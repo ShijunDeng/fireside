@@ -3,6 +3,7 @@ export type TopicStatus = (typeof topicStatuses)[number];
 
 export interface Topic {
   id: number;
+  position: number;
   title: string;
   summary: string;
   proposer: string;

@@ -1,30 +1,41 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Archive,
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
   BookOpen,
+  Calendar,
   CalendarDays,
+  CalendarRange,
   Check,
+  ChevronLeft,
   ChevronRight,
   Clock3,
   Flame,
   Github,
+  GripVertical,
   Lightbulb,
   Link as LinkIcon,
+  List,
   MapPin,
+  Pencil,
   Plus,
   Search,
   Sparkles,
+  Trash2,
   UserRound,
   UserRoundPlus,
   Users,
   X,
 } from 'lucide-react';
 import { api } from './api';
-import type { Stats, Topic, TopicStatus } from './types';
+import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
+import type { Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
-type ModalKind = 'create' | 'claim' | 'schedule' | 'archive';
+type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete';
+type ViewMode = 'list' | 'month' | 'week';
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'ALL', label: '全部议题' },
@@ -82,13 +93,35 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction }: { topic: Topic; onAction: (kind: ModalKind, topic: Topic) => void }) {
+function TopicCard({ topic, onAction, draggable, index, total, onDragStart, onDrop, onMove }: {
+  topic: Topic;
+  onAction: (kind: ModalKind, topic: Topic) => void;
+  draggable: boolean;
+  index: number;
+  total: number;
+  onDragStart: (id: number) => void;
+  onDrop: (id: number) => void;
+  onMove: (id: number, direction: -1 | 1) => void;
+}) {
   const meta = statusMeta[topic.status];
   return (
-    <article className={`topic-card topic-${meta.className}`}>
+    <article
+      className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
+      onDragOver={(event) => draggable && event.preventDefault()}
+      onDrop={(event) => { event.preventDefault(); onDrop(topic.id); }}
+    >
       <div className="topic-head">
         <span className={`status-pill ${meta.className}`}><i />{meta.label}</span>
-        <span className="topic-number">#{String(topic.id).padStart(3, '0')}</span>
+        <div className="topic-head-actions">
+          {draggable && <>
+            <button className="drag-handle" draggable onDragStart={(event) => { event.stopPropagation(); onDragStart(topic.id); }} title="拖动排序" aria-label={`拖动 ${topic.title} 排序`}><GripVertical size={14} /></button>
+            <button disabled={index === 0} onClick={() => onMove(topic.id, -1)} title="上移" aria-label={`将 ${topic.title} 上移`}><ArrowUp size={13} /></button>
+            <button disabled={index === total - 1} onClick={() => onMove(topic.id, 1)} title="下移" aria-label={`将 ${topic.title} 下移`}><ArrowDown size={13} /></button>
+          </>}
+          <span className="topic-number">#{String(topic.id).padStart(3, '0')}</span>
+          <button onClick={() => onAction('edit', topic)} title="编辑议题" aria-label={`编辑 ${topic.title}`}><Pencil size={13} /></button>
+          <button className="danger" onClick={() => onAction('delete', topic)} title="删除议题" aria-label={`删除 ${topic.title}`}><Trash2 size={13} /></button>
+        </div>
       </div>
       <div className="topic-tags">
         {topic.tags.map((tag) => <span key={tag}>{tag}</span>)}
@@ -121,6 +154,97 @@ function TopicCard({ topic, onAction }: { topic: Topic; onAction: (kind: ModalKi
   );
 }
 
+function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
+  topics: Topic[];
+  mode: Exclude<ViewMode, 'list'>;
+  cursor: Date;
+  onCursorChange: (date: Date) => void;
+  onEdit: (topic: Topic) => void;
+}) {
+  const today = new Date();
+  const scheduledTopics = topics.filter((topic) => topic.scheduledAt);
+  const weekStart = startOfWeek(cursor);
+  const days = mode === 'month'
+    ? buildMonthDays(cursor)
+    : buildWeekDays(cursor);
+  const rangeEnd = days.at(-1)!;
+  const title = mode === 'month'
+    ? `${cursor.getFullYear()} 年 ${cursor.getMonth() + 1} 月`
+    : `${weekStart.getMonth() + 1}月${weekStart.getDate()}日 — ${rangeEnd.getMonth() + 1}月${rangeEnd.getDate()}日`;
+
+  function changePeriod(direction: number) {
+    const next = new Date(cursor);
+    if (mode === 'month') next.setMonth(next.getMonth() + direction, 1);
+    else next.setDate(next.getDate() + direction * 7);
+    onCursorChange(next);
+  }
+
+  function eventsForDate(date: Date) {
+    const key = dateKey(date);
+    return scheduledTopics
+      .filter((topic) => topic.scheduledAt && dateKey(new Date(topic.scheduledAt)) === key)
+      .sort((a, b) => new Date(a.scheduledAt!).getTime() - new Date(b.scheduledAt!).getTime());
+  }
+
+  return (
+    <div className={`calendar-shell ${mode}`}>
+      <div className="calendar-toolbar">
+        <div className="calendar-nav">
+          <button onClick={() => changePeriod(-1)} aria-label="上一个周期"><ChevronLeft size={16} /></button>
+          <button className="today-button" onClick={() => onCursorChange(new Date())}>今天</button>
+          <button onClick={() => changePeriod(1)} aria-label="下一个周期"><ChevronRight size={16} /></button>
+        </div>
+        <h3>{title}</h3>
+        <div className="calendar-legend"><span className="scheduled" />即将开讲 <span className="archived" />已经归档</div>
+      </div>
+
+      {mode === 'month' ? (
+        <div className="month-scroll">
+          <div className="month-calendar">
+            {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((day) => <div className="weekday" key={day}>{day}</div>)}
+            {days.map((day) => {
+              const events = eventsForDate(day);
+              const isToday = dateKey(day) === dateKey(today);
+              const outside = day.getMonth() !== cursor.getMonth();
+              return <div className={`calendar-day ${isToday ? 'today' : ''} ${outside ? 'outside' : ''}`} key={dateKey(day)}>
+                <span className="day-number">{day.getDate()}</span>
+                <div className="day-events">
+                  {events.slice(0, 3).map((topic) => <button key={topic.id} className={`calendar-event ${statusMeta[topic.status].className}`} onClick={() => onEdit(topic)} title={topic.title}>
+                    <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+                    <span>{topic.title}</span>
+                  </button>)}
+                  {events.length > 3 && <small>还有 {events.length - 3} 个议题</small>}
+                </div>
+              </div>;
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="week-scroll">
+          <div className="week-calendar">
+            {days.map((day) => {
+              const events = eventsForDate(day);
+              const isToday = dateKey(day) === dateKey(today);
+              return <div className={`week-day ${isToday ? 'today' : ''}`} key={dateKey(day)}>
+                <div className="week-day-head"><span>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'][day.getDay()]}</span><strong>{day.getDate()}</strong></div>
+                <div className="week-events">
+                  {events.length ? events.map((topic) => <button key={topic.id} className={`week-event ${statusMeta[topic.status].className}`} onClick={() => onEdit(topic)}>
+                    <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+                    <strong>{topic.title}</strong>
+                    <span><UserRound size={12} />{topic.presenter ?? '待定'}</span>
+                    <span><MapPin size={12} />{topic.room ?? '地点待定'}</span>
+                    <small>{topic.duration ?? 0} 分钟</small>
+                  </button>) : <p className="no-events">留一晚给未知</p>}
+                </div>
+              </div>;
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Modal({ kind, topic, onClose, onComplete }: {
   kind: ModalKind;
   topic: Topic | null;
@@ -134,6 +258,8 @@ function Modal({ kind, topic, onClose, onComplete }: {
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
     schedule: { eyebrow: 'SAVE THE DATE', title: '安排炉边分享', intro: '选一个大家方便靠近炉火的时间。' },
     archive: { eyebrow: 'KEEP THE EMBERS', title: '沉淀本期收获', intro: '留下一点余温，让后来的人也能顺着线索继续探索。' },
+    edit: { eyebrow: 'TEND THE FIRE', title: '编辑议题', intro: '更新议题信息，让每一位围炉伙伴看到准确的线索。' },
+    delete: { eyebrow: 'REMOVE A SPARK', title: '删除这个议题？', intro: '删除后，相关的认领、排期与归档信息也会永久消失。' },
   }[kind];
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -166,6 +292,24 @@ function Modal({ kind, topic, onClose, onComplete }: {
           materialUrl: String(data.get('materialUrl')),
         });
         onComplete('议题已归档，这簇火光被好好保存了');
+      } else if (kind === 'edit' && topic) {
+        const payload: Parameters<typeof api.update>[1] = {
+          title: String(data.get('title')),
+          summary: String(data.get('summary')),
+          proposer: String(data.get('proposer')),
+          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 5),
+        };
+        if (data.has('presenter')) payload.presenter = String(data.get('presenter'));
+        if (data.has('scheduledAt')) payload.scheduledAt = new Date(String(data.get('scheduledAt'))).toISOString();
+        if (data.has('duration')) payload.duration = Number(data.get('duration'));
+        if (data.has('room')) payload.room = String(data.get('room'));
+        if (data.has('takeaway')) payload.takeaway = String(data.get('takeaway'));
+        if (data.has('materialUrl')) payload.materialUrl = String(data.get('materialUrl'));
+        await api.update(topic.id, payload);
+        onComplete('议题信息已更新');
+      } else if (kind === 'delete' && topic) {
+        await api.remove(topic.id);
+        onComplete('议题已删除');
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
@@ -203,9 +347,30 @@ function Modal({ kind, topic, onClose, onComplete }: {
             <label>本期最值得留下的收获<textarea name="takeaway" required maxLength={1000} rows={5} placeholder="用几句话记下结论、共识或仍待探索的问题……" autoFocus /></label>
             <label>资料链接（选填）<input name="materialUrl" type="url" placeholder="https://" /></label>
           </>}
+          {kind === 'edit' && topic && <>
+            <label>议题标题<input name="title" required maxLength={80} defaultValue={topic.title} autoFocus /></label>
+            <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} defaultValue={topic.summary} /></label>
+            <div className="form-row">
+              <label>发起人<input name="proposer" required maxLength={30} defaultValue={topic.proposer} /></label>
+              <label>标签<input name="tags" maxLength={100} defaultValue={topic.tags.join(', ')} /></label>
+            </div>
+            {topic.status !== 'OPEN' && <label>分享人<input name="presenter" required maxLength={30} defaultValue={topic.presenter ?? ''} /></label>}
+            {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && <>
+              <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={formatDateTimeInput(topic.scheduledAt)} /></label>
+              <div className="form-row">
+                <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={topic.duration ?? 40} /></label>
+                <label>地点 / 会议链接<input name="room" required maxLength={60} defaultValue={topic.room ?? ''} /></label>
+              </div>
+            </>}
+            {topic.status === 'ARCHIVED' && <>
+              <label>本期收获<textarea name="takeaway" required maxLength={1000} rows={4} defaultValue={topic.takeaway ?? ''} /></label>
+              <label>资料链接（选填）<input name="materialUrl" type="url" defaultValue={topic.materialUrl ?? ''} placeholder="https://" /></label>
+            </>}
+          </>}
+          {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>此操作不可撤销，请确认是否继续。</span></p></div>}
           {error && <div className="form-error">{error}</div>}
-          <button className="submit-btn" disabled={submitting} type="submit">
-            {submitting ? '正在添柴…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : '完成归档'}
+          <button className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
+            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'edit' ? '保存修改' : '确认删除'}
             {!submitting && <ChevronRight size={17} />}
           </button>
         </form>
@@ -221,12 +386,17 @@ export default function App() {
   const [loadError, setLoadError] = useState('');
   const [tab, setTab] = useState<Tab>('ALL');
   const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<TopicSort>('manual');
+  const [view, setView] = useState<ViewMode>('list');
+  const [calendarCursor, setCalendarCursor] = useState(new Date());
+  const [draggedId, setDraggedId] = useState<number | null>(null);
+  const [liveMessage, setLiveMessage] = useState('');
   const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
   const [toast, setToast] = useState('');
 
   const load = useCallback(async () => {
     try {
-      const [topicData, statData] = await Promise.all([api.topics(), api.stats()]);
+      const [topicData, statData] = await Promise.all([api.topics(sort), api.stats()]);
       setTopics(topicData);
       setStats(statData);
       setLoadError('');
@@ -235,7 +405,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [sort]);
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
@@ -260,13 +430,51 @@ export default function App() {
     await load();
   }
   function scrollToTopics() { document.querySelector('#topics')?.scrollIntoView({ behavior: 'smooth' }); }
+  const canManualReorder = view === 'list' && sort === 'manual' && tab === 'ALL' && !search.trim();
+
+  async function persistOrder(next: Topic[], previous: Topic[], moved: Topic) {
+    setTopics(next);
+    try {
+      await api.reorder(next.map((topic) => topic.id));
+      const position = next.findIndex((topic) => topic.id === moved.id) + 1;
+      setLiveMessage(`${moved.title} 已移动到第 ${position} 位`);
+    } catch (error) {
+      setTopics(previous);
+      setToast(error instanceof Error ? `排序保存失败：${error.message}` : '排序保存失败，已恢复原顺序');
+    }
+  }
+
+  function moveTopic(id: number, direction: -1 | 1) {
+    if (!canManualReorder) return;
+    const from = topics.findIndex((topic) => topic.id === id);
+    const to = from + direction;
+    if (from < 0 || to < 0 || to >= topics.length) return;
+    const previous = [...topics];
+    const next = [...topics];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    void persistOrder(next, previous, moved);
+  }
+
+  function dropTopic(targetId: number) {
+    if (!canManualReorder || draggedId === null || draggedId === targetId) return setDraggedId(null);
+    const from = topics.findIndex((topic) => topic.id === draggedId);
+    const to = topics.findIndex((topic) => topic.id === targetId);
+    if (from < 0 || to < 0) return setDraggedId(null);
+    const previous = [...topics];
+    const next = [...topics];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    setDraggedId(null);
+    void persistOrder(next, previous, moved);
+  }
 
   return <>
     <header className="nav shell">
       <a className="brand" href="#top"><span className="brand-mark"><Flame size={18} /></span><span>围炉夜话</span><i>FIRESIDE</i></a>
       <nav>
         <button onClick={scrollToTopics}>议题广场</button>
-        <button onClick={() => { setTab('SCHEDULED'); scrollToTopics(); }}>本周排期</button>
+        <button onClick={() => { setTab('SCHEDULED'); setView('week'); setCalendarCursor(new Date()); scrollToTopics(); }}>本周排期</button>
         <button className="nav-cta" onClick={() => openAction('create')}><Plus size={16} /> 发起议题</button>
       </nav>
     </header>
@@ -313,10 +521,42 @@ export default function App() {
           <label className="search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索议题、标签或分享人" /></label>
         </div>
 
+        <div className="view-sort-bar">
+          <div className="view-switch" aria-label="议题视图">
+            <button className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}><List size={15} />列表</button>
+            <button className={view === 'month' ? 'active' : ''} onClick={() => setView('month')}><Calendar size={15} />月历</button>
+            <button className={view === 'week' ? 'active' : ''} onClick={() => setView('week')}><CalendarRange size={15} />周历</button>
+          </div>
+          <div className="sort-control">
+            {view === 'list' && <label>排序方式
+              <select value={sort} onChange={(event) => setSort(event.target.value as TopicSort)}>
+                <option value="manual">手动排序</option>
+                <option value="newest">最新创建</option>
+                <option value="oldest">最早创建</option>
+                <option value="schedule">排期时间</option>
+                <option value="status">议题状态</option>
+              </select>
+            </label>}
+            {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">清除搜索并切回“全部议题”后可手动排序</span>}
+          </div>
+        </div>
+
         {loading ? <div className="empty-state"><Flame className="loading-flame" /><h3>正在点燃炉火…</h3></div>
           : loadError ? <div className="empty-state"><h3>{loadError}</h3><button onClick={() => void load()}>重新连接</button></div>
-          : visibleTopics.length ? <div className="topic-grid">{visibleTopics.map((topic) => <TopicCard key={topic.id} topic={topic} onAction={openAction} />)}</div>
+          : visibleTopics.length && view === 'list' ? <div className="topic-grid">{visibleTopics.map((topic, index) => <TopicCard
+              key={topic.id}
+              topic={topic}
+              index={index}
+              total={visibleTopics.length}
+              onAction={openAction}
+              draggable={canManualReorder}
+              onDragStart={setDraggedId}
+              onDrop={dropTopic}
+              onMove={moveTopic}
+            />)}</div>
+          : visibleTopics.length && view !== 'list' ? <CalendarView topics={visibleTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onEdit={(topic) => openAction('edit', topic)} />
           : <div className="empty-state"><Lightbulb /><h3>这里还没有火种</h3><p>换个筛选条件，或者成为第一个发起议题的人。</p><button onClick={() => openAction('create')}>发起议题</button></div>}
+        <p className="sr-only" aria-live="polite">{liveMessage}</p>
       </section>
 
       <section className="how-wrap" id="how">

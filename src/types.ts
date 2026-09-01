@@ -2,6 +2,7 @@ export type TopicStatus = 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED';
 
 export interface Topic {
   id: number;
+  position: number;
   title: string;
   summary: string;
   proposer: string;
@@ -17,6 +18,8 @@ export interface Topic {
   updatedAt: string;
   archivedAt: string | null;
 }
+
+export type TopicSort = 'manual' | 'newest' | 'oldest' | 'schedule' | 'status';
 
 export interface Stats {
   open: number;

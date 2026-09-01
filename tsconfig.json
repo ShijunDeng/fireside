@@ -17,5 +17,5 @@
     "jsx": "react-jsx",
     "types": ["node"]
   },
-  "include": ["src", "server", "tests", "vite.config.ts"]
+  "include": ["src", "server", "tests", "e2e", "vite.config.ts", "playwright.config.ts"]
 }

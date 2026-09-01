@@ -5,6 +5,7 @@ import type { Topic, TopicStatus } from './types.js';
 
 type TopicRow = {
   id: number;
+  position: number;
   title: string;
   summary: string;
   proposer: string;
@@ -24,6 +25,7 @@ type TopicRow = {
 export function rowToTopic(row: TopicRow): Topic {
   return {
     id: row.id,
+    position: row.position,
     title: row.title,
     summary: row.summary,
     proposer: row.proposer,
@@ -52,9 +54,9 @@ function seedDatabase(db: Database.Database) {
   const createdAt = now.toISOString();
   const insert = db.prepare(`
     INSERT INTO topics
-      (title, summary, proposer, presenter, tags, status, scheduled_at, duration, room, takeaway, material_url, created_at, updated_at, archived_at)
+      (position, title, summary, proposer, presenter, tags, status, scheduled_at, duration, room, takeaway, material_url, created_at, updated_at, archived_at)
     VALUES
-      (@title, @summary, @proposer, @presenter, @tags, @status, @scheduledAt, @duration, @room, @takeaway, @materialUrl, @createdAt, @updatedAt, @archivedAt)
+      (@position, @title, @summary, @proposer, @presenter, @tags, @status, @scheduledAt, @duration, @room, @takeaway, @materialUrl, @createdAt, @updatedAt, @archivedAt)
   `);
 
   const samples = [
@@ -90,8 +92,8 @@ function seedDatabase(db: Database.Database) {
   ] as const;
 
   const transaction = db.transaction(() => {
-    for (const sample of samples) {
-      insert.run({ ...sample, tags: JSON.stringify(sample.tags) });
+    for (const [index, sample] of samples.entries()) {
+      insert.run({ ...sample, position: index + 1, tags: JSON.stringify(sample.tags) });
     }
   });
   transaction();
@@ -107,6 +109,7 @@ export function createDatabase(databasePath: string, seed = true) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS topics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      position INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL,
       summary TEXT NOT NULL,
       proposer TEXT NOT NULL,
@@ -125,6 +128,11 @@ export function createDatabase(databasePath: string, seed = true) {
     CREATE INDEX IF NOT EXISTS idx_topics_status ON topics(status);
     CREATE INDEX IF NOT EXISTS idx_topics_scheduled_at ON topics(scheduled_at);
   `);
+  const columns = db.prepare('PRAGMA table_info(topics)').all() as { name: string }[];
+  if (!columns.some((column) => column.name === 'position')) {
+    db.exec('ALTER TABLE topics ADD COLUMN position INTEGER NOT NULL DEFAULT 0');
+  }
+  db.exec('UPDATE topics SET position = id WHERE position = 0');
   if (seed) seedDatabase(db);
   return db;
 }

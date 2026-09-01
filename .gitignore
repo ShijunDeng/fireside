@@ -6,3 +6,6 @@ data/*.db-*
 *.log
 .DS_Store
 coverage/
+test-results/
+playwright-report/
+blob-report/

@@ -8,6 +8,9 @@
 - 认领议题：分享人接过火炬，进入准备阶段
 - 议题排期：设置日期、时间、分享时长和地点
 - 议题归档：沉淀核心收获与外部资料链接
+- 完整管理：编辑各状态允许的字段，二次确认后删除议题
+- 灵活排序：手动拖拽、上移/下移，以及按创建、排期和状态排序
+- 日历规划：列表、月历和周历三种视图，点击事件直接编辑
 - 议题广场：按状态筛选，支持全文搜索
 - 数据看板：展示待认领、已排期和已归档数据
 
@@ -47,6 +50,15 @@ npm run check
 
 该命令依次执行 TypeScript 类型检查、API 生命周期测试和生产构建。
 
+浏览器端到端验收：
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+需求、验收标准和迭代证据统一维护在 [`specs/`](./specs/README.md)。所有新功能和 BUG 修复遵循先更新规格、再开发验证的流程。
+
 ## API
 
 | 方法 | 路径 | 用途 |
@@ -54,6 +66,9 @@ npm run check
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/api/topics` | 获取议题，可用 `status` 筛选 |
 | `POST` | `/api/topics` | 创建议题 |
+| `PATCH` | `/api/topics/:id` | 编辑议题 |
+| `DELETE` | `/api/topics/:id` | 删除议题 |
+| `POST` | `/api/topics/reorder` | 保存全局手动顺序 |
 | `POST` | `/api/topics/:id/claim` | 认领议题 |
 | `POST` | `/api/topics/:id/schedule` | 安排分享 |
 | `POST` | `/api/topics/:id/archive` | 归档议题 |

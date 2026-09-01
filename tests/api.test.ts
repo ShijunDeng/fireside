@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import Database from 'better-sqlite3';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../server/app.js';
 
@@ -95,5 +99,106 @@ describe('围炉夜话 API', () => {
     const response = await app.inject({ method: 'POST', url: '/api/topics', payload: { title: '', summary: '', proposer: '' } });
     assert.equal(response.statusCode, 400);
     assert.ok(response.json().message);
+  });
+
+  it('支持更新和删除议题', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '待编辑议题', summary: '修改前的简介。', proposer: '原发起人', tags: ['旧标签'] },
+    });
+    const id = created.json().id as number;
+    const updated = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`,
+      payload: { title: '编辑后的议题', summary: '修改后的简介。', proposer: '新发起人', tags: ['新标签', 'CRUD'] },
+    });
+    assert.equal(updated.statusCode, 200);
+    assert.equal(updated.json().title, '编辑后的议题');
+    assert.deepEqual(updated.json().tags, ['新标签', 'CRUD']);
+
+    const invalidUrl = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { materialUrl: 'javascript:alert(1)' } });
+    assert.equal(invalidUrl.statusCode, 400);
+    const bypassState = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`,
+      payload: { scheduledAt: new Date().toISOString(), duration: 30, room: '越级排期' },
+    });
+    assert.equal(bypassState.statusCode, 409);
+
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+    assert.equal(deleted.statusCode, 204);
+    const duplicate = await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+    assert.equal(duplicate.statusCode, 404);
+    const topics = await app.inject({ method: 'GET', url: '/api/topics' });
+    assert.equal(topics.json().some((topic: { id: number }) => topic.id === id), false);
+  });
+
+  it('持久化完整的手动排序并拒绝不完整列表', async () => {
+    const before = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const ids = (before.json() as { id: number }[]).map(({ id }) => id);
+    const reversed = [...ids].reverse();
+    const reordered = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed } });
+    assert.equal(reordered.statusCode, 204);
+    const after = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((after.json() as { id: number }[]).map(({ id }) => id), reversed);
+
+    const incomplete = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed.slice(1) } });
+    assert.equal(incomplete.statusCode, 400);
+    const duplicate = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: [reversed[0], reversed[0]] } });
+    assert.equal(duplicate.statusCode, 400);
+  });
+});
+
+describe('数据库兼容性与并发', () => {
+  it('为旧数据库无损添加 position 字段', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-migration-'));
+    const databasePath = path.join(directory, 'legacy.db');
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL, summary TEXT NOT NULL, proposer TEXT NOT NULL, presenter TEXT,
+        tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'OPEN', scheduled_at TEXT,
+        duration INTEGER, room TEXT, takeaway TEXT, material_url TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+      );
+    `);
+    const now = new Date().toISOString();
+    legacy.prepare("INSERT INTO topics (title, summary, proposer, tags, status, created_at, updated_at) VALUES (?, ?, ?, '[]', 'OPEN', ?, ?)")
+      .run('旧议题一', '历史内容一', '甲', now, now);
+    legacy.prepare("INSERT INTO topics (title, summary, proposer, tags, status, created_at, updated_at) VALUES (?, ?, ?, '[]', 'OPEN', ?, ?)")
+      .run('旧议题二', '历史内容二', '乙', now, now);
+    legacy.close();
+
+    const migrationApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await migrationApp.ready();
+    const response = await migrationApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((response.json() as { title: string; position: number }[]).map(({ title, position }) => ({ title, position })), [
+      { title: '旧议题一', position: 1 },
+      { title: '旧议题二', position: 2 },
+    ]);
+    await migrationApp.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('两个应用实例并发认领时只有一个成功', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-concurrency-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    const secondApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await Promise.all([firstApp.ready(), secondApp.ready()]);
+    const created = await firstApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '并发火种', summary: '只能被一个人成功认领。', proposer: '发起人', tags: [] },
+    });
+    const id = created.json().id as number;
+    const [first, second] = await Promise.all([
+      firstApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '认领人甲' } }),
+      secondApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '认领人乙' } }),
+    ]);
+    assert.deepEqual([first.statusCode, second.statusCode].sort(), [200, 409]);
+    const winner = first.statusCode === 200 ? first.json().presenter : second.json().presenter;
+    const topics = await firstApp.inject({ method: 'GET', url: '/api/topics' });
+    assert.equal(topics.json()[0].presenter, winner);
+    await Promise.all([firstApp.close(), secondApp.close()]);
+    await rm(directory, { recursive: true, force: true });
   });
 });
