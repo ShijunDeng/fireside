@@ -100,6 +100,11 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
 - `RemainAfterExit` 的开机 recovery 只能作为本次开机的第一道门，不能代替每次启动门禁。`fireside.service` 每次自动/显式启动和 `fireside-backup.service` 每次 timer/人工启动都必须先执行 root-owned transaction gate：无 journal 才直接通过；有 journal 且发布锁空闲表示控制器已成为 orphan，必须在 Node 或 backup runner 执行前恢复；有 journal且锁被当前受控 promote 持有时，只允许与已校验 journal 阶段、current 指针和目标完全一致的那次受控服务重启，不能让普通并发启动猜测放行。
 - 每次启动门禁不能与持排他锁同步等待 `systemctl restart` 的正常 promote 自锁死，也不能把调用者环境、可写 marker 或“lock 正忙”本身当作授权。受控 restart 与 orphan 的区分必须绑定 root-owned事务、当前指针和活跃控制器所有权；控制器在放行点前后异常退出时，下一次 service/backup 入口仍须先恢复，且 backup 绝不能从未验收 target 执行或 prune。
+- 新事务必须有至少 128-bit 随机 txid，并把 owner boot id、PID/starttime、固定控制器身份和锁 inode 作为附加证据。每次受控 service restart 使用 journal 内原子 fsync 的单次许可，绑定 txid、phase、expected commit、purpose 和递增 generation；gate 原子消费，旧许可、第二次 restart、错误 current/phase/owner/lock 一律拒绝。PID 或 lock-busy 单独都不是授权。
+- service gate 在同一锁内把已验证 commit 固化为 root-owned 不可变运行 selector，MainPID 的 WorkingDirectory/ExecStart 必须引用 selector 而不是可变 `current`，关闭 pre-gate→exec 的 current TOCTOU。gate 拿到锁时直接在同一 worker 内恢复，不得再次调用会重复 flock 的入口。
+- 在第一份 journal 前启动独立 root-owned watchdog；它等待控制器释放同一锁，正常流程看到 journal 已清即退出，控制器异常死亡而相同 txid journal 仍在则接管恢复。watchdog/gate 的失败必须 fail-closed；受控 target 即使在许可消费后的极小窗口启动，也会被独立 watchdog 停止并恢复，不能持续成为公网版本。
+- fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
+- backup 不得与 root recovery 共用一个扩大写权限的 sandbox。使用独立 root-owned gate/recovery unit，再进入保持现有最小权限的 runner unit；runner 在取得共享锁后再次只读确认没有 journal并解析已健康 selector，防止 gate→runner 间竞态。任意 active transaction 都不得执行 target backup CLI 或 prune。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
 - 含生产备份副本且已授权给 `fireside-build` 的 preflight stage 必须确认递归删除成功且路径消失后，才能取消 EXIT trap、写 transaction 或切换 `current`。显式清理失败必须以 2 停在切换前并记录稳定错误；trap 的兜底清理失败也必须可见，不能静默把敏感副本当作已删除。
 - healthy marker 的 manifest digest 必须先独立计算、检查命令状态并验证为 64 位 SHA-256（仅显式 legacy current 可用固定标记），再写 marker；禁止让 command substitution 失败被外层 `printf` 成功掩盖。marker 生成/持久化失败属于提升失败，必须回到调用前版本。
@@ -187,6 +192,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 29. 正常 promote 持排他锁执行受控 restart 不与每次启动门禁死锁，只有 journal 中目标可被启动并完成健康门禁；伪造/陈旧授权、错误 phase/current、锁由非对应操作占用或控制器在放行边界退出都不能让未验收 target 成为持久运行版本。
 30. 在 bootstrap 的 target 已启动后分别阻塞 live health、healthy journal、marker/state sync、写许可和 clear journal；用真实会话提交创建/编辑/删除/排序/认领/排期/报名/归档。提交点前全部返回 503、revision/order/名单不变且页面草稿可重试；写许可发布后的任意 2xx 在控制器死亡和 recovery 后仍存在，禁止用启动前备份覆盖。
 31. 写许可缺失、commit 不匹配、普通/符号/多链接或权限异常时全部业务写失败关闭，公开 GET、health 和 access verify 可用；正常 bootstrap/promote/rollback 完成后许可精确匹配 current，服务重启继续允许写。
+32. gate 拒绝旧 txid/旧 generation/第二次消费、错误 owner PID starttime/boot id、错误锁 inode/phase/current/commit 和非 root/错误权限/链接许可；运行 selector 只能由 gate 在锁内原子更新，controller 在 gate 返回到 Node exec 间切 current 也不能改变本次实际启动 release。
+33. watchdog 在 journal 前已成功启动；分别在许可写前、消费前、消费后、Node exec 前后和 health 中杀 controller，最终都自动停止 target、恢复 origin 并清理许可。正常流程 watchdog 无副作用退出；watchdog启动失败则切换前退出 2。
+34. controller 持锁时启动一个会存活的 systemctl 等子进程并杀 controller，子进程不得继续持有锁；watchdog能立即获得锁并恢复。backup gate 与最小权限 runner 分离，恢复权限不会进入候选 backup CLI 的 unit namespace。
 
 ### 7.2 生产
 
@@ -247,3 +255,5 @@ Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固�
 同一 boot 恢复复审确认 `RemainAfterExit=yes` 会让 recovery 首次成功后一直保持 active，后续 `Requires+After` 不再执行其 `ExecStart`。控制器若在 switched 等 journal 阶段被 SIGKILL，服务自动重启、显式 restart 或备份 timer 会直接采用未验收 target。新增每次 service/backup 启动的 transaction gate；同时保留正常 promote 持锁同步 restart 的无死锁路径。该 P1 使连续计数继续为 0。
 
 bootstrap 数据复审发现 live health 窗口已经由 socket 向公网开放业务写，而后续 healthy/marker/sync/clear 任一步失败仍会用启动前备份覆盖主库，形成“用户收到 2xx 后数据消失”。采用按 release commit 绑定的 root-owned 写许可：可回退阶段业务写统一 503；许可发布是不可逆提交点，之后 recovery 只能向前完成，不能恢复旧数据库。该数据丢失 P1 再次把成熟度计数归零。
+
+启动门禁设计复审确认纯 ExecStartPre 仍有 current TOCTOU、许可消费后 owner 死亡窗口与重复 flock 死锁；发布锁还可能被 systemctl 子进程继承，backup 若共用恢复 sandbox 会扩大 root 候选 runner 权限。采用 txid/单次许可、不可变 runtime selector、独立 watchdog、子进程关闭锁 fd和 gate/runner 分离；这些相邻 P1 继续保持成熟度计数为 0。
