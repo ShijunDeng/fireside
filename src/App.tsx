@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   Archive,
   ArrowDown,
@@ -38,8 +38,10 @@ import {
 } from 'lucide-react';
 import { api, ApiError, clearWriteKey, getWriteKey, onUnauthorized, saveWriteKey } from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
+import { createDialogToken, dialogStack } from './dialog-stack';
 import { buildPosterModel, isPosterEligible, posterToBlob, renderTopicPoster } from './poster';
 import { activityPhase } from '../shared/activity';
+import type { DialogToken } from './dialog-stack';
 import type { ActivityPhase, Participant, Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
@@ -114,28 +116,72 @@ function topicMeetingUrl(topic: Topic) {
 
 const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-function useDialogA11y(onClose: () => void) {
+function focusReturnTarget() {
+  const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  if (active && active !== document.body && active !== document.documentElement) return active;
+  const underlyingDialog = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]:not([inert])')).at(-1);
+  return underlyingDialog?.querySelector<HTMLElement>('button[type="submit"]')
+    ?? underlyingDialog?.querySelector<HTMLElement>('[data-initial-focus]')
+    ?? underlyingDialog?.querySelector<HTMLElement>(focusableSelector)
+    ?? active;
+}
+
+function useDialogA11y(onClose: () => void, label = 'dialog') {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
-  const returnFocusRef = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const tokenRef = useRef<DialogToken | null>(null);
+  if (!tokenRef.current) tokenRef.current = createDialogToken(label);
+  const token = tokenRef.current;
+  const stack = useSyncExternalStore(dialogStack.subscribe, dialogStack.getSnapshot, dialogStack.getSnapshot);
+  const isTop = stack.at(-1) === token;
+  const returnFocusRef = useRef<HTMLElement | null>(focusReturnTarget());
   const returnFocusKey = returnFocusRef.current?.dataset.focusReturn;
+  const initialFocusHandledRef = useRef(false);
   closeRef.current = onClose;
 
+  useLayoutEffect(() => {
+    const release = dialogStack.register(token);
+    return () => {
+      const shouldRestoreFocus = dialogStack.isTop(token);
+      release();
+      if (!shouldRestoreFocus) return;
+      let attempts = 0;
+      const restoreFocus = () => {
+        if (dialogStack.isRegistered(token)) return;
+        const original = returnFocusRef.current;
+        const fallback = returnFocusKey ? document.querySelector<HTMLElement>(`[data-focus-return="${CSS.escape(returnFocusKey)}"]`) : null;
+        const target = original?.isConnected ? original : fallback;
+        if (target && !target.matches(':disabled') && !target.closest('[inert]')) target.focus();
+        else if (attempts++ < 30) window.requestAnimationFrame(restoreFocus);
+        else document.querySelector<HTMLElement>('#topics h2')?.focus();
+      };
+      window.requestAnimationFrame(restoreFocus);
+    };
+  }, [returnFocusKey, token]);
+
   useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    if (!isTop || initialFocusHandledRef.current) return;
     const frame = window.requestAnimationFrame(() => {
+      if (!dialogStack.isTop(token)) return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      initialFocusHandledRef.current = true;
       (dialog.querySelector<HTMLElement>('[data-initial-focus]') ?? dialog.querySelector<HTMLElement>(focusableSelector) ?? dialog).focus();
     });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isTop, token]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (!dialogStack.isTop(token)) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         closeRef.current();
         return;
       }
       if (event.key !== 'Tab') return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
       const focusable = Array.from(dialog!.querySelectorAll<HTMLElement>(focusableSelector)).filter((element) => element.offsetParent !== null);
       if (!focusable.length) {
         event.preventDefault();
@@ -153,23 +199,9 @@ function useDialogA11y(onClose: () => void) {
       }
     }
     document.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      document.removeEventListener('keydown', onKeyDown);
-      document.body.style.overflow = previousOverflow;
-      let attempts = 0;
-      const restoreFocus = () => {
-        const original = returnFocusRef.current;
-        const fallback = returnFocusKey ? document.querySelector<HTMLElement>(`[data-focus-return="${CSS.escape(returnFocusKey)}"]`) : null;
-        const target = original?.isConnected ? original : fallback;
-        if (target) target.focus();
-        else if (returnFocusKey && attempts++ < 30) window.requestAnimationFrame(restoreFocus);
-        else document.querySelector<HTMLElement>('#topics h2')?.focus();
-      };
-      window.requestAnimationFrame(restoreFocus);
-    };
-  }, []);
-  return dialogRef;
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [token]);
+  return { dialogRef, isTop };
 }
 
 function FireVisual() {
@@ -415,7 +447,7 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const canJoin = topic.status === 'SCHEDULED' && canAttendPhase(topicPhase(topic, now));
-  const dialogRef = useDialogA11y(onClose);
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'participants');
 
   const loadParticipants = useCallback(async () => {
     setLoading(true);
@@ -465,8 +497,8 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
     }
   }
 
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <div ref={dialogRef} className="modal participants-modal" role="dialog" aria-modal="true" aria-labelledby="participants-title" tabIndex={-1}>
+  return <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal participants-modal" role="dialog" aria-modal="true" aria-labelledby="participants-title" tabIndex={-1} inert={!isTop}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><Users size={14} /> FIRESIDE GUESTS</span>
       <h2 id="participants-title">{canJoin ? '报名参加围炉' : '本期参与伙伴'}</h2>
@@ -490,7 +522,7 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
 
 function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => void; onSync: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const dialogRef = useDialogA11y(onClose);
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'poster');
   const errorRef = useRef<HTMLDivElement>(null);
   const openedRevision = useRef(topic.revision);
   const onSyncRef = useRef(onSync);
@@ -611,8 +643,8 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
     : phase === 'generating' ? '正在生成宣讲海报'
       : phase === 'ready' ? '宣讲海报已为你备好'
         : '本次没有生成海报';
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <div ref={dialogRef} className="modal poster-modal" role="dialog" aria-modal="true" aria-labelledby="poster-title" tabIndex={-1}>
+  return <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal poster-modal" role="dialog" aria-modal="true" aria-labelledby="poster-title" tabIndex={-1} inert={!isTop}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><ImageDown size={14} /> FIRESIDE POSTER</span>
       <h2 id="poster-title">{title}</h2>
@@ -648,16 +680,16 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
 }
 
 function AccessModal({ message, onClose, onUnlocked }: { message: string; onClose: () => void; onUnlocked: () => void }) {
-  const dialogRef = useDialogA11y(onClose);
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'access');
+  const errorRef = useRef<HTMLDivElement>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    const current = dialogRef.current;
-    const underlying = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).filter((dialog) => dialog !== current);
-    underlying.forEach((dialog) => { dialog.inert = true; });
-    return () => underlying.forEach((dialog) => { dialog.inert = false; });
-  }, [dialogRef]);
+    if (!error || !isTop) return;
+    const frame = window.requestAnimationFrame(() => errorRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [error, isTop]);
 
   async function unlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -674,8 +706,8 @@ function AccessModal({ message, onClose, onUnlocked }: { message: string; onClos
     }
   }
 
-  return <div className="modal-backdrop access-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <div ref={dialogRef} className="modal access-modal" role="dialog" aria-modal="true" aria-labelledby="access-title" tabIndex={-1}>
+  return <div className="modal-backdrop access-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal access-modal" role="dialog" aria-modal="true" aria-labelledby="access-title" tabIndex={-1} inert={!isTop}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><LockKeyhole size={14} /> TRUSTED COLLABORATORS</span>
       <h2 id="access-title">解锁围炉协作</h2>
@@ -683,7 +715,7 @@ function AccessModal({ message, onClose, onUnlocked }: { message: string; onClos
       <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>口令只保存在当前浏览器会话，不会写入网址或 Git。</span></p></div>
       <form onSubmit={unlock}>
         <label>围炉口令<input name="writeKey" type="password" required autoComplete="current-password" autoFocus data-initial-focus placeholder="输入团队共享口令" /></label>
-        {error && <div className="form-error" role="alert">{error}</div>}
+        {error && <div ref={errorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
         <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在验证…' : '解锁协作'}{!submitting && <UnlockKeyhole size={16} />}</button>
       </form>
     </div>
@@ -697,7 +729,7 @@ function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
   unlockVersion: number;
   now: Date;
 }) {
-  const dialogRef = useDialogA11y(onClose);
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'meeting');
   const [meetingUrl, setMeetingUrl] = useState('');
   const [error, setError] = useState('');
   const phase = topicPhase(topic, now);
@@ -727,8 +759,8 @@ function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
       });
     return () => { active = false; };
   }, [phase, topic.id, unlockVersion]);
-  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <div ref={dialogRef} className="modal meeting-modal" role="dialog" aria-modal="true" aria-labelledby="meeting-title" tabIndex={-1}>
+  return <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal meeting-modal" role="dialog" aria-modal="true" aria-labelledby="meeting-title" tabIndex={-1} inert={!isTop}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><LinkIcon size={14} /> MEETING ACCESS</span>
       <h2 id="meeting-title">进入线上围炉</h2>
@@ -774,7 +806,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
     }
     onClose();
   }
-  const dialogRef = useDialogA11y(closeModal);
+  const { dialogRef, isTop } = useDialogA11y(closeModal, kind);
   const copy = {
     create: { eyebrow: 'ADD A SPARK', title: '发起一个新议题', intro: '不必是完整答案，一个真实的问题就足够成为火种。' },
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
@@ -933,8 +965,8 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
   }
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && closeModal()}>
-      <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1}>
+    <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && closeModal()}>
+      <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} inert={!isTop}>
         <button className="modal-close" onClick={closeModal} aria-label="关闭"><X size={19} /></button>
         <span className="modal-eyebrow"><Sparkles size={14} />{copy.eyebrow}</span>
         <h2 id="modal-title">{copy.title}</h2>
