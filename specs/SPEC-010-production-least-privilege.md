@@ -84,7 +84,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 ### FR-OPS-008 在线一致备份
 
 - 使用 `better-sqlite3` backup API 从活动 WAL 数据库生成单文件一致备份，禁止 `cp fireside.db` 作为备份实现。
-- 写入同目录 root-only 临时文件，`integrity_check=ok` 后原子改名；失败清理本次明确命名的临时文件，不影响既有备份。
+- 写入同目录 root-only 临时文件；在线 backup 完成后先把独立副本转换为 `DELETE` journal，再执行 `integrity_check`，确保最终发布物是无需 WAL/SHM 的单文件快照。校验通过后原子改名；成功或失败都清理本次明确命名的临时主文件、`-wal` 与 `-shm`，不影响既有备份。
 - 成功记录时间、文件名、字节数、SHA-256、Topic 数、参与人数与 order version；不得记录标题、姓名、会议链接、口令或 token。
 - systemd timer 每日运行并支持错过后补跑；默认保留最近 14 份。只有新备份成功且校验通过后，才删除严格匹配命名规则的超额旧备份。
 - 备份服务可为读取 0600 源库拥有唯一必要的只读 DAC 能力，但不得拥有写生产状态、网络或其他 capability；应用服务自身永远不能访问备份目录。
@@ -107,7 +107,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 
 1. systemd fd 环境覆盖正确、PID 不匹配、0/2 个 fd、名称不匹配与普通 HOST/PORT 回退。
 2. SIGTERM/SIGINT 幂等关闭；服务器关闭后 DB 可再次独占打开，无强杀或未处理 rejection。
-3. 在线 backup 覆盖 WAL 中未 checkpoint 数据；备份 `integrity_check=ok`，Topic/revision/order/参与人数一致。
+3. 在线 backup 覆盖 WAL 中未 checkpoint 数据；备份 `journal_mode=delete`、`integrity_check=ok`，Topic/revision/order/参与人数一致，目录中没有本次 `.tmp`、`.tmp-wal`、`.tmp-shm` 或最终同名边车。
 4. 备份失败不留下最终文件；保留策略不删除非匹配文件，且仅在成功后保留最新 14 份。
 5. TypeScript、全部单元/API、生产构建、依赖审计和桌面/Pixel 7 E2E 回归。
 

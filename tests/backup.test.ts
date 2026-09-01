@@ -182,7 +182,11 @@ describe('SQLite 一致备份', () => {
       assert.equal(metadata.bytes, (await stat(backupPath)).size);
       assert.equal(metadata.sha256, await sha256(backupPath));
       assert.deepEqual(readDatabaseFingerprint(backupPath), sourceFingerprint);
-      assert.deepEqual((await readdir(backupDirectory)).filter((name) => name.endsWith('.tmp')), []);
+      assert.deepEqual(await readdir(backupDirectory), [metadata.filename]);
+      const standalone = new Database(backupPath, { readonly: true, fileMustExist: true });
+      assert.equal(standalone.pragma('journal_mode', { simple: true }), 'delete');
+      standalone.close();
+      assert.deepEqual(await readdir(backupDirectory), [metadata.filename]);
 
       const serializedMetadata = JSON.stringify(metadata);
       for (const secret of [
@@ -253,6 +257,7 @@ describe('SQLite 一致备份', () => {
       assert.equal(entries.some((entry) => entry.name === name), true, `${name} must not be pruned`);
     }
     for (const name of retained) assert.equal((await stat(path.join(backupDirectory, name))).mode & 0o777, 0o600);
+    assert.equal(entries.some((entry) => entry.name.endsWith('-wal') || entry.name.endsWith('-shm')), false);
   });
 
   it('系统时钟回退时仍保留本次已发布备份，并只清理严格匹配的旧文件', async () => {

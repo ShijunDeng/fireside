@@ -151,6 +151,17 @@ export function readDatabaseFingerprint(databasePath: string) {
   }
 }
 
+function inspectStandaloneBackup(databasePath: string) {
+  const db = new Database(databasePath, { fileMustExist: true });
+  try {
+    const journalMode = db.pragma('journal_mode = DELETE', { simple: true });
+    if (journalMode !== 'delete') throw new Error('SQLite backup must use a standalone DELETE journal');
+    return inspectOpenDatabase(db);
+  } finally {
+    db.close();
+  }
+}
+
 function formatTimestamp(date: Date) {
   if (!Number.isFinite(date.getTime())) throw new TypeError('Backup clock must return a valid Date');
   return date.toISOString().replaceAll('-', '').replaceAll(':', '').replace('.', '');
@@ -189,6 +200,16 @@ async function requireAbsent(filename: string) {
     throw error;
   }
   throw new Error('Generated backup destination already exists');
+}
+
+async function removeFilesIfPresent(filenames: string[]) {
+  for (const filename of filenames) {
+    try {
+      await unlink(filename);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 async function pruneBackups(directory: string, retention: number, publishedFilename: string) {
@@ -245,6 +266,7 @@ export async function createSqliteBackup(options: CreateBackupOptions): Promise<
   if (!isBackupFilename(filename)) throw new Error('Generated backup filename is invalid');
   const finalPath = path.join(options.backupDirectory, filename);
   const temporaryPath = path.join(options.backupDirectory, `.${filename}.${process.pid}.tmp`);
+  const temporarySidecars = [`${temporaryPath}-wal`, `${temporaryPath}-shm`];
   await requireAbsent(finalPath);
 
   let source: Database.Database | null = null;
@@ -261,7 +283,8 @@ export async function createSqliteBackup(options: CreateBackupOptions): Promise<
     source = null;
 
     await chmod(temporaryPath, 0o600);
-    const fingerprint = readDatabaseFingerprint(temporaryPath);
+    const fingerprint = inspectStandaloneBackup(temporaryPath);
+    await removeFilesIfPresent(temporarySidecars);
     const fileInfo = await stat(temporaryPath);
     const sha256 = await sha256File(temporaryPath);
     await rename(temporaryPath, finalPath);
@@ -281,7 +304,7 @@ export async function createSqliteBackup(options: CreateBackupOptions): Promise<
     };
   } catch (error) {
     if (!published && temporaryCreated) {
-      await unlink(temporaryPath).catch(() => undefined);
+      await removeFilesIfPresent([temporaryPath, ...temporarySidecars]).catch(() => undefined);
     }
     throw error;
   } finally {
