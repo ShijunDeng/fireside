@@ -82,6 +82,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 预装控制器及其任一子脚本必须在解析测试模式、降权用户、路径或 hook 之前识别生产控制器身份；只要调用环境包含 `FIRESIDE_RELEASE_*` 或其他已定义的测试路径/用户覆盖变量，就必须以退出码 2 拒绝，不能仅忽略。该边界也必须由随生产标记复制到隔离目录的控制器夹具验证，不能只测试工作树入口。
 - 控制器不得让 root Git 继承调用者的 `HOME`、XDG、全局/系统配置、`core.fsmonitor`、hooks 或其他可执行配置。所有 Git 读取都必须使用固定 PATH、空的 global/system config，并在命令行禁用 repository-local fsmonitor 与 hooks；隔离生产夹具须注入恶意 HOME/XDG 与仓库本地 fsmonitor 哨兵，证明 status/archive/授权检查前后均不会执行。
 - 本地 Git replace/graft 语义不能改写已由 GitHub 授权的对象身份；所有 rev-parse/tree/archive/dirty 命令必须禁用 replacement refs。开发用户创建 `refs/replace/<authorized-commit>` 后，候选归档仍必须来自原始 commit/tree，不能采用替换对象。
+- 禁止从开发用户仓库执行权威 `ls-remote` 或生成发布 archive：repository-local `url.*.insteadOf`、`core.attributesFile`、`.git/info/attributes` 等仍可改写远端和归档。生产必须把固定 HTTPS GitHub main fetch 到 root-owned、空配置的临时 bare 仓库，commit 授权、tree 与 archive 全部来自该仓库；开发工作树只参与 HEAD/dirty 的非授权性前置检查。
 - root 工具的临时目录、代理和 systemd/DBus 目标同样不能由调用者决定：控制器固定 root-only `TMPDIR`，清除大小写代理、`NO_PROXY`、DBus/SYSTEMD 变量；健康 curl 还必须显式 `--noproxy '*'`。manifest 校验不得在调用者目录创建随后按路径重新打开的 root 临时文件，systemctl/systemd-run 只能连接本机系统 manager。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
 - 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 HTTPS GitHub 仓库在隔离 Git 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
@@ -160,6 +161,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 20. 在三次业务指纹均一致后注入 preflight stage 删除失败；命令必须返回 2，current/previous/journal 不变且明确报告待人工清理的路径状态。恢复清理能力后，同一门禁可正常完成且不残留 stage。
 21. 用“旧 origin runner 写旧哨兵、target runner 写安全哨兵”的夹具证明首次 promote 只执行 target backup CLI；成功后 rollback 使用调用前 current 的安全 runner。安全 runner 的 file/dir sync 故障仍须保持双指针/journal不变且不 prune，备份进程不可读取密钥文件。
 22. 在 umask 022 且锁不存在时执行 install/promote/recover 的锁准备逻辑，结果必须为 root:root 0600 普通单链接文件；预置 0644 时安全修权，预置 symlink/目录/非 root/多链接时拒绝。`nobody` 无法打开或持锁，backup 与 controller 的共享/排他互斥仍成立。
+23. 在开发仓库 local config 设置 `url.*.insteadOf` 指向攻击者 bare main，并用 `core.attributesFile`/`.git/info/attributes` 对 tracked 文件设置 `export-ignore`；生产授权、tree 和归档仍只能来自固定 GitHub fetch 的 root-owned bare 仓库，假 main 与被隐藏文件均不能进入结果。
 
 ### 7.2 生产
 
@@ -210,3 +212,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 首次生产提升还存在备份自举缺口：线上历史 current 的 backup CLI 本身没有本轮新增的崩溃安全顺序，若仍用 origin runner，第一份发布备份不满足 FR-OPS-008。正常 promote 必须使用已校验 target 的安全 runner；rollback 使用调用前 current runner，并在 transient sandbox 隐藏生产密钥。
 
 维护锁审计确认首次 root 控制器可在 umask 022 下创建 0644 lock；Linux flock 允许普通用户对只读 fd 取得排他锁，因此可永久阻断发布和备份。生产控制器必须统一创建/修权/验证固定锁，recovery 先行后 backup 复用该受保护 inode。
+
+Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固定 GitHub URL 改到攻击者 bare remote，`core.attributesFile`/info attributes 还能让 archive 丢文件。授权与产物不能再复用开发仓库配置：固定远端 fetch、commit/tree/archive 必须全部在 root-owned 临时 bare 仓库完成。
