@@ -53,6 +53,7 @@ type AppOptions = {
   seed?: boolean;
   logger?: boolean;
   serveStatic?: boolean;
+  beforeTopicUpdate?: () => Promise<void>;
 };
 
 function validationMessage(error: z.ZodError) {
@@ -128,25 +129,22 @@ export function buildApp(options: AppOptions = {}) {
     if (fieldsByStatus[current.status].some((field) => field in body.data)) {
       return reply.code(409).send({ message: '当前状态不能修改这些字段，请按议题流程操作' });
     }
-    const next = { ...current, ...body.data };
-    db.prepare(`
-      UPDATE topics SET title = ?, summary = ?, proposer = ?, presenter = ?, tags = ?,
-        scheduled_at = ?, duration = ?, room = ?, takeaway = ?, material_url = ?, updated_at = ?
-      WHERE id = ?
-    `).run(
-      next.title,
-      next.summary,
-      next.proposer,
-      next.presenter || null,
-      JSON.stringify(next.tags),
-      next.scheduledAt,
-      next.duration,
-      next.room || null,
-      next.takeaway || null,
-      next.materialUrl || null,
-      new Date().toISOString(),
-      params.data.id,
-    );
+    await options.beforeTopicUpdate?.();
+    const updates: { column: string; value: unknown }[] = [];
+    if (body.data.title !== undefined) updates.push({ column: 'title', value: body.data.title });
+    if (body.data.summary !== undefined) updates.push({ column: 'summary', value: body.data.summary });
+    if (body.data.proposer !== undefined) updates.push({ column: 'proposer', value: body.data.proposer });
+    if (body.data.presenter !== undefined) updates.push({ column: 'presenter', value: body.data.presenter });
+    if (body.data.tags !== undefined) updates.push({ column: 'tags', value: JSON.stringify(body.data.tags) });
+    if (body.data.scheduledAt !== undefined) updates.push({ column: 'scheduled_at', value: body.data.scheduledAt });
+    if (body.data.duration !== undefined) updates.push({ column: 'duration', value: body.data.duration });
+    if (body.data.room !== undefined) updates.push({ column: 'room', value: body.data.room });
+    if (body.data.takeaway !== undefined) updates.push({ column: 'takeaway', value: body.data.takeaway });
+    if (body.data.materialUrl !== undefined) updates.push({ column: 'material_url', value: body.data.materialUrl || null });
+    updates.push({ column: 'updated_at', value: new Date().toISOString() });
+    const result = db.prepare(`UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')} WHERE id = ?`)
+      .run(...updates.map(({ value }) => value), params.data.id);
+    if (result.changes === 0) return reply.code(404).send({ message: '没有找到这个议题' });
     return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 

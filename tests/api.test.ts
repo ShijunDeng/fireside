@@ -201,4 +201,49 @@ describe('数据库兼容性与并发', () => {
     await Promise.all([firstApp.close(), secondApp.close()]);
     await rm(directory, { recursive: true, force: true });
   });
+
+  it('普通编辑与排期交错时不会覆盖生命周期字段', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-update-race-'));
+    const databasePath = path.join(directory, 'shared.db');
+    let signalRead!: () => void;
+    let releaseUpdate!: () => void;
+    const readReached = new Promise<void>((resolve) => { signalRead = resolve; });
+    const updateReleased = new Promise<void>((resolve) => { releaseUpdate = resolve; });
+    const editingApp = buildApp({
+      databasePath, seed: false, serveStatic: false,
+      beforeTopicUpdate: async () => { signalRead(); await updateReleased; },
+    });
+    const lifecycleApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await Promise.all([editingApp.ready(), lifecycleApp.ready()]);
+    const created = await lifecycleApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '并发编辑议题', summary: '编辑标题时另一实例进行排期。', proposer: '发起人', tags: [] },
+    });
+    const id = created.json().id as number;
+    await lifecycleApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '分享人' } });
+
+    const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { title: '并发后的新标题' } });
+    await readReached;
+    const scheduledAt = new Date(Date.now() + 86_400_000).toISOString();
+    const scheduled = await lifecycleApp.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`,
+      payload: { scheduledAt, duration: 50, room: '并发测试会议室' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    releaseUpdate();
+    const edited = await pendingEdit;
+    assert.equal(edited.statusCode, 200);
+
+    const topics = await lifecycleApp.inject({ method: 'GET', url: '/api/topics' });
+    const finalTopic = topics.json()[0];
+    assert.equal(finalTopic.title, '并发后的新标题');
+    assert.equal(finalTopic.status, 'SCHEDULED');
+    assert.equal(finalTopic.presenter, '分享人');
+    assert.equal(finalTopic.scheduledAt, scheduledAt);
+    assert.equal(finalTopic.duration, 50);
+    assert.equal(finalTopic.room, '并发测试会议室');
+
+    await Promise.all([editingApp.close(), lifecycleApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
 });
