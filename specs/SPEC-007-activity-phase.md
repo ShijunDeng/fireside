@@ -1,6 +1,6 @@
 # SPEC-007：活动阶段与动作准入
 
-- 状态：`Ready`
+- 状态：`Accepted`
 - 创建：2026-09-02
 - 优先级：P1
 - 关联：SPEC-003 第 11 轮、SPEC-004 FR-FLOW-004 / FR-JOIN-001～002 / FR-POSTER-001、SPEC-005 Topic revision

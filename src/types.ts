@@ -1,3 +1,5 @@
+export type { ActivityPhase } from '../shared/activity';
+
 export type TopicStatus = 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED';
 
 export interface Topic {

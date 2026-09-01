@@ -17,6 +17,67 @@ async function deleteLatestTopic(request: APIRequestContext, id: number) {
   if (response.status() !== 204) throw new Error(`Failed to delete topic ${id}: ${response.status()}`);
 }
 
+type PhaseTopic = {
+  id: number;
+  revision: number;
+  title: string;
+  summary: string;
+  proposer: string;
+  presenter: string | null;
+  tags: string[];
+  status: 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED';
+  scheduledAt: string | null;
+  duration: number | null;
+  room: string | null;
+  meetingUrl: string | null;
+  hasMeetingUrl: boolean;
+  participantCount: number;
+  takeaway: string | null;
+  materialUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt: string | null;
+};
+
+async function readPhaseTopic(request: APIRequestContext, id: number) {
+  const response = await request.get(`/api/topics/${id}`);
+  if (!response.ok()) throw new Error(`Failed to read topic ${id}: ${response.status()}`);
+  return response.json() as Promise<PhaseTopic>;
+}
+
+async function createScheduledPhaseTopic(request: APIRequestContext, data: {
+  title: string;
+  scheduledAt: string;
+  meetingUrl?: string;
+}) {
+  const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    title: data.title,
+    summary: '活动阶段浏览器验收夹具。',
+    proposer: '阶段测试',
+    presenter: '阶段测试',
+    tags: ['阶段'],
+  } });
+  expect(created.status()).toBe(201);
+  const topic = await created.json() as PhaseTopic;
+  const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, {
+    headers: revisionHeaders(topic.revision),
+    data: {
+      scheduledAt: data.scheduledAt,
+      duration: 10,
+      room: '阶段测试会议室',
+      meetingUrl: data.meetingUrl ?? '',
+    },
+  });
+  expect(scheduled.status()).toBe(200);
+  return scheduled.json() as Promise<PhaseTopic>;
+}
+
+async function cleanupPhaseTopics(request: APIRequestContext, ids: number[]) {
+  const results = await Promise.allSettled(ids.map((id) => deleteLatestTopic(request, id)));
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (failure) throw failure.reason;
+}
+
 test.describe('议题管理工作台', () => {
   test.beforeEach(async ({ page }) => {
     await page.addInitScript((key) => {
@@ -75,12 +136,12 @@ test.describe('议题管理工作台', () => {
     await expect(updatedCard).toHaveCount(0);
   });
 
-  test('自荐发布并可逐步撤销归档、排期和认领', async ({ page }, testInfo) => {
+  test('自荐发布并可逐步撤销排期和认领', async ({ page }, testInfo) => {
     const title = `自荐发布浏览器验收-${testInfo.project.name}-${Date.now()}`;
     await page.goto('/');
     await page.getByRole('button', { name: /发起议题/ }).first().click();
     await page.getByLabel('议题标题').fill(title);
-    await page.getByLabel('一句话简介').fill('从自荐发布走到排期归档，再逐步撤销以验证纠错路径。');
+    await page.getByLabel('一句话简介').fill('从自荐发布走到排期，再逐步撤销以验证纠错路径。');
     await page.getByLabel('你的名字').fill('自荐分享者');
     await page.getByLabel('我来分享').check();
     await page.getByRole('button', { name: '发布议题' }).click();
@@ -91,15 +152,7 @@ test.describe('议题管理工作台', () => {
     await card.getByRole('button', { name: /安排分享/ }).click();
     await page.getByRole('button', { name: '确认排期' }).click();
     await expect(card).toContainText('已排期');
-
-    await card.getByRole('button', { name: /完成归档/ }).click();
-    await page.getByLabel('本期最值得留下的收获').fill('浏览器完整纠错链路已验证。');
-    await page.getByRole('dialog').getByRole('button', { name: '完成归档' }).click();
-    await expect(card).toContainText('已经归档');
-
-    await card.getByRole('button', { name: /撤销归档/ }).click();
-    await page.getByRole('button', { name: '确认撤销归档' }).click();
-    await expect(card).toContainText('已排期');
+    await expect(card.getByRole('button', { name: /完成归档/ })).toHaveCount(0);
 
     await card.getByRole('button', { name: /取消排期/ }).click();
     await page.getByRole('button', { name: '确认取消排期' }).click();
@@ -174,6 +227,265 @@ test.describe('议题管理工作台', () => {
     await expect(card).toHaveCount(0);
   });
 
+  test('活动从即将开始无刷新进入进行中，并在阶段冲突后同步动作矩阵', async ({ page, request }, testInfo) => {
+    test.setTimeout(45_000);
+    const marker = `${testInfo.project.name}-${Date.now()}-${testInfo.retry}`;
+    const upcomingTitle = `即将开始阶段验收-${marker}`;
+    const liveTitle = `跨开始边界验收-${marker}`;
+    const upcomingMeeting = `https://meet.example.test/upcoming/${marker}`;
+    const liveMeeting = `https://meet.example.test/live/${marker}`;
+    const cleanupIds: number[] = [];
+
+    await page.addInitScript(() => {
+      const key = 'e2e-phase-document-loads';
+      sessionStorage.setItem(key, String(Number(sessionStorage.getItem(key) ?? 0) + 1));
+    });
+
+    try {
+      const upcoming = await createScheduledPhaseTopic(request, {
+        title: upcomingTitle,
+        scheduledAt: new Date(Date.now() + 86_400_000).toISOString(),
+        meetingUrl: upcomingMeeting,
+      });
+      cleanupIds.push(upcoming.id);
+
+      await page.goto('/');
+      const upcomingCard = page.locator('.topic-card')
+        .filter({ has: page.getByRole('heading', { name: upcomingTitle, exact: true }) })
+        .filter({ hasText: `#${String(upcoming.id).padStart(3, '0')}` });
+      await expect(upcomingCard.locator('.status-pill')).toHaveText('已排期');
+      await expect(upcomingCard.getByRole('button', { name: '报名参加' })).toBeVisible();
+      await expect(upcomingCard.getByRole('button', { name: '加入会议' })).toBeVisible();
+      await expect(upcomingCard.getByRole('button', { name: '生成海报' })).toBeVisible();
+      await expect(upcomingCard.getByRole('button', { name: '取消排期' })).toBeVisible();
+      await expect(upcomingCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
+      await expect(upcomingCard.getByRole('button', { name: /未举行/ })).toHaveCount(0);
+
+      await upcomingCard.getByRole('button', { name: '报名参加' }).click();
+      let participantDialog = page.getByRole('dialog');
+      await participantDialog.getByLabel('你的名字').fill('即将开始参与者');
+      await participantDialog.getByRole('button', { name: '确认报名' }).click();
+      await expect(participantDialog.getByText('即将开始参与者')).toBeVisible();
+      await participantDialog.getByRole('button', { name: '取消 即将开始参与者 的报名' }).click();
+      await expect(participantDialog.getByText('0 人')).toBeVisible();
+      await participantDialog.getByRole('button', { name: '关闭' }).click();
+
+      await upcomingCard.getByRole('button', { name: '加入会议' }).click();
+      let dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', upcomingMeeting);
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      await upcomingCard.getByRole('button', { name: '生成海报' }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('heading', { name: '宣讲海报已为你备好' })).toBeVisible();
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      const boundary = await createScheduledPhaseTopic(request, {
+        title: liveTitle,
+        scheduledAt: new Date(Date.now() + 8_000).toISOString(),
+        meetingUrl: liveMeeting,
+      });
+      cleanupIds.push(boundary.id);
+      await page.reload();
+      const documentLoadsAtUpcoming = await page.evaluate(() => Number(sessionStorage.getItem('e2e-phase-document-loads')));
+      const liveCard = page.locator('.topic-card')
+        .filter({ has: page.getByRole('heading', { name: liveTitle, exact: true }) })
+        .filter({ hasText: `#${String(boundary.id).padStart(3, '0')}` });
+      await expect(liveCard.locator('.status-pill')).toHaveText('已排期');
+      await liveCard.getByRole('button', { name: '取消排期' }).click();
+      const staleUnscheduleDialog = page.getByRole('dialog');
+      await expect(staleUnscheduleDialog.getByRole('heading', { name: '取消这次排期？' })).toBeVisible();
+
+      await expect(liveCard.locator('.status-pill')).toHaveText('进行中', { timeout: 15_000 });
+      expect(await page.evaluate(() => Number(sessionStorage.getItem('e2e-phase-document-loads')))).toBe(documentLoadsAtUpcoming);
+      await staleUnscheduleDialog.getByRole('button', { name: '确认取消排期' }).click();
+      await expect(staleUnscheduleDialog).toHaveCount(0);
+      await expect(liveCard.locator('.status-pill')).toHaveText('进行中');
+      await expect(page.getByText(/已同步最新状态/)).toBeVisible();
+
+      await expect(liveCard.getByRole('button', { name: '报名参加' })).toBeVisible();
+      await expect(liveCard.getByRole('button', { name: '加入会议' })).toBeVisible();
+      await expect(liveCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+      await expect(liveCard.getByRole('button', { name: '取消排期' })).toHaveCount(0);
+      await expect(liveCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
+      await expect(liveCard.getByRole('button', { name: /未举行/ })).toHaveCount(0);
+
+      await liveCard.getByRole('button', { name: '报名参加' }).click();
+      participantDialog = page.getByRole('dialog');
+      await participantDialog.getByLabel('你的名字').fill('迟到参与者');
+      await participantDialog.getByRole('button', { name: '确认报名' }).click();
+      await expect(participantDialog.getByText('迟到参与者')).toBeVisible();
+      await participantDialog.getByRole('button', { name: '关闭' }).click();
+
+      await liveCard.getByRole('button', { name: '加入会议' }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', liveMeeting);
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      await liveCard.getByRole('button', { name: `编辑 ${liveTitle}`, exact: true }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog).toContainText('活动进行中，排期已锁定');
+      await expect(dialog.getByLabel('分享时间')).toBeDisabled();
+      await expect(dialog.getByLabel('时长（分钟）')).toBeDisabled();
+      await expect(dialog.getByLabel('地点 / 参与说明（链接与凭证请填下方）')).toBeEnabled();
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      await page.getByRole('button', { name: '周历' }).click();
+      const liveWeekEvent = page.locator('.week-event').filter({ hasText: liveTitle });
+      await expect(liveWeekEvent).toContainText('进行中');
+      await expect(liveWeekEvent.getByRole('button', { name: '加入会议' })).toBeVisible();
+      await expect(liveWeekEvent.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+    } finally {
+      await cleanupPhaseTopics(request, cleanupIds);
+    }
+  });
+
+  test('结束与归档阶段提供只读名单、归档和未举行恢复且关闭会议', async ({ page, request }) => {
+    const topicsResponse = await request.get('/api/topics');
+    expect(topicsResponse.ok()).toBe(true);
+    const topics = await topicsResponse.json() as PhaseTopic[];
+    const archivedSeed = topics.find((topic) => topic.title === 'RAG 不是万能药：我们踩过的三个坑' && topic.status === 'ARCHIVED');
+    if (!archivedSeed) throw new Error('缺少可恢复的历史归档种子议题');
+    const originalArchive = {
+      takeaway: archivedSeed.takeaway ?? '历史归档验收恢复内容',
+      materialUrl: archivedSeed.materialUrl ?? '',
+    };
+
+    try {
+      await page.goto('/');
+      let seedCard = page.locator('.topic-card')
+        .filter({ has: page.getByRole('heading', { name: archivedSeed.title, exact: true }) })
+        .filter({ hasText: `#${String(archivedSeed.id).padStart(3, '0')}` });
+      await expect(seedCard.locator('.status-pill')).toHaveText('已经归档');
+      await expect(seedCard.getByRole('button', { name: '查看参与' })).toBeVisible();
+      await expect(seedCard.getByRole('button', { name: '撤销归档' })).toBeVisible();
+      await expect(seedCard.getByRole('button', { name: '加入会议' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '报名参加' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
+      const archivedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: writeHeaders });
+      expect(archivedMeeting.status()).toBe(409);
+      expect(await archivedMeeting.text()).not.toContain('http');
+
+      const unarchived = await request.post(`/api/topics/${archivedSeed.id}/unarchive`, {
+        headers: revisionHeaders((await readPhaseTopic(request, archivedSeed.id)).revision),
+        data: {},
+      });
+      expect(unarchived.status()).toBe(200);
+      await page.reload();
+      seedCard = page.locator('.topic-card')
+        .filter({ has: page.getByRole('heading', { name: archivedSeed.title, exact: true }) })
+        .filter({ hasText: `#${String(archivedSeed.id).padStart(3, '0')}` });
+      await expect(seedCard.locator('.status-pill')).toHaveText('待归档');
+      await expect(seedCard).toContainText('分享已结束，等待归档');
+      await expect(seedCard.getByRole('button', { name: '查看参与' })).toBeVisible();
+      await expect(seedCard.getByRole('button', { name: '完成归档' })).toBeVisible();
+      await expect(seedCard.getByRole('button', { name: '未举行 / 重新排期' })).toBeVisible();
+      await expect(seedCard.getByRole('button', { name: '报名参加' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '加入会议' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: '取消排期' })).toHaveCount(0);
+      const endedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: writeHeaders });
+      expect(endedMeeting.status()).toBe(409);
+      expect(await endedMeeting.text()).not.toContain('http');
+
+      await seedCard.getByRole('button', { name: '查看参与' }).click();
+      let dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('heading', { name: '本期参与伙伴' })).toBeVisible();
+      await expect(dialog.getByText('0 人')).toBeVisible();
+      await expect(dialog.getByLabel('你的名字')).toHaveCount(0);
+      await expect(dialog.getByRole('button', { name: '确认报名' })).toHaveCount(0);
+      await expect(dialog.locator('.participant-row button')).toHaveCount(0);
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      await seedCard.getByRole('button', { name: `编辑 ${archivedSeed.title}`, exact: true }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog.getByLabel('分享时间')).toBeDisabled();
+      await expect(dialog.getByLabel('时长（分钟）')).toBeDisabled();
+      await expect(dialog.getByLabel('地点 / 参与说明（链接与凭证请填下方）')).toBeEnabled();
+      await dialog.getByRole('button', { name: '关闭' }).click();
+
+      await page.getByRole('button', { name: '周历' }).click();
+      await page.getByRole('button', { name: '上一个周期' }).click();
+      const endedWeekEvent = page.locator('.week-event').filter({ hasText: archivedSeed.title });
+      await expect(endedWeekEvent).toContainText('待归档');
+      await expect(endedWeekEvent.getByRole('button', { name: '加入会议' })).toHaveCount(0);
+      await expect(endedWeekEvent.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+      await page.getByRole('button', { name: '列表' }).click();
+
+      await seedCard.getByRole('button', { name: '完成归档' }).click();
+      dialog = page.getByRole('dialog');
+      await dialog.getByLabel('本期最值得留下的收获').fill(originalArchive.takeaway);
+      if (originalArchive.materialUrl) await dialog.getByLabel('资料链接（选填）').fill(originalArchive.materialUrl);
+      await dialog.getByRole('button', { name: '完成归档' }).click();
+      await expect(seedCard.locator('.status-pill')).toHaveText('已经归档');
+
+      const secondUnarchive = await request.post(`/api/topics/${archivedSeed.id}/unarchive`, {
+        headers: revisionHeaders((await readPhaseTopic(request, archivedSeed.id)).revision),
+        data: {},
+      });
+      expect(secondUnarchive.status()).toBe(200);
+      const endedForReset = await readPhaseTopic(request, archivedSeed.id);
+      await page.reload();
+      seedCard = page.locator('.topic-card')
+        .filter({ has: page.getByRole('heading', { name: archivedSeed.title, exact: true }) })
+        .filter({ hasText: `#${String(archivedSeed.id).padStart(3, '0')}` });
+
+      let serveResetResult = false;
+      let resetRequestCount = 0;
+      const claimedAfterReset: PhaseTopic = {
+        ...endedForReset,
+        revision: endedForReset.revision + 1,
+        status: 'CLAIMED',
+        scheduledAt: null,
+        duration: null,
+        room: null,
+        meetingUrl: null,
+        hasMeetingUrl: false,
+        participantCount: 0,
+        updatedAt: new Date().toISOString(),
+      };
+      await page.route(`**/api/topics/${archivedSeed.id}/unschedule`, async (route) => {
+        resetRequestCount += 1;
+        serveResetResult = true;
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(claimedAfterReset) });
+      });
+      await page.route(/\/api\/topics\?sort=/, async (route) => {
+        if (!serveResetResult) return route.continue();
+        const response = await route.fetch();
+        const currentTopics = await response.json() as PhaseTopic[];
+        await route.fulfill({ response, json: currentTopics.map((topic) => topic.id === archivedSeed.id ? claimedAfterReset : topic) });
+      });
+
+      await seedCard.getByRole('button', { name: '未举行 / 重新排期' }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog.getByRole('heading', { name: '确认未举行 / 重新排期？' })).toBeVisible();
+      await expect(dialog).toContainText(/旧报名/);
+      await expect(dialog).toContainText(/地点/);
+      await expect(dialog).toContainText(/会议入口/);
+      await dialog.getByRole('button', { name: '确认未举行 / 重新排期' }).click();
+      expect(resetRequestCount).toBe(1);
+      await expect(seedCard.locator('.status-pill')).toHaveText('已被认领');
+      await expect(seedCard).not.toContainText('人报名');
+      const unchangedRealParticipants = await request.get(`/api/topics/${archivedSeed.id}/participants`, { headers: writeHeaders });
+      expect(unchangedRealParticipants.status()).toBe(200);
+      expect(await unchangedRealParticipants.json()).toEqual([]);
+      await page.unroute(`**/api/topics/${archivedSeed.id}/unschedule`);
+      await page.unroute(/\/api\/topics\?sort=/);
+    } finally {
+      const current = await readPhaseTopic(request, archivedSeed.id);
+      if (current.status === 'SCHEDULED') {
+        const restored = await request.post(`/api/topics/${archivedSeed.id}/archive`, {
+          headers: revisionHeaders(current.revision),
+          data: originalArchive,
+        });
+        if (restored.status() !== 200) throw new Error(`Failed to restore archived seed ${archivedSeed.id}: ${restored.status()}`);
+      } else if (current.status !== 'ARCHIVED') {
+        throw new Error(`Archived seed ${archivedSeed.id} ended in unexpected state ${current.status}`);
+      }
+    }
+  });
+
   test('公网只读脱敏，解锁后协作且失效口令不会丢失表单', async ({ page, request }, testInfo) => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const protectedTitle = `公网隐私验收-${marker}`;
@@ -246,10 +558,10 @@ test.describe('议题管理工作台', () => {
     await Promise.all(cleanupIds.map((id) => deleteLatestTopic(request, id)));
   });
 
-  test('报名弹窗遇到活动状态冲突会关闭并同步权威结果', async ({ page, request }, testInfo) => {
+  test('报名弹窗遇到取消排期会关闭并同步权威结果', async ({ page, request }, testInfo) => {
     const title = `报名冲突验收-${testInfo.project.name}-${Date.now()}`;
     const created = await request.post('/api/topics', { headers: writeHeaders, data: {
-      title, summary: '打开报名后由另一位协调者归档。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
+      title, summary: '打开报名后由另一位协调者取消排期。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
     } });
     const topic = await created.json() as { id: number; revision: number };
     const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
@@ -262,11 +574,11 @@ test.describe('议题管理工作台', () => {
     await card.getByRole('button', { name: '报名参加' }).click();
     const dialog = page.getByRole('dialog');
     await dialog.getByLabel('你的名字').fill('晚到的参与者');
-    const archived = await request.post(`/api/topics/${topic.id}/archive`, { headers: revisionHeaders(scheduledTopic.revision), data: { takeaway: '由另一位协调者完成归档。', materialUrl: '' } });
-    expect(archived.status()).toBe(200);
+    const unscheduled = await request.post(`/api/topics/${topic.id}/unschedule`, { headers: revisionHeaders(scheduledTopic.revision), data: {} });
+    expect(unscheduled.status()).toBe(200);
     await dialog.getByRole('button', { name: '确认报名' }).click();
     await expect(dialog).toHaveCount(0);
-    await expect(card).toContainText('已经归档');
+    await expect(card).toContainText('已被认领');
     await expect(page.getByText(/已同步最新状态/)).toBeVisible();
 
     await deleteLatestTopic(request, topic.id);
@@ -443,7 +755,6 @@ test.describe('议题管理工作台', () => {
     });
     const future = new Date(Date.now() + 3 * 86_400_000);
     future.setHours(19, 30, 0, 0);
-    const past = new Date(Date.now() - 86_400_000);
     const created = await request.post('/api/topics', { headers: writeHeaders, data: {
       title,
       summary: '验证最大合法布局与分段凭证。会议号：123 456 789，入会密码（括号密语），后续普通简介仍可安全绘制。',
@@ -453,28 +764,15 @@ test.describe('议题管理工作台', () => {
     } });
     expect(created.ok()).toBe(true);
     const topic = await created.json() as { id: number; revision: number };
-    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
-      scheduledAt: future.toISOString(), duration: 45, room: '三楼围炉会议室', meetingUrl: secretUrl,
-    } });
-    expect(scheduled.ok()).toBe(true);
-    const pastCreated = await request.post('/api/topics', { headers: writeHeaders, data: {
-      title: `过期海报验收 ${marker}`, summary: '过期排期不能继续宣传。', proposer: '海报测试', presenter: '海报测试', tags: [],
-    } });
-    expect(pastCreated.ok()).toBe(true);
-    const pastTopic = await pastCreated.json() as { id: number; revision: number };
-    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { headers: revisionHeaders(pastTopic.revision), data: {
-      scheduledAt: past.toISOString(), duration: 30, room: '旧会议室', meetingUrl: '',
-    } });
-    expect(pastScheduled.ok()).toBe(true);
-
-    await page.goto('/');
+    try {
+      const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
+        scheduledAt: future.toISOString(), duration: 45, room: '三楼围炉会议室', meetingUrl: secretUrl,
+      } });
+      expect(scheduled.ok()).toBe(true);
+      await page.goto('/');
     const card = page.locator('.topic-card')
       .filter({ has: page.getByRole('heading', { name: title, exact: true }) })
       .filter({ hasText: `#${String(topic.id).padStart(3, '0')}` });
-    const pastCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: `过期海报验收 ${marker}`, exact: true }) });
-    await expect(pastCard).toContainText('待归档');
-    await expect(pastCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
-
     const requests: string[] = [];
     page.on('request', (outgoing) => requests.push(outgoing.url()));
     const posterButton = card.getByRole('button', { name: '生成海报' });
@@ -520,9 +818,8 @@ test.describe('议题管理工作台', () => {
     }));
     expect(overflow.document).toBeLessThanOrEqual(0);
     expect(overflow.body).toBeLessThanOrEqual(0);
-    const sourceRequests = requests.filter((url) => !url.startsWith('blob:'));
+    const sourceRequests = requests.filter((url) => url.endsWith(`/api/topics/${topic.id}`));
     expect(sourceRequests).toHaveLength(1);
-    expect(sourceRequests[0]).toMatch(new RegExp(`/api/topics/${topic.id}$`));
     await expect(dialog).toContainText('长按海报图片保存');
 
     const downloadButton = dialog.getByRole('button', { name: '下载 PNG' });
@@ -557,8 +854,9 @@ test.describe('议题管理工作台', () => {
     expect(requests.filter((url) => url.endsWith(`/api/topics/${topic.id}`))).toHaveLength(3);
     await page.getByRole('button', { name: '关闭' }).click();
 
-    await deleteLatestTopic(request, topic.id);
-    await deleteLatestTopic(request, pastTopic.id);
+    } finally {
+      await deleteLatestTopic(request, topic.id);
+    }
   });
 
   test('海报从列表与周历读取最新改期后再生成', async ({ page, request }, testInfo) => {
@@ -761,41 +1059,44 @@ test.describe('议题管理工作台', () => {
     scheduledAt.setHours(18, 0, 0, 0);
     const ids: number[] = [];
     const titles: string[] = [];
-    for (let index = 1; index <= 4; index += 1) {
-      const title = `月历溢出-${testInfo.project.name}-${Date.now()}-${index}`;
-      titles.push(title);
-      const created = await request.post('/api/topics', {
-        headers: writeHeaders,
-        data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
-      });
-      const topic = await created.json() as { id: number; revision: number };
-      ids.push(topic.id);
-      await request.post(`/api/topics/${topic.id}/schedule`, {
-        headers: revisionHeaders(topic.revision),
-        data: { scheduledAt: scheduledAt.toISOString(), duration: 30, room: '月历测试会议室', meetingUrl: '' },
-      });
+    const titlePrefix = `月历溢出-${testInfo.project.name}-${Date.now()}`;
+    try {
+      for (let index = 1; index <= 4; index += 1) {
+        const title = `${titlePrefix}-${index}`;
+        titles.push(title);
+        const created = await request.post('/api/topics', {
+          headers: writeHeaders,
+          data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
+        });
+        const topic = await created.json() as { id: number; revision: number };
+        ids.push(topic.id);
+        await request.post(`/api/topics/${topic.id}/schedule`, {
+          headers: revisionHeaders(topic.revision),
+          data: { scheduledAt: scheduledAt.toISOString(), duration: 30, room: '月历测试会议室', meetingUrl: '' },
+        });
+      }
+
+      await page.goto('/');
+      await page.getByRole('button', { name: '月历', exact: true }).click();
+      const moreButton = page.getByRole('button', { name: /还有 \d+ 个议题/ });
+      const fixtureEvents = page.locator('.calendar-event').filter({ hasText: titlePrefix });
+      await expect(moreButton).toBeVisible();
+      expect(await fixtureEvents.count()).toBeLessThan(4);
+      await moreButton.click();
+      await expect(fixtureEvents).toHaveCount(4);
+      await expect(page.getByRole('button', { name: '收起' })).toBeVisible();
+
+      await page.getByRole('button', { name: /发起议题/ }).first().click();
+      await page.getByLabel('议题标题').fill('标签上限验收');
+      await page.getByLabel('一句话简介').fill('第六个标签必须明确报错，不能被静默截断。');
+      await page.getByLabel('你的名字').fill('标签测试');
+      await page.getByLabel('标签（最多 5 个）').fill('一,二,三,四,五,六');
+      await page.getByRole('button', { name: '发布议题' }).click();
+      await expect(page.getByText('标签最多 5 个')).toBeVisible();
+      await page.getByRole('button', { name: '关闭' }).click();
+    } finally {
+      await cleanupPhaseTopics(request, ids);
     }
-
-    await page.goto('/');
-    await page.getByRole('button', { name: '月历', exact: true }).click();
-    const moreButton = page.getByRole('button', { name: '还有 1 个议题' });
-    const hiddenEvent = page.locator('.calendar-event').filter({ hasText: titles[3] });
-    await expect(moreButton).toBeVisible();
-    await expect(hiddenEvent).toHaveCount(0);
-    await moreButton.click();
-    await expect(hiddenEvent).toBeVisible();
-    await expect(page.getByRole('button', { name: '收起' })).toBeVisible();
-
-    await page.getByRole('button', { name: /发起议题/ }).first().click();
-    await page.getByLabel('议题标题').fill('标签上限验收');
-    await page.getByLabel('一句话简介').fill('第六个标签必须明确报错，不能被静默截断。');
-    await page.getByLabel('你的名字').fill('标签测试');
-    await page.getByLabel('标签（最多 5 个）').fill('一,二,三,四,五,六');
-    await page.getByRole('button', { name: '发布议题' }).click();
-    await expect(page.getByText('标签最多 5 个')).toBeVisible();
-    await page.getByRole('button', { name: '关闭' }).click();
-
-    await Promise.all(ids.map((id) => deleteLatestTopic(request, id)));
   });
 
   test('上移按钮保存手动顺序，刷新后保持', async ({ page }) => {

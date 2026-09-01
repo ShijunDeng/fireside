@@ -1,7 +1,7 @@
-import type { Participant, Stats, Topic, TopicSort } from './types';
+import type { ActivityPhase, Participant, Stats, Topic, TopicSort } from './types';
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number, public code?: string) {
+  constructor(message: string, public status: number, public code?: string, public phase?: ActivityPhase) {
     super(message);
   }
 }
@@ -26,13 +26,17 @@ export function onUnauthorized(handler: (() => void) | null) {
 }
 
 async function readBody<T>(response: Response, notifyUnauthorized = true): Promise<T> {
-  const body = await response.json().catch(() => ({}));
+  const body = await response.json().catch(() => ({})) as {
+    message?: string;
+    code?: string;
+    phase?: ActivityPhase;
+  };
   if (!response.ok) {
     if (response.status === 401 && notifyUnauthorized) {
       clearWriteKey();
       unauthorizedHandler?.();
     }
-    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code);
+    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code, body.phase);
   }
   return body as T;
 }
