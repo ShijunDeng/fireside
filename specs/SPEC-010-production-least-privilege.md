@@ -95,6 +95,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
+- 含生产备份副本且已授权给 `fireside-build` 的 preflight stage 必须确认递归删除成功且路径消失后，才能取消 EXIT trap、写 transaction 或切换 `current`。显式清理失败必须以 2 停在切换前并记录稳定错误；trap 的兜底清理失败也必须可见，不能静默把敏感副本当作已删除。
 - healthy marker 的 manifest digest 必须先独立计算、检查命令状态并验证为 64 位 SHA-256（仅显式 legacy current 可用固定标记），再写 marker；禁止让 command substitution 失败被外层 `printf` 成功掩盖。marker 生成/持久化失败属于提升失败，必须回到调用前版本。
 - manifest 复算器的退出状态必须与内容比较一起成功；process substitution 生产者失败不能被 `cmp` 的前缀相等吞掉。额外的换行/Tab 路径、尾部 stat/hash 失败或任意生成器异常都必须拒绝整个 release。
 - 健康门禁不是单次 200：socket 与 service active，MainPID UID 为 `fireside`、cwd 精确指向目标 release，PID 在稳定观察窗不变化，且多个新连接健康请求连续成功。previous 更新或其持久化失败也视为提升失败并恢复原版本。
@@ -154,6 +155,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 17. 注入 manifest digest 读取/hash 失败；不得生成空 digest healthy marker，不得把目标记为 previous/healthy，提升必须按事务语义自动恢复。
 18. 在合法 manifest 后增加排序位于尾部且含换行/Tab 的路径，或让尾部 stat/hash 失败；即使生成器已输出的前缀与磁盘 manifest 完全相等，验证仍必须失败。
 19. 为已授权 commit 创建指向恶意 commit 的本地 `refs/replace`；controller 的 tree、archive 和最终 marker 必须仍对应原对象，替换内容不得进入候选。
+20. 在三次业务指纹均一致后注入 preflight stage 删除失败；命令必须返回 2，current/previous/journal 不变且明确报告待人工清理的路径状态。恢复清理能力后，同一门禁可正常完成且不残留 stage。
 
 ### 7.2 生产
 
@@ -198,3 +200,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 发布文档和授权链也存在闭环缺口：直接向 SSH URL push 不会更新命名 remote 的 tracking ref，而本地 ref 本身又可由开发用户改写。文档必须显式 fetch/验证；生产控制器则从固定 HTTPS GitHub `refs/heads/main` 读取权威 commit，不能把开发者仓库元数据当授权根。
 
 主动复核补充：即使 commit SHA 由 GitHub 精确授权，本地 `refs/replace/<commit>` 仍可让默认 `git archive` 读取另一对象。隔离 Git 命令必须统一设置 no-replace 语义，并以恶意替换树证明归档身份没有被本地元数据改写。
+
+敏感副本清理复审发现：三次 preflight 成功后的显式 `rm -rf` 状态原先未检查，脚本会取消 trap 并继续发布，可能把 build 用户可读的生产数据库副本留在 `/run`。清理成功和路径消失是写发布事务前的硬门禁；失败不得切换版本或误报完成。

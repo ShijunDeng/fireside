@@ -217,3 +217,4 @@
 - manifest 复算也不能用丢失 producer 状态的 process substitution：若尾部路径含换行/Tab 或 stat/hash 失败，`cmp` 可能只比较已输出的合法前缀并误判相等。必须让生成器和比较器状态共同受 `pipefail` 门禁，并加入非法尾部路径回归。
 - 发布流程补强：按 SSH URL push 不更新 `refs/remotes/origin/main`，README 必须显式 fetch 后再验证；生产 controller 不能信任开发用户可改写的本地 tracking ref，须从固定 HTTPS GitHub 权威 main 核对精确 commit。
 - 本地主动审计阻断 H：GitHub 精确 SHA 授权后，本地 `refs/replace/<commit>` 仍可让默认 rev/tree/archive 采用攻击者替换对象。所有 release Git 命令必须禁用 replacement refs，并用恶意替换 commit 证明候选仍来自原始树。
+- 修复复审阻断 I：三次数据库 preflight 成功后，删除已 chown 给 build 用户的敏感副本 stage 若失败，旧脚本仍取消 trap 并切换版本。只有显式清理成功且路径消失才可写 transaction；清理故障必须返回 2、保持双指针/journal 不变并保留可见错误。
