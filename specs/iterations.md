@@ -257,5 +257,7 @@
 - 嵌套 npm bin 阻断 AT：真实 prune 后 Fastify 与 node-abi 的嵌套依赖各自包含 `.bin/semver`，原逻辑只删顶层 `.bin` 后把合法命令链接误报为越界。固化改为递归删除所有真实 `.bin` 目录，再对其余树保持零 symlink 门禁；测试同时覆盖嵌套清理和 `.bin` 外链接拒绝。
 - legacy npm bin 阻断 AU：候选安装成功后的首次 promote 被历史 current 的顶层/嵌套 `.bin` 命令链接拒绝。只有完全缺少 commit/metadata/manifest 且链接全集位于真实 `node_modules/**/.bin/` 的显式 legacy，才允许在主锁内先全量预检、再删除 `.bin`并fsync；其他链接或 manifested release 均零修改拒绝。
 - watchdog READY 归属阻断 AV：真实 transient `Type=notify` 中，短生命周期 `systemd-notify` 的自身PID不被 `NotifyAccess=main`接受；systemd-run等待READY、watchdog随后等待controller主锁，确定性死锁。dispatcher必须用 `--pid=parent` 把READY显式归属父脚本main PID（不依赖可能被 transient 参数展开改写的 shell PID 字面量），并以真实持锁systemd握手及杀监督恢复验证。
+- watchdog helper 凭据阻断 AW：AV 的直接 bash 探针绕过了生产 capability sandbox；真实 dispatcher链中 helper 没有权限伪装父PID，会退回自身凭据并继续被 `NotifyAccess=main`拒绝。固定root控制器、无网络且隔离业务密钥的 unit 改为 `NotifyAccess=all`，保留 `--pid=parent` 载荷和同步确认，不增加 `CAP_SYS_ADMIN`；验收必须复现生产进程链和最小bounding set。
+- watchdog 网络/部署密钥隔离阻断 AX：规格要求恢复者不接触公网和生产密钥，但 transient unit 仍可任意出站并读取 `/etc/fireside-release` 的 GitHub deploy key。恢复健康检查只需宿主 loopback，故 unit 用 `IPAddressDeny=any` + `IPAddressAllow=localhost` 仅放行回环，并把业务口令与整个deploy-key目录都加入 `InaccessiblePaths`；真实unit必须验证回环健康仍通、公网与两类密钥均不可达。
 
-本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR/AS/AT/AU/AV 十三个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。
+本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR/AS/AT/AU/AV/AW/AX 十五个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。

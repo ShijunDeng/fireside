@@ -1559,6 +1559,11 @@ server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address()
     assert.doesNotMatch(backupGate, /^EnvironmentFile=/m);
     assert.match(backup, /^ReadOnlyPaths=\/run$/m);
     assert.doesNotMatch(backup, /^ReadWritePaths=\/run$/m);
-    assert.match(await readFile(promoteScript, 'utf8'), /systemd-notify --pid=parent --ready/);
+    const promote = await readFile(promoteScript, 'utf8');
+    assert.match(promote, /systemd-notify --pid=parent --ready/);
+    assert.match(promote, /NotifyAccess=all/);
+    assert.doesNotMatch(promote, /CapabilityBoundingSet=[^'\n]*CAP_SYS_ADMIN/);
+    assert.match(promote, /IPAddressDeny=any -p IPAddressAllow=localhost/);
+    assert.match(promote, /InaccessiblePaths='\/etc\/fireside\.env \/etc\/fireside-release'/);
   });
 });

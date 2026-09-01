@@ -234,14 +234,16 @@ start_transaction_watchdog() {
   fi
   release_systemd_run --quiet --collect --service-type=notify \
     --unit="fireside-release-watchdog-${txid}" \
-    -p User=root -p Group=root -p NotifyAccess=main -p Restart=on-failure -p RestartSec=200ms \
+    -p User=root -p Group=root -p NotifyAccess=all -p Restart=on-failure -p RestartSec=200ms \
     -p NoNewPrivileges=yes \
     -p 'CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER' \
     -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes -p PrivateDevices=yes \
     -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectKernelLogs=yes \
     -p ProtectControlGroups=yes -p RestrictSUIDSGID=yes -p RestrictNamespaces=yes \
+    -p IPAddressDeny=any -p IPAddressAllow=localhost \
     -p ReadWritePaths='/opt/fireside /var/lib/fireside-release /var/lib/fireside /run' \
-    -p ReadOnlyPaths=/var/backups/fireside -p InaccessiblePaths=/etc/fireside.env \
+    -p ReadOnlyPaths=/var/backups/fireside \
+    -p InaccessiblePaths='/etc/fireside.env /etc/fireside-release' \
     -p TimeoutStartSec=15min -- \
     /usr/local/sbin/fireside-release watchdog "${txid}" 8>&- 9>&-
   release_systemctl is-active --quiet "fireside-release-watchdog-${txid}.service" 8>&- 9>&-
