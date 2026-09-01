@@ -1,11 +1,9 @@
 import type { Topic } from './types';
+import { containsMeetingSensitiveText, redactMeetingSensitiveText } from '../shared/meeting-text';
 
 const POSTER_WIDTH = 1080;
 const POSTER_HEIGHT = 1440;
 const FONT_STACK = '"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif';
-const ONLINE_PATTERN = /https?:\/\/|www\.|zoom|teams|腾讯会议|飞书|lark|会议号|会议码|密码|passcode/i;
-const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s，。；;]+/giu;
-const CREDENTIAL_PATTERN = /(?:会议号|会议码|密码|passcode)\s*[:：]?\s*[\w-]+/giu;
 
 export interface PosterModel {
   title: string;
@@ -20,6 +18,44 @@ export interface PosterModel {
   source: string;
   filename: string;
 }
+
+export interface PosterRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PosterTextBlock {
+  x: number;
+  y: number;
+  fontSize: number;
+  lineHeight: number;
+  lines: string[];
+  bounds: PosterRect;
+}
+
+export interface PosterTagLayout {
+  text: string;
+  bounds: PosterRect;
+  textMaxWidth: number;
+}
+
+export interface PosterLayout {
+  title: PosterTextBlock;
+  summary: PosterTextBlock;
+  info: PosterRect;
+  presenterText: string;
+  presenterMaxWidth: number;
+  durationText: string;
+  locationLines: string[];
+  tags: PosterTagLayout[];
+  tagRegion: PosterRect;
+  footer: PosterRect;
+  sourceText: string;
+}
+
+export type PosterTextMeasure = (fontSize: number, value: string, fontWeight?: number) => number;
 
 function formatParts(value: string) {
   const formatter = new Intl.DateTimeFormat('zh-CN', {
@@ -41,9 +77,7 @@ function formatParts(value: string) {
 }
 
 export function sanitizePosterText(value: string) {
-  return value
-    .replace(URL_PATTERN, '[链接已隐藏]')
-    .replace(CREDENTIAL_PATTERN, '[凭证已隐藏]');
+  return redactMeetingSensitiveText(value);
 }
 
 export function isPosterEligible(topic: Topic, now = new Date()) {
@@ -55,18 +89,18 @@ export function isPosterEligible(topic: Topic, now = new Date()) {
 export function posterLocation(topic: Topic) {
   const room = topic.room?.trim() || '';
   if (topic.meetingUrl || topic.hasMeetingUrl) {
-    return room && !ONLINE_PATTERN.test(room)
+    return room && !containsMeetingSensitiveText(room)
       ? `${sanitizePosterText(room)} · 线上参与 · 会议链接请在议题广场获取`
       : '线上参与 · 会议链接请在议题广场获取';
   }
-  if (room && ONLINE_PATTERN.test(room)) {
+  if (room && containsMeetingSensitiveText(room)) {
     return '线上参与 · 会议链接请在议题广场获取';
   }
   return sanitizePosterText(room) || '地点待定';
 }
 
 export function posterFilename(dateKeyValue: string, title: string) {
-  const safeTitle = Array.from(title
+  const safeTitle = Array.from(sanitizePosterText(title)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '')
     .replace(/\s+/g, '-'))
     .slice(0, 36)
@@ -163,13 +197,131 @@ function drawTextLines(context: CanvasRenderingContext2D, lines: string[], x: nu
   lines.forEach((line, index) => context.fillText(line, x, y + index * lineHeight));
 }
 
-export function fitPosterTitle(title: string, measure: (fontSize: number, value: string) => number) {
+export function fitPosterTitle(
+  title: string,
+  measure: (fontSize: number, value: string) => number,
+  maxHeight = Number.POSITIVE_INFINITY,
+) {
   for (let size = 76; size >= 48; size -= 4) {
     const lines = wrapPosterText(title, (value) => measure(size, value), 880, 5);
     const hidden = lines.at(-1)?.endsWith('…');
-    if (!hidden || size === 48) return { size, lines, lineHeight: Math.round(size * 1.24) };
+    const lineHeight = Math.round(size * 1.24);
+    if (lines.length * lineHeight <= maxHeight && (!hidden || size === 48)) {
+      return { size, lines, lineHeight };
+    }
   }
-  return { size: 48, lines: [title], lineHeight: 60 };
+  throw new Error('海报标题没有足够的可用布局空间');
+}
+
+export function ellipsizePosterText(text: string, measure: (value: string) => number, maxWidth: number) {
+  if (measure(text) <= maxWidth) return text;
+  const chars = Array.from(text);
+  while (chars.length && measure(`${chars.join('')}…`) > maxWidth) chars.pop();
+  return chars.length ? `${chars.join('').trimEnd()}…` : '…';
+}
+
+export function buildPosterLayout(model: PosterModel, measure: PosterTextMeasure): PosterLayout {
+  const contentX = 96;
+  const contentWidth = 888;
+  const titleTop = 228;
+  const summaryLineHeight = 48;
+  const summaryLines = wrapPosterText(model.summary, (value) => measure(30, value, 400), 880, 3);
+  const summaryHeight = summaryLines.length * summaryLineHeight;
+  const infoHeight = 290;
+  const tagHeight = 46;
+  const tagRegionHeight = model.tags.length ? tagHeight : 0;
+  const footerTop = 1216;
+  const minimumBlockGap = 20;
+  const titleToSummaryGap = 24;
+  const summaryToInfoGap = 30;
+  const infoToTagsGap = 28;
+  const maximumInfoTop = footerTop
+    - minimumBlockGap
+    - tagRegionHeight
+    - infoToTagsGap
+    - infoHeight;
+  const maximumTitleHeight = maximumInfoTop
+    - summaryToInfoGap
+    - summaryHeight
+    - titleToSummaryGap
+    - titleTop;
+  const title = fitPosterTitle(
+    model.title,
+    (fontSize, value) => measure(fontSize, value, 900),
+    maximumTitleHeight,
+  );
+  const titleBounds = {
+    x: contentX,
+    y: titleTop,
+    width: 880,
+    height: title.lines.length * title.lineHeight,
+  };
+  const titleBlock: PosterTextBlock = {
+    x: contentX,
+    y: titleTop + title.size,
+    fontSize: title.size,
+    lineHeight: title.lineHeight,
+    lines: title.lines,
+    bounds: titleBounds,
+  };
+
+  const summaryTop = titleBounds.y + titleBounds.height + titleToSummaryGap;
+  const summaryBlock: PosterTextBlock = {
+    x: 98,
+    y: summaryTop + 30,
+    fontSize: 30,
+    lineHeight: summaryLineHeight,
+    lines: summaryLines,
+    bounds: { x: 98, y: summaryTop, width: 880, height: summaryHeight },
+  };
+
+  const summaryBottom = summaryBlock.bounds.y + summaryBlock.bounds.height;
+  const info: PosterRect = {
+    x: 94,
+    y: Math.max(700, summaryBottom + summaryToInfoGap),
+    width: 892,
+    height: infoHeight,
+  };
+  const presenterMaxWidth = 470;
+  const presenterText = ellipsizePosterText(
+    `分享人  ${model.presenter}`,
+    (value) => measure(25, value, 600),
+    presenterMaxWidth,
+  );
+  const durationText = `时长  ${model.duration}`;
+  const locationLines = wrapPosterText(model.location, (value) => measure(24, value, 600), 790, 2);
+
+  const tagGap = 12;
+  const tagTop = info.y + info.height + infoToTagsGap;
+  const tagCount = model.tags.length;
+  const tagWidth = tagCount
+    ? Math.min(210, (contentWidth - tagGap * (tagCount - 1)) / tagCount)
+    : 0;
+  const tags = model.tags.map((tag, index) => {
+    const textMaxWidth = Math.max(1, tagWidth - 32);
+    return {
+      text: ellipsizePosterText(tag, (value) => measure(20, value, 700), textMaxWidth),
+      bounds: { x: contentX + index * (tagWidth + tagGap), y: tagTop, width: tagWidth, height: tagHeight },
+      textMaxWidth,
+    };
+  });
+  const tagRegion: PosterRect = { x: contentX, y: tagTop, width: contentWidth, height: tagCount ? tagHeight : 0 };
+  const footer: PosterRect = { x: contentX, y: footerTop, width: contentWidth, height: 124 };
+  const sourceText = ellipsizePosterText(model.source, (value) => measure(20, value, 500), 330);
+
+  return {
+    title: titleBlock,
+    summary: summaryBlock,
+    info,
+    presenterText,
+    presenterMaxWidth,
+    durationText,
+    locationLines,
+    tags,
+    tagRegion,
+    footer,
+    sourceText,
+  };
 }
 
 export function renderTopicPoster(canvas: HTMLCanvasElement, model: PosterModel) {
@@ -226,22 +378,19 @@ export function renderTopicPoster(canvas: HTMLCanvasElement, model: PosterModel)
   context.fillText('即 将 开 讲', 883, 133);
   context.textAlign = 'left';
 
-  const title = fitPosterTitle(model.title, (size, value) => {
-    context.font = `900 ${size}px ${FONT_STACK}`;
+  const layout = buildPosterLayout(model, (size, value, weight = 400) => {
+    context.font = `${weight} ${size}px ${FONT_STACK}`;
     return context.measureText(value).width;
   });
   context.fillStyle = '#fff5e8';
-  context.font = `900 ${title.size}px ${FONT_STACK}`;
-  drawTextLines(context, title.lines, 96, 300, title.lineHeight);
-  const titleBottom = 300 + title.lines.length * title.lineHeight;
+  context.font = `900 ${layout.title.fontSize}px ${FONT_STACK}`;
+  drawTextLines(context, layout.title.lines, layout.title.x, layout.title.y, layout.title.lineHeight);
 
   context.font = `400 30px ${FONT_STACK}`;
   context.fillStyle = '#aaa49a';
-  const summary = wrapPosterText(model.summary, (value) => context.measureText(value).width, 880, 3);
-  drawTextLines(context, summary, 98, titleBottom + 56, 48);
+  drawTextLines(context, layout.summary.lines, layout.summary.x, layout.summary.y, layout.summary.lineHeight);
 
-  const infoTop = Math.max(760, titleBottom + 250);
-  roundedRect(context, 94, infoTop, 892, 310, 28);
+  roundedRect(context, layout.info.x, layout.info.y, layout.info.width, layout.info.height, 28);
   context.fillStyle = 'rgba(255,255,255,.045)';
   context.fill();
   context.strokeStyle = 'rgba(122,217,255,.16)';
@@ -249,43 +398,38 @@ export function renderTopicPoster(canvas: HTMLCanvasElement, model: PosterModel)
 
   context.fillStyle = '#7ad9ff';
   context.font = `800 32px ${FONT_STACK}`;
-  context.fillText(model.date, 140, infoTop + 66);
+  context.fillText(model.date, 140, layout.info.y + 58);
   context.fillStyle = '#f6f3ee';
   context.font = `900 54px ${FONT_STACK}`;
-  context.fillText(model.time, 140, infoTop + 130);
+  context.fillText(model.time, 140, layout.info.y + 118);
   context.strokeStyle = 'rgba(255,255,255,.10)';
-  context.beginPath(); context.moveTo(140, infoTop + 160); context.lineTo(940, infoTop + 160); context.stroke();
+  context.beginPath(); context.moveTo(140, layout.info.y + 144); context.lineTo(940, layout.info.y + 144); context.stroke();
   context.font = `600 25px ${FONT_STACK}`;
   context.fillStyle = '#d8d2c9';
-  context.fillText(`分享人  ${model.presenter}`, 140, infoTop + 212);
-  context.fillText(`时长  ${model.duration}`, 650, infoTop + 212);
+  context.fillText(layout.presenterText, 140, layout.info.y + 194);
+  context.fillText(layout.durationText, 690, layout.info.y + 194);
   context.fillStyle = '#ffc98a';
   context.font = `600 24px ${FONT_STACK}`;
-  const location = wrapPosterText(model.location, (value) => context.measureText(value).width, 790, 2);
-  drawTextLines(context, location, 140, infoTop + 263, 34);
+  drawTextLines(context, layout.locationLines, 140, layout.info.y + 242, 30);
 
-  let tagX = 96;
-  const tagY = infoTop + 352;
   context.font = `700 20px ${FONT_STACK}`;
-  for (const tag of model.tags) {
-    const width = Math.min(210, context.measureText(tag).width + 40);
-    if (tagX + width > 984) break;
-    roundedRect(context, tagX, tagY, width, 46, 23);
+  for (const tag of layout.tags) {
+    roundedRect(context, tag.bounds.x, tag.bounds.y, tag.bounds.width, tag.bounds.height, 23);
     context.fillStyle = 'rgba(255,176,90,.07)'; context.fill();
     context.strokeStyle = 'rgba(255,176,90,.18)'; context.stroke();
-    context.fillStyle = '#d7b489'; context.textAlign = 'center'; context.fillText(tag, tagX + width / 2, tagY + 30);
-    tagX += width + 12;
+    context.fillStyle = '#d7b489'; context.textAlign = 'center';
+    context.fillText(tag.text, tag.bounds.x + tag.bounds.width / 2, tag.bounds.y + 30);
   }
   context.textAlign = 'left';
 
   context.fillStyle = '#f3d0a7';
   context.font = `900 38px ${FONT_STACK}`;
-  context.fillText('为彼此的好奇添一把柴。', 96, 1266);
+  context.fillText('为彼此的好奇添一把柴。', layout.footer.x, layout.footer.y + 50);
   context.fillStyle = '#74777d';
   context.font = `500 20px ${FONT_STACK}`;
-  context.fillText('详情与报名，请前往围炉夜话议题广场', 96, 1320);
+  context.fillText('详情与报名，请前往围炉夜话议题广场', layout.footer.x, layout.footer.y + 104);
   context.textAlign = 'right';
-  context.fillText(model.source, 984, 1320);
+  context.fillText(layout.sourceText, layout.footer.x + layout.footer.width, layout.footer.y + 104);
   context.textAlign = 'left';
 }
 

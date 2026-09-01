@@ -68,7 +68,10 @@ export const api = {
       orderVersion: Number(response.headers.get('X-Order-Version') ?? 0),
     };
   },
-  topic: (id: number) => request<Topic>(`/api/topics/${id}`),
+  topic: async (id: number) => {
+    const response = await fetch(`/api/topics/${id}`, { cache: 'no-store' });
+    return readBody<Topic>(response, false);
+  },
   stats: () => request<Stats>('/api/stats'),
   create: (data: { title: string; summary: string; proposer: string; presenter?: string; tags: string[] }) =>
     request<Topic>('/api/topics', { method: 'POST', body: JSON.stringify(data) }),

@@ -44,6 +44,7 @@ import type { Participant, Stats, Topic, TopicSort, TopicStatus } from './types'
 type Tab = 'ALL' | TopicStatus;
 type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete' | 'release' | 'unschedule' | 'unarchive';
 type ViewMode = 'list' | 'month' | 'week';
+type PosterPhase = 'checking' | 'generating' | 'ready' | 'read-error' | 'render-error' | 'unavailable';
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'ALL', label: '全部议题' },
@@ -140,6 +141,7 @@ function useDialogA11y(onClose: () => void) {
         const target = original?.isConnected ? original : fallback;
         if (target) target.focus();
         else if (returnFocusKey && attempts++ < 30) window.requestAnimationFrame(restoreFocus);
+        else document.querySelector<HTMLElement>('#topics h2')?.focus();
       };
       window.requestAnimationFrame(restoreFocus);
     };
@@ -188,6 +190,8 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, dragg
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
+      data-focus-return={`poster-${topic.id}`}
+      tabIndex={-1}
       onDragOver={(event) => draggable && !reordering && event.preventDefault()}
       onDrop={(event) => { event.preventDefault(); onDrop(topic.id); }}
     >
@@ -252,13 +256,14 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, dragg
   );
 }
 
-function CalendarView({ topics, mode, cursor, onCursorChange, onEdit, onMeeting }: {
+function CalendarView({ topics, mode, cursor, onCursorChange, onEdit, onMeeting, onPoster }: {
   topics: Topic[];
   mode: Exclude<ViewMode, 'list'>;
   cursor: Date;
   onCursorChange: (date: Date) => void;
   onEdit: (topic: Topic) => void;
   onMeeting: (topic: Topic) => void;
+  onPoster: (topic: Topic) => void;
 }) {
   const today = new Date();
   const [expandedDays, setExpandedDays] = useState<Set<string>>(() => new Set());
@@ -336,7 +341,8 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit, onMeeting 
                 <div className="week-events">
                   {events.length ? events.map((topic) => {
                     const hasMeetingUrl = topic.status === 'SCHEDULED' && (topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic)));
-                    return <div key={topic.id} className={`week-event ${statusMeta[topic.status].className}`}>
+                    const canCreatePoster = isPosterEligible(topic);
+                    return <div key={topic.id} className={`week-event ${statusMeta[topic.status].className}`} data-focus-return={`poster-${topic.id}`} tabIndex={-1}>
                       <button className="week-event-main" onClick={() => onEdit(topic)} aria-label={`编辑 ${topic.title}`}>
                         <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
                         <strong>{topic.title}</strong>
@@ -345,6 +351,7 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit, onMeeting 
                         <small>{topic.duration ?? 0} 分钟</small>
                       </button>
                       {hasMeetingUrl && <button className="week-join" onClick={() => onMeeting(topic)}><LinkIcon size={12} />加入会议</button>}
+                      {canCreatePoster && <button className="week-join" data-focus-return={`poster-${topic.id}`} onClick={() => onPoster(topic)}><ImageDown size={12} />生成海报</button>}
                     </div>;
                   }) : <p className="no-events">留一晚给未知</p>}
                 </div>
@@ -442,93 +449,145 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
   </div>;
 }
 
-function PosterModal({ topic, onClose }: { topic: Topic; onClose: () => void }) {
+function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => void; onSync: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dialogRef = useDialogA11y(onClose);
+  const errorRef = useRef<HTMLDivElement>(null);
+  const openedRevision = useRef(topic.revision);
+  const onSyncRef = useRef(onSync);
+  onSyncRef.current = onSync;
   const [attempt, setAttempt] = useState(0);
+  const [phase, setPhase] = useState<PosterPhase>('checking');
+  const [model, setModel] = useState<ReturnType<typeof buildPosterModel> | null>(null);
   const [posterBlob, setPosterBlob] = useState<Blob | null>(null);
   const [posterUrl, setPosterUrl] = useState('');
-  const [generating, setGenerating] = useState(true);
   const [canShare, setCanShare] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const modelResult = useMemo(() => {
-    try {
-      return { model: buildPosterModel(topic, window.location.origin), error: '' };
-    } catch (err) {
-      return { model: null, error: err instanceof Error ? err.message : '海报信息不完整' };
-    }
-  }, [topic]);
 
   useEffect(() => {
     let cancelled = false;
     let objectUrl = '';
-    setGenerating(true);
+    setPhase('checking');
+    setModel(null);
     setPosterBlob(null);
     setPosterUrl('');
     setCanShare(false);
     setNotice('');
-    setError(modelResult.error);
-    if (!modelResult.model) {
-      setGenerating(false);
-      return;
-    }
+    setError('');
     void (async () => {
+      let latest: Topic;
+      try {
+        latest = await api.topic(topic.id);
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 404) {
+          setError('议题已被删除，本次没有生成海报。');
+          setPhase('unavailable');
+          onSyncRef.current();
+          return;
+        }
+        setError(err instanceof Error ? `无法读取最新议题：${err.message}` : '无法读取最新议题，请稍后重试');
+        setPhase('read-error');
+        return;
+      }
+      if (cancelled) return;
+      if (!isPosterEligible(latest)) {
+        setError(latest.status === 'ARCHIVED'
+          ? '议题已归档，本次没有生成海报。'
+          : latest.status === 'SCHEDULED'
+            ? '活动已经开始或排期已过，本次没有生成海报。'
+            : '议题已取消排期或状态已变化，本次没有生成海报。');
+        setPhase('unavailable');
+        onSyncRef.current();
+        return;
+      }
+
+      let latestModel: ReturnType<typeof buildPosterModel>;
+      try {
+        latestModel = buildPosterModel(latest, window.location.origin);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : '最新议题信息不完整，无法生成海报');
+        setPhase('unavailable');
+        onSyncRef.current();
+        return;
+      }
+      setModel(latestModel);
+      const sourceUpdated = latest.revision !== openedRevision.current;
+      setPhase('generating');
       try {
         await document.fonts?.ready;
         if (!canvasRef.current || cancelled) return;
-        renderTopicPoster(canvasRef.current, modelResult.model!);
+        renderTopicPoster(canvasRef.current, latestModel);
         const blob = await posterToBlob(canvasRef.current);
         if (cancelled) return;
         objectUrl = URL.createObjectURL(blob);
-        const file = new File([blob], modelResult.model!.filename, { type: 'image/png' });
+        const file = new File([blob], latestModel.filename, { type: 'image/png' });
         setPosterBlob(blob);
         setPosterUrl(objectUrl);
         setCanShare(Boolean(navigator.canShare?.({ files: [file] })));
+        setPhase('ready');
+        setNotice(sourceUpdated ? '检测到议题已更新，海报已按刚刚确认的最新排期生成。' : '');
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : '海报生成失败，请重试');
-      } finally {
-        if (!cancelled) setGenerating(false);
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : '海报生成失败，请重试');
+          setPhase('render-error');
+        }
       }
     })();
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [attempt, modelResult]);
+  }, [attempt, topic.id]);
+
+  useEffect(() => {
+    if (!['read-error', 'render-error', 'unavailable'].includes(phase)) return;
+    const frame = window.requestAnimationFrame(() => errorRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [attempt, phase]);
 
   function downloadPoster() {
-    if (!posterUrl || !modelResult.model) return;
+    if (!posterUrl || !model) return;
     const anchor = document.createElement('a');
     anchor.href = posterUrl;
-    anchor.download = modelResult.model.filename;
+    anchor.download = model.filename;
     anchor.click();
   }
 
   async function sharePoster() {
-    if (!posterBlob || !modelResult.model) return;
+    if (!posterBlob || !model) return;
     try {
-      const file = new File([posterBlob], modelResult.model.filename, { type: 'image/png' });
-      await navigator.share({ title: `围炉夜话 · ${modelResult.model.title}`, files: [file] });
+      const file = new File([posterBlob], model.filename, { type: 'image/png' });
+      await navigator.share({ title: `围炉夜话 · ${model.title}`, files: [file] });
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       setNotice('分享没有完成，你仍可以下载或长按图片保存。');
     }
   }
 
-  const model = modelResult.model;
+  const busy = phase === 'checking' || phase === 'generating';
+  const retryable = phase === 'read-error' || phase === 'render-error';
+  const title = phase === 'checking' ? '正在确认最新议题'
+    : phase === 'generating' ? '正在生成宣讲海报'
+      : phase === 'ready' ? '宣讲海报已为你备好'
+        : '本次没有生成海报';
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <div ref={dialogRef} className="modal poster-modal" role="dialog" aria-modal="true" aria-labelledby="poster-title" tabIndex={-1}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><ImageDown size={14} /> FIRESIDE POSTER</span>
-      <h2 id="poster-title">宣讲海报已为你备好</h2>
-      <p className="modal-intro">使用最新排期在本地生成；线上会议链接与凭证不会出现在海报中。</p>
+      <h2 id="poster-title">{title}</h2>
+      <p className="modal-intro">{phase === 'ready'
+        ? '这张海报基于刚刚确认的议题版本在本地生成；线上会议链接与凭证不会出现在海报中。'
+        : '生成前会重新确认议题状态与排期；只有仍可宣传时，才会在本地生成海报。'}</p>
       <div className="poster-layout">
         <div className="poster-preview" aria-live="polite">
           <canvas ref={canvasRef} className="poster-canvas-source" aria-hidden="true" />
-          {generating && <div className="poster-status"><Flame className="loading-flame" /><span>正在举起火炬…</span></div>}
-          {!generating && posterUrl && model && <img src={posterUrl} alt={`围炉夜话宣讲海报：${model.title}，${model.date} ${model.time}`} />}
-          {!generating && error && <div className="poster-status error"><span>{error}</span><button onClick={() => setAttempt((value) => value + 1)}>重新生成</button></div>}
+          {busy && <div className="poster-status"><Flame className="loading-flame" /><span>{phase === 'checking' ? '正在确认最新议题与排期…' : '正在举起火炬…'}</span></div>}
+          {phase === 'ready' && posterUrl && model && <img src={posterUrl} alt={`围炉夜话宣讲海报：${model.title}，${model.date} ${model.time}`} />}
+          {!busy && phase !== 'ready' && error && <div ref={errorRef} className="poster-status error" role="alert" tabIndex={-1}><span>{error}</span>{retryable
+            ? <button onClick={() => setAttempt((value) => value + 1)}>重新读取并生成</button>
+            : <button onClick={onClose}>返回议题广场</button>}</div>}
         </div>
         <div className="poster-side">
           {model && <div className="poster-summary">
@@ -537,11 +596,11 @@ function PosterModal({ topic, onClose }: { topic: Topic; onClose: () => void }) 
             <p>{model.date}<br />{model.time}</p>
             <p>分享人 · {model.presenter}<br />{model.location}</p>
           </div>}
-          <div className="poster-actions">
-            <button className="submit-btn" disabled={!posterUrl || generating} onClick={downloadPoster}><Download size={16} />下载 PNG</button>
-            {canShare && <button className="poster-share" disabled={!posterBlob || generating} onClick={() => void sharePoster()}><Share2 size={16} />分享 / 保存</button>}
+          {phase === 'ready' && <><div className="poster-actions">
+            <button className="submit-btn" disabled={!posterUrl} onClick={downloadPoster}><Download size={16} />下载 PNG</button>
+            {canShare && <button className="poster-share" disabled={!posterBlob} onClick={() => void sharePoster()}><Share2 size={16} />分享 / 保存</button>}
           </div>
-          <p className="poster-save-hint">手机端可长按左侧图片保存；支持文件分享时也可直接发送给伙伴。</p>
+          <p className="poster-save-hint">手机端可长按海报图片保存；支持文件分享时也可直接发送给伙伴。</p></>}
           {notice && <div className="form-error" role="status">{notice}</div>}
         </div>
       </div>
@@ -1173,7 +1232,7 @@ export default function App() {
 
       <section className="topics-section shell" id="topics">
         <div className="section-heading">
-          <div><p className="section-kicker">TOPIC COMMONS · 议题广场</p><h2>炉边正在发生什么</h2></div>
+          <div><p className="section-kicker">TOPIC COMMONS · 议题广场</p><h2 tabIndex={-1}>炉边正在发生什么</h2></div>
           <p>可以自己举起火炬，也可以邀请同伴接力。<br />从零散的兴趣，走向一次共同探索。</p>
         </div>
         <div className="topic-toolbar">
@@ -1221,7 +1280,7 @@ export default function App() {
               onDrop={dropTopic}
               onMove={moveTopic}
             />)}</div>
-          : visibleTopics.length && view !== 'list' ? <CalendarView topics={visibleTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onEdit={(topic) => openAction('edit', topic)} onMeeting={openMeeting} />
+          : visibleTopics.length && view !== 'list' ? <CalendarView topics={visibleTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onEdit={(topic) => openAction('edit', topic)} onMeeting={openMeeting} onPoster={setPosterTopic} />
           : <div className="empty-state"><Lightbulb /><h3>这里还没有火种</h3><p>换个筛选条件，或者成为第一个发起议题的人。</p><button onClick={() => openAction('create')}>发起议题</button></div>}
         <p className="sr-only" aria-live="polite">{liveMessage}</p>
       </section>
@@ -1264,7 +1323,7 @@ export default function App() {
 
     {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} />}
     {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} />}
-    {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} />}
+    {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} onSync={() => void load()} />}
     {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} unlockVersion={unlockVersion} />}
     {accessModalOpen && <AccessModal message={accessMessage} onClose={closeAccess} onUnlocked={finishUnlock} />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}

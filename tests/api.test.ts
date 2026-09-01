@@ -332,11 +332,16 @@ describe('围炉夜话 API', () => {
     let revision = created.json().revision as number;
     const sensitiveRooms = [
       'https://meet.example.test/join?passcode=omega',
+      'https://meet.example.test/join/(room-42)?token=TOPSECRET',
       '线上入口：https://meet.example.test/join?pwd=omega',
       '请访问 www.example.test/join?pwd=omega',
       '腾讯会议 123 456 789，密码：秘密口令',
       'Teams 会议号=998877 passcode = a-b_C',
       '线上参与 pwd=hidden-token',
+      '入会密码（括号密语）',
+      '会议号[123 456 789]',
+      'PWD【omega】',
+      '腾讯会议〔987 654 321〕',
     ];
     for (const room of sensitiveRooms) {
       const response = await app.inject({
@@ -355,7 +360,16 @@ describe('围炉夜话 API', () => {
     });
     assert.equal(scheduled.statusCode, 200);
     revision = scheduled.json().revision;
-    for (const room of ['密码学读书会', '3号会议室', '三楼围炉会议室']) {
+    for (const room of [
+      '密码学读书会',
+      '3号会议室',
+      '三楼围炉会议室',
+      '密码学（基础）',
+      '3号会议室（东区）',
+      '腾讯会议室【A区】',
+      'Zoom（产品设计）',
+      'Teams〔协作复盘〕',
+    ]) {
       const response = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(revision), payload: { room } });
       assert.equal(response.statusCode, 200, room);
       revision = response.json().revision;
