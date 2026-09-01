@@ -154,6 +154,61 @@ describe('围炉夜话 API', () => {
     assert.equal(duplicateUnschedule.statusCode, 409);
   });
 
+  it('支持独立会议链接与报名、取消和名单冻结', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '线上参会议题', summary: '验证参会入口和报名闭环。', proposer: '组织者', presenter: '组织者', tags: ['线上'] },
+    });
+    const id = created.json().id as number;
+    const meetingUrl = `https://meet.example.com/fireside/${'long-path-'.repeat(12)}?room=weekly`;
+    const scheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`,
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 60, room: '线上会议', meetingUrl },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    assert.equal(scheduled.json().meetingUrl, meetingUrl);
+
+    const firstJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: 'Alice' } });
+    assert.equal(firstJoin.statusCode, 201);
+    const duplicateJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '  alice  ' } });
+    assert.equal(duplicateJoin.statusCode, 409);
+    const secondJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '小林' } });
+    assert.equal(secondJoin.statusCode, 201);
+    const participants = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+    assert.deepEqual((participants.json() as { name: string }[]).map(({ name }) => name), ['Alice', '小林']);
+    const topics = await app.inject({ method: 'GET', url: '/api/topics' });
+    const topic = (topics.json() as { id: number; participantCount: number }[]).find((item) => item.id === id);
+    assert.equal(topic?.participantCount, 2);
+
+    await app.inject({ method: 'POST', url: `/api/topics/${id}/archive`, payload: { takeaway: '参会闭环完成。', materialUrl: '' } });
+    const joinArchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '迟到者' } });
+    assert.equal(joinArchived.statusCode, 409);
+    const leaveArchived = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
+    assert.equal(leaveArchived.statusCode, 409);
+
+    await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} });
+    const left = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
+    assert.equal(left.statusCode, 204);
+    const afterLeave = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+    assert.deepEqual((afterLeave.json() as { name: string }[]).map(({ name }) => name), ['小林']);
+
+    const unscheduled = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    assert.equal(unscheduled.statusCode, 200);
+    assert.equal(unscheduled.json().meetingUrl, null);
+    const afterUnschedule = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+    assert.deepEqual(afterUnschedule.json(), []);
+
+    const invalidUrlTopic = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '非法会议链接', summary: '协议必须安全。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    const invalidUrl = await app.inject({
+      method: 'POST', url: `/api/topics/${invalidUrlTopic.json().id}/schedule`,
+      payload: { scheduledAt: new Date().toISOString(), duration: 30, room: '线上', meetingUrl: 'javascript:alert(1)' },
+    });
+    assert.equal(invalidUrl.statusCode, 400);
+  });
+
   it('拒绝缺少关键信息的议题', async () => {
     const response = await app.inject({ method: 'POST', url: '/api/topics', payload: { title: '', summary: '', proposer: '' } });
     assert.equal(response.statusCode, 400);
@@ -325,8 +380,8 @@ describe('数据库兼容性与并发', () => {
 
     const verifyBusinessData = new Database(databasePath);
     const afterRows = verifyBusinessData.prepare('SELECT * FROM topics ORDER BY id').all() as Array<Record<string, unknown> & { position: number }>;
-    const withoutPosition = ({ position: _position, ...row }: Record<string, unknown> & { position: number }) => row;
-    assert.deepEqual(afterRows.map(withoutPosition), beforeRows.map(withoutPosition));
+    const legacyBusinessColumns = ({ position: _position, meeting_url: _meetingUrl, ...row }: Record<string, unknown> & { position: number }) => row;
+    assert.deepEqual(afterRows.map(legacyBusinessColumns), beforeRows.map(legacyBusinessColumns));
     verifyBusinessData.close();
 
     const secondStart = buildApp({ databasePath, seed: false, serveStatic: false });

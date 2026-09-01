@@ -14,7 +14,6 @@ import {
   ChevronRight,
   Clock3,
   Flame,
-  Github,
   GripVertical,
   Lightbulb,
   Link as LinkIcon,
@@ -33,7 +32,7 @@ import {
 } from 'lucide-react';
 import { api, ApiError } from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
-import type { Stats, Topic, TopicSort, TopicStatus } from './types';
+import type { Participant, Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
 type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete' | 'release' | 'unschedule' | 'unarchive';
@@ -43,14 +42,14 @@ const tabs: { key: Tab; label: string }[] = [
   { key: 'ALL', label: '全部议题' },
   { key: 'OPEN', label: '等待认领' },
   { key: 'CLAIMED', label: '准备中' },
-  { key: 'SCHEDULED', label: '近期排期' },
+  { key: 'SCHEDULED', label: '已排期' },
   { key: 'ARCHIVED', label: '往期归档' },
 ];
 
 const statusMeta: Record<TopicStatus, { label: string; className: string }> = {
   OPEN: { label: '等待添柴', className: 'open' },
   CLAIMED: { label: '已被认领', className: 'claimed' },
-  SCHEDULED: { label: '即将开讲', className: 'scheduled' },
+  SCHEDULED: { label: '已排期', className: 'scheduled' },
   ARCHIVED: { label: '已经归档', className: 'archived' },
 };
 
@@ -74,6 +73,14 @@ function defaultScheduleTime() {
   return local.toISOString().slice(0, 16);
 }
 
+function legacyMeetingUrl(room: string | null) {
+  return room && /^https?:\/\/\S+$/i.test(room) ? room : null;
+}
+
+function topicMeetingUrl(topic: Topic) {
+  return topic.meetingUrl ?? legacyMeetingUrl(topic.room);
+}
+
 function FireVisual() {
   return (
     <div className="fire-card" aria-label="围炉夜话的篝火插画">
@@ -95,9 +102,10 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
+function TopicCard({ topic, onAction, onParticipants, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
   topic: Topic;
   onAction: (kind: ModalKind, topic: Topic) => void;
+  onParticipants: (topic: Topic) => void;
   draggable: boolean;
   reordering: boolean;
   index: number;
@@ -107,6 +115,7 @@ function TopicCard({ topic, onAction, draggable, reordering, index, total, onDra
   onMove: (id: number, direction: -1 | 1) => void;
 }) {
   const meta = statusMeta[topic.status];
+  const meetingUrl = topicMeetingUrl(topic);
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
@@ -135,7 +144,8 @@ function TopicCard({ topic, onAction, draggable, reordering, index, total, onDra
       {topic.status === 'SCHEDULED' && topic.scheduledAt && (
         <div className="schedule-box">
           <div><CalendarDays size={16} /><strong>{formatDate(topic.scheduledAt)}</strong></div>
-          <div><MapPin size={15} /><span>{topic.room}</span><Clock3 size={15} /><span>{topic.duration} 分钟</span></div>
+          <div><MapPin size={15} /><span>{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room}</span><Clock3 size={15} /><span>{topic.duration} 分钟</span></div>
+          {meetingUrl && <a className="meeting-link" href={meetingUrl} target="_blank" rel="noreferrer"><LinkIcon size={14} />加入会议</a>}
         </div>
       )}
 
@@ -147,6 +157,7 @@ function TopicCard({ topic, onAction, draggable, reordering, index, total, onDra
         <div className="people">
           <span><UserRound size={14} /> 发起 · {topic.proposer}</span>
           {topic.presenter && <span><Flame size={14} /> 分享 · {topic.presenter}</span>}
+          {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && <span><Users size={14} /> {topic.participantCount} 人报名</span>}
         </div>
         <div className="card-action-group">
           {topic.status === 'OPEN' && <button className="card-action warm" onClick={() => onAction('claim', topic)}>认领议题 <ArrowRight size={15} /></button>}
@@ -156,10 +167,12 @@ function TopicCard({ topic, onAction, draggable, reordering, index, total, onDra
           </>}
           {topic.status === 'SCHEDULED' && <>
             <button className="card-action subtle" onClick={() => onAction('unschedule', topic)}>取消排期 <CalendarX2 size={14} /></button>
+            <button className="card-action cyan" onClick={() => onParticipants(topic)}>报名参加 <Users size={14} /></button>
             <button className="card-action" onClick={() => onAction('archive', topic)}>完成归档 <Archive size={15} /></button>
           </>}
           {topic.status === 'ARCHIVED' && <>
             <button className="card-action subtle" onClick={() => onAction('unarchive', topic)}>撤销归档 <RotateCcw size={14} /></button>
+            <button className="card-action" onClick={() => onParticipants(topic)}>查看参与 <Users size={14} /></button>
             {topic.materialUrl && <a className="card-action" href={topic.materialUrl} target="_blank" rel="noreferrer">查看资料 <LinkIcon size={15} /></a>}
           </>}
         </div>
@@ -176,6 +189,7 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
   onEdit: (topic: Topic) => void;
 }) {
   const today = new Date();
+  const [expandedDays, setExpandedDays] = useState<Set<string>>(() => new Set());
   const scheduledTopics = topics.filter((topic) => topic.scheduledAt);
   const weekStart = startOfWeek(cursor);
   const days = mode === 'month'
@@ -209,7 +223,7 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
           <button onClick={() => changePeriod(1)} aria-label="下一个周期"><ChevronRight size={16} /></button>
         </div>
         <h3>{title}</h3>
-        <div className="calendar-legend"><span className="scheduled" />即将开讲 <span className="archived" />已经归档</div>
+        <div className="calendar-legend"><span className="scheduled" />已排期 <span className="archived" />已经归档</div>
       </div>
 
       {mode === 'month' ? (
@@ -218,16 +232,22 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
             {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((day) => <div className="weekday" key={day}>{day}</div>)}
             {days.map((day) => {
               const events = eventsForDate(day);
+              const key = dateKey(day);
+              const expanded = expandedDays.has(key);
               const isToday = dateKey(day) === dateKey(today);
               const outside = day.getMonth() !== cursor.getMonth();
-              return <div className={`calendar-day ${isToday ? 'today' : ''} ${outside ? 'outside' : ''}`} key={dateKey(day)}>
+              return <div className={`calendar-day ${isToday ? 'today' : ''} ${outside ? 'outside' : ''}`} key={key}>
                 <span className="day-number">{day.getDate()}</span>
                 <div className="day-events">
-                  {events.slice(0, 3).map((topic) => <button key={topic.id} className={`calendar-event ${statusMeta[topic.status].className}`} onClick={() => onEdit(topic)} title={topic.title}>
+                  {events.slice(0, expanded ? events.length : 3).map((topic) => <button key={topic.id} className={`calendar-event ${statusMeta[topic.status].className}`} onClick={() => onEdit(topic)} title={topic.title}>
                     <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
                     <span>{topic.title}</span>
                   </button>)}
-                  {events.length > 3 && <small>还有 {events.length - 3} 个议题</small>}
+                  {events.length > 3 && <button className="day-more" onClick={() => setExpandedDays((current) => {
+                    const next = new Set(current);
+                    if (next.has(key)) next.delete(key); else next.add(key);
+                    return next;
+                  })}>{expanded ? '收起' : `还有 ${events.length - 3} 个议题`}</button>}
                 </div>
               </div>;
             })}
@@ -242,13 +262,19 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
               return <div className={`week-day ${isToday ? 'today' : ''}`} key={dateKey(day)}>
                 <div className="week-day-head"><span>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'][day.getDay()]}</span><strong>{day.getDate()}</strong></div>
                 <div className="week-events">
-                  {events.length ? events.map((topic) => <button key={topic.id} className={`week-event ${statusMeta[topic.status].className}`} onClick={() => onEdit(topic)}>
-                    <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
-                    <strong>{topic.title}</strong>
-                    <span><UserRound size={12} />{topic.presenter ?? '待定'}</span>
-                    <span><MapPin size={12} />{topic.room ?? '地点待定'}</span>
-                    <small>{topic.duration ?? 0} 分钟</small>
-                  </button>) : <p className="no-events">留一晚给未知</p>}
+                  {events.length ? events.map((topic) => {
+                    const meetingUrl = topicMeetingUrl(topic);
+                    return <div key={topic.id} className={`week-event ${statusMeta[topic.status].className}`}>
+                      <button className="week-event-main" onClick={() => onEdit(topic)} aria-label={`编辑 ${topic.title}`}>
+                        <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+                        <strong>{topic.title}</strong>
+                        <span><UserRound size={12} />{topic.presenter ?? '待定'}</span>
+                        <span><MapPin size={12} />{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '地点待定'}</span>
+                        <small>{topic.duration ?? 0} 分钟</small>
+                      </button>
+                      {meetingUrl && <a className="week-join" href={meetingUrl} target="_blank" rel="noreferrer"><LinkIcon size={12} />加入会议</a>}
+                    </div>;
+                  }) : <p className="no-events">留一晚给未知</p>}
                 </div>
               </div>;
             })}
@@ -257,6 +283,85 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
       )}
     </div>
   );
+}
+
+function ParticipantsModal({ topic, onClose, onChanged }: {
+  topic: Topic;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const canJoin = topic.status === 'SCHEDULED';
+
+  const loadParticipants = useCallback(async () => {
+    try {
+      setParticipants(await api.participants(topic.id));
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '报名名单加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [topic.id]);
+
+  useEffect(() => { void loadParticipants(); }, [loadParticipants]);
+
+  async function join(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    setSubmitting(true);
+    setError('');
+    try {
+      await api.join(topic.id, String(data.get('name')));
+      form.reset();
+      await loadParticipants();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '报名失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function leave(participant: Participant) {
+    setSubmitting(true);
+    setError('');
+    try {
+      await api.leave(topic.id, participant.id);
+      await loadParticipants();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消报名失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="modal participants-modal" role="dialog" aria-modal="true" aria-labelledby="participants-title">
+      <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
+      <span className="modal-eyebrow"><Users size={14} /> FIRESIDE GUESTS</span>
+      <h2 id="participants-title">{canJoin ? '报名参加围炉' : '本期参与伙伴'}</h2>
+      <p className="modal-intro">可以来分享，也可以只守着火光坐一会儿。姓名是公开署名，当前不绑定个人账号。</p>
+      <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>
+      {canJoin && <form className="join-form" onSubmit={join}>
+        <label>你的名字<input name="name" required maxLength={30} placeholder="怎么称呼你" autoFocus /></label>
+        <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在处理…' : '确认报名'}{!submitting && <ChevronRight size={17} />}</button>
+      </form>}
+      <div className="participant-list" aria-live="polite">
+        <div className="participant-list-head"><b>参与名单</b><span>{participants.length} 人</span></div>
+        {loading ? <p>正在靠近炉火…</p> : participants.length === 0 ? <p>还没有人报名，成为第一位围炉伙伴吧。</p> : participants.map((participant) => <div className="participant-row" key={participant.id}>
+          <span><UserRound size={14} />{participant.name}</span>
+          {canJoin && <button disabled={submitting} onClick={() => void leave(participant)} aria-label={`取消 ${participant.name} 的报名`}>取消报名</button>}
+        </div>)}
+      </div>
+      {error && <div className="form-error">{error}</div>}
+    </div>
+  </div>;
 }
 
 function Modal({ kind, topic, onClose, onComplete, onConflict }: {
@@ -294,7 +399,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
           summary: String(data.get('summary')),
           proposer,
           ...(selfPresent ? { presenter: proposer } : {}),
-          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 5),
+          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
         });
         onComplete(selfPresent ? '议题已发布并由你分享，接下来可以安排时间' : '新火种已放到炉边，等待同伴认领');
       } else if (kind === 'claim' && topic) {
@@ -305,6 +410,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
           scheduledAt: new Date(String(data.get('scheduledAt'))).toISOString(),
           duration: Number(data.get('duration')),
           room: String(data.get('room')),
+          meetingUrl: String(data.get('meetingUrl')),
         });
         onComplete('排期完成，炉边已经为这次分享留好位置');
       } else if (kind === 'archive' && topic) {
@@ -327,12 +433,13 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
           title: String(data.get('title')),
           summary: String(data.get('summary')),
           proposer: String(data.get('proposer')),
-          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 5),
+          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
         };
         if (data.has('presenter')) payload.presenter = String(data.get('presenter'));
         if (data.has('scheduledAt')) payload.scheduledAt = new Date(String(data.get('scheduledAt'))).toISOString();
         if (data.has('duration')) payload.duration = Number(data.get('duration'));
         if (data.has('room')) payload.room = String(data.get('room'));
+        if (data.has('meetingUrl')) payload.meetingUrl = String(data.get('meetingUrl'));
         if (data.has('takeaway')) payload.takeaway = String(data.get('takeaway'));
         if (data.has('materialUrl')) payload.materialUrl = String(data.get('materialUrl'));
         await api.update(topic.id, payload);
@@ -366,7 +473,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} placeholder="它为什么值得一起聊聊？你想从哪里开始探索？" /></label>
             <div className="form-row">
               <label>你的名字<input name="proposer" required maxLength={30} placeholder="怎么称呼你" /></label>
-              <label>标签<input name="tags" maxLength={100} placeholder="AI, 产品, Demo" /></label>
+              <label>标签（最多 5 个）<input name="tags" maxLength={100} placeholder="AI, 产品, Demo" /></label>
             </div>
             <fieldset className="intent-options">
               <legend>发布后由谁分享？</legend>
@@ -379,8 +486,9 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
             <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={defaultScheduleTime()} autoFocus /></label>
             <div className="form-row">
               <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={40} /></label>
-              <label>地点 / 会议链接<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
+              <label>地点 / 参与说明<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
             </div>
+            <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} placeholder="https://" /></label>
           </>}
           {kind === 'archive' && <>
             <label>本期最值得留下的收获<textarea name="takeaway" required maxLength={1000} rows={5} placeholder="用几句话记下结论、共识或仍待探索的问题……" autoFocus /></label>
@@ -391,15 +499,16 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} defaultValue={topic.summary} /></label>
             <div className="form-row">
               <label>发起人<input name="proposer" required maxLength={30} defaultValue={topic.proposer} /></label>
-              <label>标签<input name="tags" maxLength={100} defaultValue={topic.tags.join(', ')} /></label>
+              <label>标签（最多 5 个）<input name="tags" maxLength={100} defaultValue={topic.tags.join(', ')} /></label>
             </div>
             {topic.status !== 'OPEN' && <label>分享人<input name="presenter" required maxLength={30} defaultValue={topic.presenter ?? ''} /></label>}
             {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && <>
               <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={formatDateTimeInput(topic.scheduledAt)} /></label>
               <div className="form-row">
                 <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={topic.duration ?? 40} /></label>
-                <label>地点 / 会议链接<input name="room" required maxLength={60} defaultValue={topic.room ?? ''} /></label>
+                <label>地点 / 参与说明<input name="room" required maxLength={60} defaultValue={legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? ''} /></label>
               </div>
+              <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} defaultValue={topicMeetingUrl(topic) ?? ''} placeholder="https://" /></label>
             </>}
             {topic.status === 'ARCHIVED' && <>
               <label>本期收获<textarea name="takeaway" required maxLength={1000} rows={4} defaultValue={topic.takeaway ?? ''} /></label>
@@ -423,7 +532,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
 
 export default function App() {
   const [topics, setTopics] = useState<Topic[]>([]);
-  const [stats, setStats] = useState<Stats>({ open: 0, scheduled: 0, archived: 0, nextTopic: null });
+  const [stats, setStats] = useState<Stats>({ open: 0, claimed: 0, scheduled: 0, archived: 0, nextTopic: null });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [tab, setTab] = useState<Tab>('ALL');
@@ -441,6 +550,7 @@ export default function App() {
   const [draggedId, setDraggedId] = useState<number | null>(null);
   const [liveMessage, setLiveMessage] = useState('');
   const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
+  const [participantsTopic, setParticipantsTopic] = useState<Topic | null>(null);
   const [toast, setToast] = useState('');
 
   const loadTopics = useCallback(async (requestedSort: TopicSort) => {
@@ -506,6 +616,13 @@ export default function App() {
     await load();
   }
   function scrollToTopics() { document.querySelector('#topics')?.scrollIntoView({ behavior: 'smooth' }); }
+  function showTopicView(nextTab: Tab, nextView: ViewMode = 'list', keyword = '') {
+    setTab(nextTab);
+    setView(nextView);
+    setSearch(keyword);
+    if (nextView === 'week') setCalendarCursor(new Date());
+    window.requestAnimationFrame(scrollToTopics);
+  }
   function changeSort(nextSort: TopicSort) {
     activeSort.current = nextSort;
     topicRequestId.current += 1;
@@ -572,7 +689,7 @@ export default function App() {
       <a className="brand" href="#top"><span className="brand-mark"><Flame size={18} /></span><span>围炉夜话</span><i>FIRESIDE</i></a>
       <nav>
         <button onClick={scrollToTopics}>议题广场</button>
-        <button onClick={() => { setTab('SCHEDULED'); setView('week'); setCalendarCursor(new Date()); scrollToTopics(); }}>本周排期</button>
+        <button onClick={() => showTopicView('SCHEDULED', 'week')}>本周排期</button>
         <button className="nav-cta" onClick={() => openAction('create')}><Plus size={16} /> 发起议题</button>
       </nav>
     </header>
@@ -585,7 +702,7 @@ export default function App() {
           <p className="english">CURIOSITY IN. KNOWLEDGE OUT.</p>
           <div className="hero-poem"><p>好奇，是火种。</p><p>关注，是柴薪。</p><strong>分享，让微光成为火焰。</strong></div>
           <h2>每周一晚，<em>为彼此的好奇添一把柴。</em></h2>
-          <p className="hero-desc">把最近让你停下来多看一眼的东西，带到炉边来。这里不做培训，不做汇报；可以带着半成品、疑问和没想明白的东西来。</p>
+          <p className="hero-desc">把最近让你停下来多看一眼的东西，带到炉边来。可以自己举起火炬，也可以邀请同伴接力；这里不做培训，不做汇报。</p>
           <div className="hero-actions">
             <button className="primary-button" onClick={() => openAction('create')}><Plus size={18} /> 添一把柴</button>
             <button className="ghost-button" onClick={scrollToTopics}>看看大家在聊什么 <ArrowRight size={17} /></button>
@@ -597,20 +714,21 @@ export default function App() {
 
       <section className="stats-wrap">
         <div className="stats shell">
-          <div><span>等待认领</span><strong>{String(stats.open).padStart(2, '0')}</strong><small>簇好奇的火种</small></div>
-          <div><span>近期排期</span><strong>{String(stats.scheduled).padStart(2, '0')}</strong><small>场炉边分享</small></div>
-          <div><span>知识归档</span><strong>{String(stats.archived).padStart(2, '0')}</strong><small>份余温被保存</small></div>
-          <div className="next-fire">
+          <button className="stat-link" onClick={() => showTopicView('OPEN')}><span>等待认领</span><strong>{String(stats.open).padStart(2, '0')}</strong><small>簇等待接力的火种</small></button>
+          <button className="stat-link" onClick={() => showTopicView('CLAIMED')}><span>准备中</span><strong>{String(stats.claimed).padStart(2, '0')}</strong><small>位伙伴正在探索</small></button>
+          <button className="stat-link" onClick={() => showTopicView('SCHEDULED')}><span>已排期</span><strong>{String(stats.scheduled).padStart(2, '0')}</strong><small>场炉边分享</small></button>
+          <button className="stat-link" onClick={() => showTopicView('ARCHIVED')}><span>知识归档</span><strong>{String(stats.archived).padStart(2, '0')}</strong><small>份余温被保存</small></button>
+          <button className="next-fire stat-link" disabled={!stats.nextTopic} onClick={() => stats.nextTopic && showTopicView('SCHEDULED', 'list', stats.nextTopic.title)}>
             <span>NEXT FIRESIDE</span>
             {stats.nextTopic ? <><strong>{stats.nextTopic.scheduledAt && formatDate(stats.nextTopic.scheduledAt)}</strong><small>{stats.nextTopic.title}</small></> : <><strong>等待排期</strong><small>认领一个议题，点燃下一炉</small></>}
-          </div>
+          </button>
         </div>
       </section>
 
       <section className="topics-section shell" id="topics">
         <div className="section-heading">
           <div><p className="section-kicker">TOPIC COMMONS · 议题广场</p><h2>炉边正在发生什么</h2></div>
-          <p>一个人提出问题，另一个人接过火炬。<br />从零散的兴趣，走向一次共同探索。</p>
+          <p>可以自己举起火炬，也可以邀请同伴接力。<br />从零散的兴趣，走向一次共同探索。</p>
         </div>
         <div className="topic-toolbar">
           <div className="tabs">
@@ -648,6 +766,7 @@ export default function App() {
               index={index}
               total={visibleTopics.length}
               onAction={openAction}
+              onParticipants={setParticipantsTopic}
               draggable={canManualReorder}
               reordering={reordering}
               onDragStart={(id) => { if (!reorderInFlight.current) setDraggedId(id); }}
@@ -663,11 +782,11 @@ export default function App() {
         <div className="shell">
           <div className="section-heading compact"><div><p className="section-kicker">HOW IT WORKS · 如何围炉</p><h2>从一点好奇，到一束火光</h2></div><p>没有复杂流程，也没有专家门槛。</p></div>
           <div className="flow-grid">
-            <div><span>01</span><i><Lightbulb /></i><h3>创建议题</h3><p>留下一个真问题，告诉大家它为什么让你好奇。</p></div>
-            <div><span>02</span><i><UserRoundPlus /></i><h3>认领议题</h3><p>愿意多走一步的人接过火炬，开始做些探索。</p></div>
-            <div><span>03</span><i><CalendarDays /></i><h3>议题排期</h3><p>约定时间与地点，为共同讨论留出一个晚上。</p></div>
-            <div><span>04</span><i><Users /></i><h3>围炉分享</h3><p>带着发现、Demo 或未解的问题来到炉边。</p></div>
-            <div><span>05</span><i><Archive /></i><h3>沉淀归档</h3><p>记下收获与线索，让火光继续传给后来的人。</p></div>
+            <button onClick={() => openAction('create')}><span>01</span><i><Lightbulb /></i><h3>创建议题</h3><p>留下一个真问题，告诉大家它为什么让你好奇。</p></button>
+            <button onClick={() => showTopicView('OPEN')}><span>02</span><i><UserRoundPlus /></i><h3>认领议题</h3><p>愿意多走一步的人接过火炬，开始做些探索。</p></button>
+            <button onClick={() => showTopicView('CLAIMED')}><span>03</span><i><CalendarDays /></i><h3>议题排期</h3><p>约定时间与地点，为共同讨论留出一个晚上。</p></button>
+            <button onClick={() => showTopicView('SCHEDULED', 'week')}><span>04</span><i><Users /></i><h3>报名围炉</h3><p>查看本周排期，报名旁听或进入线上会议。</p></button>
+            <button onClick={() => showTopicView('ARCHIVED')}><span>05</span><i><Archive /></i><h3>沉淀归档</h3><p>记下收获与线索，让火光继续传给后来的人。</p></button>
           </div>
         </div>
       </section>
@@ -693,9 +812,10 @@ export default function App() {
       </section>
     </main>
 
-    <footer className="shell"><div className="brand muted"><span className="brand-mark"><Flame size={16} /></span><span>围炉夜话</span></div><p>Curiosity is the spark. Sharing keeps it alive.</p><a href="https://github.com/ShijunDeng/fireside" target="_blank" rel="noreferrer"><Github size={16} /> GitHub Repository</a></footer>
+    <footer className="shell"><div className="brand muted"><span className="brand-mark"><Flame size={16} /></span><span>围炉夜话</span></div><p>Curiosity is the spark. Sharing keeps it alive.</p><span>团队共创 · 公开浏览</span></footer>
 
     {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} />}
+    {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}
   </>;
 }

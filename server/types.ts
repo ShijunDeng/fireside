@@ -13,9 +13,18 @@ export interface Topic {
   scheduledAt: string | null;
   duration: number | null;
   room: string | null;
+  meetingUrl: string | null;
+  participantCount: number;
   takeaway: string | null;
   materialUrl: string | null;
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
+}
+
+export interface Participant {
+  id: number;
+  topicId: number;
+  name: string;
+  createdAt: string;
 }

@@ -15,6 +15,8 @@ type TopicRow = {
   scheduled_at: string | null;
   duration: number | null;
   room: string | null;
+  meeting_url: string | null;
+  participant_count?: number;
   takeaway: string | null;
   material_url: string | null;
   created_at: string;
@@ -35,6 +37,8 @@ export function rowToTopic(row: TopicRow): Topic {
     scheduledAt: row.scheduled_at,
     duration: row.duration,
     room: row.room,
+    meetingUrl: row.meeting_url,
+    participantCount: row.participant_count ?? 0,
     takeaway: row.takeaway,
     materialUrl: row.material_url,
     createdAt: row.created_at,
@@ -125,6 +129,7 @@ export function createDatabase(databasePath: string, seed = true) {
       scheduled_at TEXT,
       duration INTEGER,
       room TEXT,
+      meeting_url TEXT,
       takeaway TEXT,
       material_url TEXT,
       created_at TEXT NOT NULL,
@@ -155,6 +160,9 @@ export function createDatabase(databasePath: string, seed = true) {
   const columns = db.prepare('PRAGMA table_info(topics)').all() as { name: string }[];
   if (!columns.some((column) => column.name === 'position')) {
     db.exec('ALTER TABLE topics ADD COLUMN position INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!columns.some((column) => column.name === 'meeting_url')) {
+    db.exec('ALTER TABLE topics ADD COLUMN meeting_url TEXT');
   }
   const positionIndex = (db.prepare("PRAGMA index_list('topics')").all() as { name: string; unique: number }[])
     .find(({ name }) => name === 'idx_topics_position');

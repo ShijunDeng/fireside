@@ -1,4 +1,4 @@
-import type { Stats, Topic, TopicSort } from './types';
+import type { Participant, Stats, Topic, TopicSort } from './types';
 
 export class ApiError extends Error {
   constructor(message: string, public status: number) {
@@ -31,7 +31,7 @@ export const api = {
   stats: () => request<Stats>('/api/stats'),
   create: (data: { title: string; summary: string; proposer: string; presenter?: string; tags: string[] }) =>
     request<Topic>('/api/topics', { method: 'POST', body: JSON.stringify(data) }),
-  update: (id: number, data: Partial<Pick<Topic, 'title' | 'summary' | 'proposer' | 'presenter' | 'tags' | 'scheduledAt' | 'duration' | 'room' | 'takeaway' | 'materialUrl'>>) =>
+  update: (id: number, data: Partial<Pick<Topic, 'title' | 'summary' | 'proposer' | 'presenter' | 'tags' | 'scheduledAt' | 'duration' | 'room' | 'meetingUrl' | 'takeaway' | 'materialUrl'>>) =>
     request<Topic>(`/api/topics/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   remove: (id: number) => request<void>(`/api/topics/${id}`, { method: 'DELETE' }),
   reorder: async (orderedIds: number[], baseVersion: number) => {
@@ -46,10 +46,13 @@ export const api = {
   claim: (id: number, presenter: string) =>
     request<Topic>(`/api/topics/${id}/claim`, { method: 'POST', body: JSON.stringify({ presenter }) }),
   release: (id: number) => request<Topic>(`/api/topics/${id}/release`, { method: 'POST', body: JSON.stringify({}) }),
-  schedule: (id: number, data: { scheduledAt: string; duration: number; room: string }) =>
+  schedule: (id: number, data: { scheduledAt: string; duration: number; room: string; meetingUrl: string }) =>
     request<Topic>(`/api/topics/${id}/schedule`, { method: 'POST', body: JSON.stringify(data) }),
   unschedule: (id: number) => request<Topic>(`/api/topics/${id}/unschedule`, { method: 'POST', body: JSON.stringify({}) }),
   archive: (id: number, data: { takeaway: string; materialUrl: string }) =>
     request<Topic>(`/api/topics/${id}/archive`, { method: 'POST', body: JSON.stringify(data) }),
   unarchive: (id: number) => request<Topic>(`/api/topics/${id}/unarchive`, { method: 'POST', body: JSON.stringify({}) }),
+  participants: (id: number) => request<Participant[]>(`/api/topics/${id}/participants`),
+  join: (id: number, name: string) => request<Participant>(`/api/topics/${id}/participants`, { method: 'POST', body: JSON.stringify({ name }) }),
+  leave: (id: number, participantId: number) => request<void>(`/api/topics/${id}/participants/${participantId}`, { method: 'DELETE' }),
 };

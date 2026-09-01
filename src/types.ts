@@ -12,6 +12,8 @@ export interface Topic {
   scheduledAt: string | null;
   duration: number | null;
   room: string | null;
+  meetingUrl: string | null;
+  participantCount: number;
   takeaway: string | null;
   materialUrl: string | null;
   createdAt: string;
@@ -19,10 +21,18 @@ export interface Topic {
   archivedAt: string | null;
 }
 
+export interface Participant {
+  id: number;
+  topicId: number;
+  name: string;
+  createdAt: string;
+}
+
 export type TopicSort = 'manual' | 'newest' | 'oldest' | 'schedule' | 'status';
 
 export interface Stats {
   open: number;
+  claimed: number;
   scheduled: number;
   archived: number;
   nextTopic: Topic | null;

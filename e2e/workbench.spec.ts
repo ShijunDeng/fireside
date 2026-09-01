@@ -20,9 +20,9 @@ test.describe('议题管理工作台', () => {
   test('顶部“本周排期”进入当前周，而不是普通列表筛选', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === 'mobile', '移动端顶部次级导航按设计隐藏，周历通过视图开关进入');
     await page.goto('/');
-    await page.getByRole('button', { name: '本周排期' }).click();
+    await page.getByRole('button', { name: '本周排期', exact: true }).click();
     await expect(page.getByRole('button', { name: '周历' })).toHaveClass(/active/);
-    await expect(page.getByRole('button', { name: '近期排期' })).toHaveClass(/active/);
+    await expect(page.getByRole('button', { name: '已排期', exact: true })).toHaveClass(/active/);
     await expect(page.locator('.week-calendar')).toBeVisible();
   });
 
@@ -68,7 +68,7 @@ test.describe('议题管理工作台', () => {
 
     await card.getByRole('button', { name: /安排分享/ }).click();
     await page.getByRole('button', { name: '确认排期' }).click();
-    await expect(card).toContainText('即将开讲');
+    await expect(card).toContainText('已排期');
 
     await card.getByRole('button', { name: /完成归档/ }).click();
     await page.getByLabel('本期最值得留下的收获').fill('浏览器完整纠错链路已验证。');
@@ -77,7 +77,7 @@ test.describe('议题管理工作台', () => {
 
     await card.getByRole('button', { name: /撤销归档/ }).click();
     await page.getByRole('button', { name: '确认撤销归档' }).click();
-    await expect(card).toContainText('即将开讲');
+    await expect(card).toContainText('已排期');
 
     await card.getByRole('button', { name: /取消排期/ }).click();
     await page.getByRole('button', { name: '确认取消排期' }).click();
@@ -89,6 +89,119 @@ test.describe('议题管理工作台', () => {
     await card.getByRole('button', { name: /删除/ }).click();
     await page.getByRole('button', { name: '确认删除' }).click();
     await expect(card).toHaveCount(0);
+  });
+
+  test('线上会议可加入，并完成报名、去重和取消报名', async ({ page }, testInfo) => {
+    const title = `线上参会浏览器验收-${testInfo.project.name}-${Date.now()}`;
+    const meetingUrl = 'https://meet.example.test/fireside/weekly-room';
+    await page.goto('/');
+    await page.getByRole('button', { name: /发起议题/ }).first().click();
+    await page.getByLabel('议题标题').fill(title);
+    await page.getByLabel('一句话简介').fill('验证会议入口、报名名单与周历中的独立参会动作。');
+    await page.getByLabel('你的名字').fill('线上组织者');
+    await page.getByLabel('我来分享').check();
+    await page.getByRole('button', { name: '发布议题' }).click();
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: /安排分享/ }).click();
+    await page.getByLabel('地点 / 参与说明').fill('线上会议');
+    await page.getByLabel('线上会议链接（选填）').fill(meetingUrl);
+    await page.getByRole('button', { name: '确认排期' }).click();
+
+    const cardMeetingLink = card.getByRole('link', { name: '加入会议' });
+    await expect(cardMeetingLink).toHaveAttribute('href', meetingUrl);
+    await expect(cardMeetingLink).toHaveAttribute('target', '_blank');
+    await expect(cardMeetingLink).toHaveAttribute('rel', 'noreferrer');
+    await card.getByRole('button', { name: /报名参加/ }).click();
+    const participantDialog = page.getByRole('dialog');
+    await participantDialog.getByLabel('你的名字').fill('Alice');
+    await participantDialog.getByRole('button', { name: '确认报名' }).click();
+    await expect(participantDialog.getByText('Alice')).toBeVisible();
+    await participantDialog.getByLabel('你的名字').fill(' alice ');
+    await participantDialog.getByRole('button', { name: '确认报名' }).click();
+    await expect(participantDialog.getByText(/已经报名/)).toBeVisible();
+    await participantDialog.getByLabel('你的名字').fill('小林');
+    await participantDialog.getByRole('button', { name: '确认报名' }).click();
+    await expect(participantDialog.getByText('2 人')).toBeVisible();
+    await participantDialog.getByRole('button', { name: '取消 Alice 的报名' }).click();
+    await expect(participantDialog.getByText('1 人')).toBeVisible();
+    await participantDialog.getByRole('button', { name: '关闭' }).click();
+    await expect(card).toContainText('1 人报名');
+
+    await page.getByRole('button', { name: '周历' }).click();
+    const weekEvent = page.locator('.week-event').filter({ hasText: title });
+    const weekMeetingLink = weekEvent.getByRole('link', { name: '加入会议' });
+    await expect(weekMeetingLink).toHaveAttribute('href', meetingUrl);
+    await page.context().route('https://meet.example.test/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<title>模拟会议室</title>' }));
+    const popupPromise = page.waitForEvent('popup');
+    await weekMeetingLink.click();
+    const popup = await popupPromise;
+    expect(popup.url()).toBe(meetingUrl);
+    await popup.close();
+    await expect(page.getByRole('heading', { name: '编辑议题' })).toHaveCount(0);
+
+    await page.getByRole('button', { name: '列表' }).click();
+    await card.getByRole('button', { name: /删除/ }).click();
+    await page.getByRole('button', { name: '确认删除' }).click();
+    await expect(card).toHaveCount(0);
+  });
+
+  test('统计与五步说明进入真实功能', async ({ page }) => {
+    await page.goto('/');
+    await page.locator('.stats').getByRole('button', { name: /等待认领/ }).click();
+    await expect(page.getByRole('button', { name: '等待认领', exact: true })).toHaveClass(/active/);
+    const flow = page.locator('.flow-grid');
+    await flow.getByRole('button', { name: '创建议题' }).click();
+    await expect(page.getByRole('heading', { name: '发起一个新议题' })).toBeVisible();
+    await page.getByRole('button', { name: '关闭' }).click();
+    await flow.getByRole('button', { name: '认领议题' }).click();
+    await expect(page.getByRole('button', { name: '等待认领', exact: true })).toHaveClass(/active/);
+    await flow.getByRole('button', { name: '议题排期' }).click();
+    await expect(page.getByRole('button', { name: '准备中', exact: true })).toHaveClass(/active/);
+    await flow.getByRole('button', { name: '报名围炉' }).click();
+    await expect(page.getByRole('button', { name: '周历' })).toHaveClass(/active/);
+    await flow.getByRole('button', { name: '沉淀归档' }).click();
+    await expect(page.getByRole('button', { name: '往期归档', exact: true })).toHaveClass(/active/);
+  });
+
+  test('月历可展开同日隐藏议题，标签超限不会静默丢弃', async ({ page, request }, testInfo) => {
+    const dayOffset = (testInfo.project.name === 'mobile' ? 10 : 1) + testInfo.retry * 2;
+    const scheduledAt = new Date(Date.now() + dayOffset * 86_400_000);
+    scheduledAt.setHours(18, 0, 0, 0);
+    const ids: number[] = [];
+    const titles: string[] = [];
+    for (let index = 1; index <= 4; index += 1) {
+      const title = `月历溢出-${testInfo.project.name}-${Date.now()}-${index}`;
+      titles.push(title);
+      const created = await request.post('/api/topics', {
+        data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
+      });
+      const topic = await created.json() as { id: number };
+      ids.push(topic.id);
+      await request.post(`/api/topics/${topic.id}/schedule`, {
+        data: { scheduledAt: scheduledAt.toISOString(), duration: 30, room: '月历测试会议室', meetingUrl: '' },
+      });
+    }
+
+    await page.goto('/');
+    await page.getByRole('button', { name: '月历', exact: true }).click();
+    const moreButton = page.getByRole('button', { name: '还有 1 个议题' });
+    const hiddenEvent = page.locator('.calendar-event').filter({ hasText: titles[3] });
+    await expect(moreButton).toBeVisible();
+    await expect(hiddenEvent).toHaveCount(0);
+    await moreButton.click();
+    await expect(hiddenEvent).toBeVisible();
+    await expect(page.getByRole('button', { name: '收起' })).toBeVisible();
+
+    await page.getByRole('button', { name: /发起议题/ }).first().click();
+    await page.getByLabel('议题标题').fill('标签上限验收');
+    await page.getByLabel('一句话简介').fill('第六个标签必须明确报错，不能被静默截断。');
+    await page.getByLabel('你的名字').fill('标签测试');
+    await page.getByLabel('标签（最多 5 个）').fill('一,二,三,四,五,六');
+    await page.getByRole('button', { name: '发布议题' }).click();
+    await expect(page.getByText('标签最多 5 个')).toBeVisible();
+    await page.getByRole('button', { name: '关闭' }).click();
+
+    await Promise.all(ids.map((id) => request.delete(`/api/topics/${id}`)));
   });
 
   test('上移按钮保存手动顺序，刷新后保持', async ({ page }) => {
