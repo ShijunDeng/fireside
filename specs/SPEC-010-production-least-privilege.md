@@ -108,8 +108,10 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能写第一份 journal。exec 后立即退出、坏参数/锁、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
 - watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
 - fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
+- 主维护锁优先由 `flock --close` 监督进程持有，controller 本身及其全部后代从未拥有该 fd；不能只在已知 systemctl/curl 调用点关闭，因为 sync/stat/hash 等任一存活子进程都可能继承。测试让持久化子进程在父 controller 被杀后继续存活，watchdog必须立即取得同一 inode。
 - backup 不得与 root recovery 共用一个扩大写权限的 sandbox。使用独立 root-owned gate/recovery unit，再进入保持现有最小权限的 runner unit；runner 在取得共享锁后再次只读确认没有 journal并解析已健康 selector，防止 gate→runner 间竞态。任意 active transaction 都不得执行 target backup CLI 或 prune。
 - service gate 与 backup gate 的 orphan 语义不同：service gate 仅在旧 MainPID 已停止的 `ExecStartPre` 中允许无 restart 恢复，随后本次启动 origin；backup gate 若先于 watchdog 取得孤儿锁，必须执行完整的授权 restart、验证 origin MainPID/cwd/health、重建 selector/许可并清 journal后才能进入 runner，不能只回指针后让仍运行的 target 留在公网。也可以不清 journal并让本次 backup 失败等待 watchdog，但绝不能从 target 备份。
+- 最小权限 backup runner 不得写 `/run`。root gate 负责创建和严格验证维护锁；runner 仅以只读 fd 对同一 inode 取得共享 flock，并在整个 `/run` 只读的 sandbox 中复查 transaction/active/selector/permit。候选 backup CLI 尝试 unlink/replace lock、selector或permit必须得到 EPERM，发布控制器只能在该共享锁释放后取得独占锁。
 - root gate 必须是没有 `EnvironmentFile=/etc/fireside.env` 的独立 unit，不能把 root `ExecStartPre` 直接放进应用 unit 而继承业务写入口口令。gate、watchdog、recovery 与 backup 的环境必须在日志和首个子进程前显式移除 `FIRESIDE_WRITE_KEY` 及会话密钥；只有非 root Node MainPID 可继承应用所需密钥。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
 - 含生产备份副本且已授权给 `fireside-build` 的 preflight stage 必须确认递归删除成功且路径消失后，才能取消 EXIT trap、写 transaction 或切换 `current`。显式清理失败必须以 2 停在切换前并记录稳定错误；trap 的兜底清理失败也必须可见，不能静默把敏感副本当作已删除。
@@ -215,6 +217,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 42. 在 bootstrap 的 switched/healthy 阶段分别截断、翻转备份一字节，或改变其 mode/owner/link/type；recovery 必须返回4，主库 hash 不变、current 与 journal 证据保留，不能先删指针或覆盖数据库。只有 filename+size+SHA-256与严格元数据全部匹配的备份才能恢复并清 journal。
 43. 在 service gate 已确认 transaction owner 活跃后阻塞它，杀 controller 并让 watchdog进入恢复，再释放 gate；最终必须是 origin MainPID/cwd/current/selector/permit一致、journal 不复活且 target 写/runner不持续运行。gate mutex 类型、owner、mode、link count任一错误均失败关闭。
 44. switched orphan 分别由 watchdog、人工 recover、backup gate 先取得；三条恢复都必须在明显小于 gate mutex 120秒超时内释放 mutex供 service gate 消费恢复许可，再重新取得并完成 origin health，不能死锁。backup 只能在完整恢复后执行 origin runner。
+45. 让 controller 的 sync 等子进程在父进程被杀后持续存活，逐一检查其 `/proc/<pid>/fd` 不含主锁/gate锁；watchdog立即取得同一inode恢复。backup CLI尝试unlink/replace lock、selector与permit均EPERM，且并发controller直到runner共享锁释放后才能进入。
 
 ### 7.2 生产
 
@@ -291,3 +294,7 @@ bootstrap 恢复完整性复审确认事务只记录备份文件名时，截断�
 service gate 许可消费复审确认 owner 瞬时校验与 journal/selector 写入之间可被 controller SIGKILL 切开；watchdog恢复清理后，旧 gate 能再次复活 target 事务。新增独立 root-only gate mutex：gate消费全程持有，watchdog取得主锁后再持有才恢复，controller从不持有；该一致性 P1 使成熟度计数保持 0。
 
 gate mutex 实现复审确认恢复者若持 mutex 同步 `systemctl restart`，本次 service gate 会等待同一锁并与父恢复者必然自锁。恢复者必须在持主锁写好绑定许可后释放 mutex，restart 返回后重新取得并复核同一事务消费与运行态；watchdog/人工/backup 三条路径都要真实验收。该 P1 使成熟度计数保持 0。
+
+锁 fd 复审确认仅在 systemctl 等少数调用点关闭 fd 不足：持久化 sync 子进程可在 controller 死亡后继续占主锁，永久阻止 watchdog。主锁改由 `flock --close` 监督者持有，controller 全后代从未获得 fd；gate 锁路径同样必须证明无继承。该恢复可用性 P1 使成熟度计数保持 0。
+
+backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护锁或运行许可，绕过互斥与写屏障。root gate 负责锁准备，runner 只读 open + shared flock 并把 `/run` 设为只读；候选 CLI 破坏尝试必须 EPERM。该高价值 P2 使成熟度计数保持 0。

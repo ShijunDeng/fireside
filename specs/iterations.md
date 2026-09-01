@@ -236,3 +236,5 @@
 - bootstrap 恢复身份阻断 Y：journal 只记录备份名时，截断/位腐坏备份可覆盖最后一份有效主库并清 journal误报成功。事务绑定备份 size+SHA-256；恢复在触碰指针/主库前验证固定目录、root:root0600、单链接普通文件与内容身份，pending复制后再次校验，失败保留现有主库和全部证据。
 - gate/watchdog 互斥阻断 Z：service gate 在 owner 校验后无锁写 journal/selector，controller SIGKILL 后可与 watchdog恢复并发并复活已清事务。增加独立 root-only gate mutex；许可消费全程持有，watchdog取得主锁后再持有才恢复，controller不持该锁且所有路径统一锁序。确定性阻塞注入验证 journal 不复活、最终运行态全为origin。
 - mutex 恢复自锁阻断 AA：恢复者持 gate mutex 同步 restart 会等待同样需要该 mutex 的 service gate。恢复者持主锁写好 reverting/pending许可后临时释放 mutex，restart后重新取得并复核同一txid/generation/consumed及健康；watchdog、人工 recover、backup gate 的 switched orphan 均须无120秒超时并完整恢复origin。
+- 锁fd继承阻断 AB：仅关闭systemctl/curl仍让sync/stat/hash等子进程继承主锁，controller死亡后watchdog可永久等待。主锁由`flock --close`监督者持有，controller及全部后代从未拥有fd；gate锁也须以存活子进程故障注入证明不会延长owner生命周期。
+- backup运行态写权阻断 AC：UID0 runner曾可写整个`/run`并替换维护锁/selector/permit。root gate预建严格锁，runner只读open同inode取得共享flock，sandbox内`/run`只读；候选CLI破坏尝试EPERM且controller严格等待共享锁释放。
