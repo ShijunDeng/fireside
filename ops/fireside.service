@@ -1,0 +1,18 @@
+[Unit]
+Description=Fireside Topic Platform
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dsj/fireside
+Environment=NODE_ENV=production
+Environment=HOST=0.0.0.0
+Environment=PORT=80
+Environment=DATABASE_PATH=/home/dsj/fireside/data/fireside.db
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
