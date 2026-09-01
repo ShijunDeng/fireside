@@ -1,0 +1,14 @@
+[Unit]
+Description=Fireside HTTP Socket
+Documentation=https://github.com/ShijunDeng/fireside
+
+[Socket]
+ListenStream=0.0.0.0:80
+Accept=no
+Service=fireside.service
+FileDescriptorName=fireside
+NoDelay=true
+Backlog=511
+
+[Install]
+WantedBy=sockets.target

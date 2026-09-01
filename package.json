@@ -7,8 +7,11 @@
   "scripts": {
     "dev": "tsx watch server/index.ts",
     "dev:web": "vite --host 0.0.0.0",
-    "build": "vite build",
-    "start": "tsx server/index.ts",
+    "clean": "node -e \"require('node:fs').rmSync('server-build', { recursive: true, force: true })\"",
+    "build:client": "vite build --outDir server-build/dist",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build": "npm run clean && npm run build:client && npm run build:server",
+    "start": "node server-build/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "test:e2e": "playwright test",

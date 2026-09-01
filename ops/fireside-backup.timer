@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily Fireside SQLite Backup
+Documentation=https://github.com/ShijunDeng/fireside
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=15m
+AccuracySec=1m
+Unit=fireside-backup.service
+
+[Install]
+WantedBy=timers.target

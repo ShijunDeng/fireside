@@ -1,37 +1,32 @@
 [Unit]
-Description=Fireside Topic Platform
+Description=Fireside SQLite Online Backup
 Documentation=https://github.com/ShijunDeng/fireside
-Requires=fireside.socket
-After=network.target fireside.socket
-RequiresMountsFor=/opt/fireside/current /var/lib/fireside
+RequiresMountsFor=/opt/fireside/current /var/lib/fireside /var/backups/fireside
 
 [Service]
-Type=exec
-User=fireside
-Group=fireside
+Type=oneshot
+User=root
+Group=root
 WorkingDirectory=/opt/fireside/current
 Environment=NODE_ENV=production
 Environment=DATABASE_PATH=/var/lib/fireside/fireside.db
-EnvironmentFile=/etc/fireside.env
-ExecStart=/usr/bin/node /opt/fireside/current/server-build/server/index.js
-Restart=on-failure
-RestartSec=3s
-TimeoutStopSec=30s
-KillSignal=SIGTERM
+Environment=BACKUP_DIRECTORY=/var/backups/fireside
+Environment=BACKUP_RETENTION=14
+ExecStart=/usr/bin/node /opt/fireside/current/server-build/server/backup-cli.js
 UMask=0077
 
-StateDirectory=fireside
-StateDirectoryMode=0700
-ReadWritePaths=/var/lib/fireside
+ReadOnlyPaths=/var/lib/fireside
+ReadWritePaths=/var/backups/fireside
 InaccessiblePaths=/etc/fireside.env
 
 NoNewPrivileges=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
+PrivateNetwork=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -45,9 +40,6 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictNamespaces=true
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX
 RemoveIPC=true
 KeyringMode=private
-
-[Install]
-WantedBy=multi-user.target
