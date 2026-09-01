@@ -13,8 +13,10 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Download,
   Flame,
   GripVertical,
+  ImageDown,
   Lightbulb,
   Link as LinkIcon,
   List,
@@ -23,6 +25,7 @@ import {
   Plus,
   RotateCcw,
   Search,
+  Share2,
   Sparkles,
   Trash2,
   UserRound,
@@ -32,6 +35,7 @@ import {
 } from 'lucide-react';
 import { api, ApiError } from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
+import { buildPosterModel, isPosterEligible, posterToBlob, renderTopicPoster } from './poster';
 import type { Participant, Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
@@ -81,6 +85,65 @@ function topicMeetingUrl(topic: Topic) {
   return topic.meetingUrl ?? legacyMeetingUrl(topic.room);
 }
 
+const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function useDialogA11y(onClose: () => void) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  const returnFocusRef = useRef<HTMLElement | null>(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const returnFocusKey = returnFocusRef.current?.dataset.focusReturn;
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const frame = window.requestAnimationFrame(() => {
+      (dialog.querySelector<HTMLElement>('[data-initial-focus]') ?? dialog.querySelector<HTMLElement>(focusableSelector) ?? dialog).focus();
+    });
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(dialog!.querySelectorAll<HTMLElement>(focusableSelector)).filter((element) => element.offsetParent !== null);
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog!.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      let attempts = 0;
+      const restoreFocus = () => {
+        const original = returnFocusRef.current;
+        const fallback = returnFocusKey ? document.querySelector<HTMLElement>(`[data-focus-return="${CSS.escape(returnFocusKey)}"]`) : null;
+        const target = original?.isConnected ? original : fallback;
+        if (target) target.focus();
+        else if (returnFocusKey && attempts++ < 30) window.requestAnimationFrame(restoreFocus);
+      };
+      window.requestAnimationFrame(restoreFocus);
+    };
+  }, []);
+  return dialogRef;
+}
+
 function FireVisual() {
   return (
     <div className="fire-card" aria-label="围炉夜话的篝火插画">
@@ -102,10 +165,11 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction, onParticipants, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
+function TopicCard({ topic, onAction, onParticipants, onPoster, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
   topic: Topic;
   onAction: (kind: ModalKind, topic: Topic) => void;
   onParticipants: (topic: Topic) => void;
+  onPoster: (topic: Topic) => void;
   draggable: boolean;
   reordering: boolean;
   index: number;
@@ -114,7 +178,8 @@ function TopicCard({ topic, onAction, onParticipants, draggable, reordering, ind
   onDrop: (id: number) => void;
   onMove: (id: number, direction: -1 | 1) => void;
 }) {
-  const meta = statusMeta[topic.status];
+  const overdue = topic.status === 'SCHEDULED' && Boolean(topic.scheduledAt) && !isPosterEligible(topic);
+  const meta = overdue ? { label: '待归档', className: 'scheduled' } : statusMeta[topic.status];
   const meetingUrl = topicMeetingUrl(topic);
   return (
     <article
@@ -146,6 +211,7 @@ function TopicCard({ topic, onAction, onParticipants, draggable, reordering, ind
           <div><CalendarDays size={16} /><strong>{formatDate(topic.scheduledAt)}</strong></div>
           <div><MapPin size={15} /><span>{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room}</span><Clock3 size={15} /><span>{topic.duration} 分钟</span></div>
           {meetingUrl && <a className="meeting-link" href={meetingUrl} target="_blank" rel="noreferrer"><LinkIcon size={14} />加入会议</a>}
+          {overdue && <p className="schedule-overdue">排期已过，请完成归档或编辑后重新安排。</p>}
         </div>
       )}
 
@@ -167,12 +233,13 @@ function TopicCard({ topic, onAction, onParticipants, draggable, reordering, ind
           </>}
           {topic.status === 'SCHEDULED' && <>
             <button className="card-action subtle" onClick={() => onAction('unschedule', topic)}>取消排期 <CalendarX2 size={14} /></button>
-            <button className="card-action cyan" onClick={() => onParticipants(topic)}>报名参加 <Users size={14} /></button>
+            <button className="card-action cyan" data-focus-return={`participants-${topic.id}`} onClick={() => onParticipants(topic)}>报名参加 <Users size={14} /></button>
+            {!overdue && <button className="card-action warm" data-focus-return={`poster-${topic.id}`} onClick={() => onPoster(topic)}>生成海报 <ImageDown size={14} /></button>}
             <button className="card-action" onClick={() => onAction('archive', topic)}>完成归档 <Archive size={15} /></button>
           </>}
           {topic.status === 'ARCHIVED' && <>
             <button className="card-action subtle" onClick={() => onAction('unarchive', topic)}>撤销归档 <RotateCcw size={14} /></button>
-            <button className="card-action" onClick={() => onParticipants(topic)}>查看参与 <Users size={14} /></button>
+            <button className="card-action" data-focus-return={`participants-${topic.id}`} onClick={() => onParticipants(topic)}>查看参与 <Users size={14} /></button>
             {topic.materialUrl && <a className="card-action" href={topic.materialUrl} target="_blank" rel="noreferrer">查看资料 <LinkIcon size={15} /></a>}
           </>}
         </div>
@@ -295,6 +362,7 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const canJoin = topic.status === 'SCHEDULED';
+  const dialogRef = useDialogA11y(onClose);
 
   const loadParticipants = useCallback(async () => {
     try {
@@ -342,14 +410,14 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
   }
 
   return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <div className="modal participants-modal" role="dialog" aria-modal="true" aria-labelledby="participants-title">
+    <div ref={dialogRef} className="modal participants-modal" role="dialog" aria-modal="true" aria-labelledby="participants-title" tabIndex={-1}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><Users size={14} /> FIRESIDE GUESTS</span>
       <h2 id="participants-title">{canJoin ? '报名参加围炉' : '本期参与伙伴'}</h2>
       <p className="modal-intro">可以来分享，也可以只守着火光坐一会儿。姓名是公开署名，当前不绑定个人账号。</p>
       <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>
       {canJoin && <form className="join-form" onSubmit={join}>
-        <label>你的名字<input name="name" required maxLength={30} placeholder="怎么称呼你" autoFocus /></label>
+        <label>你的名字<input name="name" required maxLength={30} placeholder="怎么称呼你" autoFocus data-initial-focus /></label>
         <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在处理…' : '确认报名'}{!submitting && <ChevronRight size={17} />}</button>
       </form>}
       <div className="participant-list" aria-live="polite">
@@ -364,6 +432,113 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
   </div>;
 }
 
+function PosterModal({ topic, onClose }: { topic: Topic; onClose: () => void }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dialogRef = useDialogA11y(onClose);
+  const [attempt, setAttempt] = useState(0);
+  const [posterBlob, setPosterBlob] = useState<Blob | null>(null);
+  const [posterUrl, setPosterUrl] = useState('');
+  const [generating, setGenerating] = useState(true);
+  const [canShare, setCanShare] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const modelResult = useMemo(() => {
+    try {
+      return { model: buildPosterModel(topic, window.location.origin), error: '' };
+    } catch (err) {
+      return { model: null, error: err instanceof Error ? err.message : '海报信息不完整' };
+    }
+  }, [topic]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = '';
+    setGenerating(true);
+    setPosterBlob(null);
+    setPosterUrl('');
+    setCanShare(false);
+    setNotice('');
+    setError(modelResult.error);
+    if (!modelResult.model) {
+      setGenerating(false);
+      return;
+    }
+    void (async () => {
+      try {
+        await document.fonts?.ready;
+        if (!canvasRef.current || cancelled) return;
+        renderTopicPoster(canvasRef.current, modelResult.model!);
+        const blob = await posterToBlob(canvasRef.current);
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        const file = new File([blob], modelResult.model!.filename, { type: 'image/png' });
+        setPosterBlob(blob);
+        setPosterUrl(objectUrl);
+        setCanShare(Boolean(navigator.canShare?.({ files: [file] })));
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : '海报生成失败，请重试');
+      } finally {
+        if (!cancelled) setGenerating(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [attempt, modelResult]);
+
+  function downloadPoster() {
+    if (!posterUrl || !modelResult.model) return;
+    const anchor = document.createElement('a');
+    anchor.href = posterUrl;
+    anchor.download = modelResult.model.filename;
+    anchor.click();
+  }
+
+  async function sharePoster() {
+    if (!posterBlob || !modelResult.model) return;
+    try {
+      const file = new File([posterBlob], modelResult.model.filename, { type: 'image/png' });
+      await navigator.share({ title: `围炉夜话 · ${modelResult.model.title}`, files: [file] });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      setNotice('分享没有完成，你仍可以下载或长按图片保存。');
+    }
+  }
+
+  const model = modelResult.model;
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal poster-modal" role="dialog" aria-modal="true" aria-labelledby="poster-title" tabIndex={-1}>
+      <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
+      <span className="modal-eyebrow"><ImageDown size={14} /> FIRESIDE POSTER</span>
+      <h2 id="poster-title">宣讲海报已为你备好</h2>
+      <p className="modal-intro">使用最新排期在本地生成；线上会议链接与凭证不会出现在海报中。</p>
+      <div className="poster-layout">
+        <div className="poster-preview" aria-live="polite">
+          <canvas ref={canvasRef} className="poster-canvas-source" aria-hidden="true" />
+          {generating && <div className="poster-status"><Flame className="loading-flame" /><span>正在举起火炬…</span></div>}
+          {!generating && posterUrl && model && <img src={posterUrl} alt={`围炉夜话宣讲海报：${model.title}，${model.date} ${model.time}`} />}
+          {!generating && error && <div className="poster-status error"><span>{error}</span><button onClick={() => setAttempt((value) => value + 1)}>重新生成</button></div>}
+        </div>
+        <div className="poster-side">
+          {model && <div className="poster-summary">
+            <span>即将开讲</span>
+            <strong>{model.title}</strong>
+            <p>{model.date}<br />{model.time}</p>
+            <p>分享人 · {model.presenter}<br />{model.location}</p>
+          </div>}
+          <div className="poster-actions">
+            <button className="submit-btn" disabled={!posterUrl || generating} onClick={downloadPoster}><Download size={16} />下载 PNG</button>
+            {canShare && <button className="poster-share" disabled={!posterBlob || generating} onClick={() => void sharePoster()}><Share2 size={16} />分享 / 保存</button>}
+          </div>
+          <p className="poster-save-hint">手机端可长按左侧图片保存；支持文件分享时也可直接发送给伙伴。</p>
+          {notice && <div className="form-error" role="status">{notice}</div>}
+        </div>
+      </div>
+    </div>
+  </div>;
+}
+
 function Modal({ kind, topic, onClose, onComplete, onConflict }: {
   kind: ModalKind;
   topic: Topic | null;
@@ -373,6 +548,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const dialogRef = useDialogA11y(onClose);
   const copy = {
     create: { eyebrow: 'ADD A SPARK', title: '发起一个新议题', intro: '不必是完整答案，一个真实的问题就足够成为火种。' },
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
@@ -460,7 +636,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
 
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1}>
         <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
         <span className="modal-eyebrow"><Sparkles size={14} />{copy.eyebrow}</span>
         <h2 id="modal-title">{copy.title}</h2>
@@ -469,7 +645,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
 
         <form onSubmit={submit}>
           {kind === 'create' && <>
-            <label>议题标题<input name="title" required maxLength={80} placeholder="最近有什么让你停下来多看了一眼？" autoFocus /></label>
+            <label>议题标题<input name="title" required maxLength={80} placeholder="最近有什么让你停下来多看了一眼？" autoFocus data-initial-focus /></label>
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} placeholder="它为什么值得一起聊聊？你想从哪里开始探索？" /></label>
             <div className="form-row">
               <label>你的名字<input name="proposer" required maxLength={30} placeholder="怎么称呼你" /></label>
@@ -481,9 +657,9 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
               <label><input type="radio" name="publishIntent" value="self" /><span><b>我来分享</b><small>发布后直接进入准备中，不再重复认领</small></span></label>
             </fieldset>
           </>}
-          {kind === 'claim' && <label>认领人<input name="presenter" required maxLength={30} placeholder="你的名字" autoFocus /></label>}
+          {kind === 'claim' && <label>认领人<input name="presenter" required maxLength={30} placeholder="你的名字" autoFocus data-initial-focus /></label>}
           {kind === 'schedule' && <>
-            <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={defaultScheduleTime()} autoFocus /></label>
+            <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={defaultScheduleTime()} autoFocus data-initial-focus /></label>
             <div className="form-row">
               <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={40} /></label>
               <label>地点 / 参与说明<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
@@ -491,11 +667,11 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
             <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} placeholder="https://" /></label>
           </>}
           {kind === 'archive' && <>
-            <label>本期最值得留下的收获<textarea name="takeaway" required maxLength={1000} rows={5} placeholder="用几句话记下结论、共识或仍待探索的问题……" autoFocus /></label>
+            <label>本期最值得留下的收获<textarea name="takeaway" required maxLength={1000} rows={5} placeholder="用几句话记下结论、共识或仍待探索的问题……" autoFocus data-initial-focus /></label>
             <label>资料链接（选填）<input name="materialUrl" type="url" placeholder="https://" /></label>
           </>}
           {kind === 'edit' && topic && <>
-            <label>议题标题<input name="title" required maxLength={80} defaultValue={topic.title} autoFocus /></label>
+            <label>议题标题<input name="title" required maxLength={80} defaultValue={topic.title} autoFocus data-initial-focus /></label>
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} defaultValue={topic.summary} /></label>
             <div className="form-row">
               <label>发起人<input name="proposer" required maxLength={30} defaultValue={topic.proposer} /></label>
@@ -551,6 +727,7 @@ export default function App() {
   const [liveMessage, setLiveMessage] = useState('');
   const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
   const [participantsTopic, setParticipantsTopic] = useState<Topic | null>(null);
+  const [posterTopic, setPosterTopic] = useState<Topic | null>(null);
   const [toast, setToast] = useState('');
 
   const loadTopics = useCallback(async (requestedSort: TopicSort) => {
@@ -767,6 +944,7 @@ export default function App() {
               total={visibleTopics.length}
               onAction={openAction}
               onParticipants={setParticipantsTopic}
+              onPoster={setPosterTopic}
               draggable={canManualReorder}
               reordering={reordering}
               onDragStart={(id) => { if (!reorderInFlight.current) setDraggedId(id); }}
@@ -816,6 +994,7 @@ export default function App() {
 
     {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} />}
     {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} />}
+    {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}
   </>;
 }

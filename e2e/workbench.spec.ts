@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
 
 test.describe('议题管理工作台', () => {
   test('在月历和周历中展示排期，并可从事件进入编辑', async ({ page }) => {
@@ -111,8 +112,10 @@ test.describe('议题管理工作台', () => {
     await expect(cardMeetingLink).toHaveAttribute('href', meetingUrl);
     await expect(cardMeetingLink).toHaveAttribute('target', '_blank');
     await expect(cardMeetingLink).toHaveAttribute('rel', 'noreferrer');
-    await card.getByRole('button', { name: /报名参加/ }).click();
+    const participantButton = card.getByRole('button', { name: /报名参加/ });
+    await participantButton.click();
     const participantDialog = page.getByRole('dialog');
+    await expect(participantDialog.getByLabel('你的名字')).toBeFocused();
     await participantDialog.getByLabel('你的名字').fill('Alice');
     await participantDialog.getByRole('button', { name: '确认报名' }).click();
     await expect(participantDialog.getByText('Alice')).toBeVisible();
@@ -125,6 +128,7 @@ test.describe('议题管理工作台', () => {
     await participantDialog.getByRole('button', { name: '取消 Alice 的报名' }).click();
     await expect(participantDialog.getByText('1 人')).toBeVisible();
     await participantDialog.getByRole('button', { name: '关闭' }).click();
+    await expect(participantButton).toBeFocused();
     await expect(card).toContainText('1 人报名');
 
     await page.getByRole('button', { name: '周历' }).click();
@@ -145,14 +149,108 @@ test.describe('议题管理工作台', () => {
     await expect(card).toHaveCount(0);
   });
 
+  test('未来排期一键生成脱敏的 1080×1440 PNG 海报并恢复焦点', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const secretUrl = `https://secret.example.test/join/${marker}?passcode=omega`;
+    const title = `海报验收 ${marker} https://secret.example.test/title`;
+    const future = new Date(Date.now() + 3 * 86_400_000);
+    future.setHours(19, 30, 0, 0);
+    const past = new Date(Date.now() - 86_400_000);
+    const created = await request.post('/api/topics', { data: {
+      title,
+      summary: '验证长按预览与隐私脱敏，会议号：998877 密码 alpha。',
+      proposer: '海报发起人',
+      presenter: '海报分享人 passcode: beta',
+      tags: ['海报', '密码: gamma'],
+    } });
+    expect(created.ok()).toBe(true);
+    const topic = await created.json() as { id: number };
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { data: {
+      scheduledAt: future.toISOString(), duration: 45, room: '三楼围炉会议室', meetingUrl: secretUrl,
+    } });
+    expect(scheduled.ok()).toBe(true);
+    const pastCreated = await request.post('/api/topics', { data: {
+      title: `过期海报验收 ${marker}`, summary: '过期排期不能继续宣传。', proposer: '海报测试', presenter: '海报测试', tags: [],
+    } });
+    expect(pastCreated.ok()).toBe(true);
+    const pastTopic = await pastCreated.json() as { id: number };
+    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { data: {
+      scheduledAt: past.toISOString(), duration: 30, room: '旧会议室', meetingUrl: '',
+    } });
+    expect(pastScheduled.ok()).toBe(true);
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    const pastCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: `过期海报验收 ${marker}`, exact: true }) });
+    await expect(pastCard).toContainText('待归档');
+    await expect(pastCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+
+    const requests: string[] = [];
+    page.on('request', (outgoing) => requests.push(outgoing.url()));
+    const posterButton = card.getByRole('button', { name: '生成海报' });
+    await posterButton.click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('heading', { name: '宣讲海报已为你备好' })).toBeVisible();
+    await expect(dialog.getByRole('button', { name: '关闭' })).toBeFocused();
+    const preview = dialog.getByRole('img', { name: /围炉夜话宣讲海报/ });
+    await expect(preview).toBeVisible();
+    const dimensions = await preview.evaluate((image: HTMLImageElement) => ({ width: image.naturalWidth, height: image.naturalHeight, source: image.src }));
+    expect(dimensions).toEqual(expect.objectContaining({ width: 1080, height: 1440 }));
+    expect(dimensions.source.startsWith('blob:')).toBe(true);
+    const dialogText = await dialog.textContent();
+    for (const secret of ['secret.example.test', '998877', 'alpha', 'beta', 'gamma', 'omega']) expect(dialogText).not.toContain(secret);
+    expect(requests.filter((url) => !url.startsWith('blob:'))).toEqual([]);
+
+    const downloadButton = dialog.getByRole('button', { name: '下载 PNG' });
+    expect((await downloadButton.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    const downloadPromise = page.waitForEvent('download');
+    await downloadButton.click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toMatch(/^围炉夜话-\d{8}-.*\.png$/);
+    const bytes = await readFile((await download.path())!);
+    expect(bytes.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+    expect(bytes.readUInt32BE(16)).toBe(1080);
+    expect(bytes.readUInt32BE(20)).toBe(1440);
+
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(posterButton).toBeFocused();
+
+    await page.evaluate(() => {
+      const state = window as typeof window & { __posterToBlob?: HTMLCanvasElement['toBlob'] };
+      state.__posterToBlob = HTMLCanvasElement.prototype.toBlob;
+      HTMLCanvasElement.prototype.toBlob = function (callback) { callback(null); };
+    });
+    await posterButton.click();
+    await expect(page.getByText('PNG 生成失败，请重试')).toBeVisible();
+    await page.evaluate(() => {
+      const state = window as typeof window & { __posterToBlob?: HTMLCanvasElement['toBlob'] };
+      if (state.__posterToBlob) HTMLCanvasElement.prototype.toBlob = state.__posterToBlob;
+    });
+    await page.getByRole('button', { name: '重新生成' }).click();
+    await expect(page.getByRole('img', { name: /围炉夜话宣讲海报/ })).toBeVisible();
+    await page.getByRole('button', { name: '关闭' }).click();
+
+    await request.delete(`/api/topics/${topic.id}`);
+    await request.delete(`/api/topics/${pastTopic.id}`);
+  });
+
   test('统计与五步说明进入真实功能', async ({ page }) => {
     await page.goto('/');
     await page.locator('.stats').getByRole('button', { name: /等待认领/ }).click();
     await expect(page.getByRole('button', { name: '等待认领', exact: true })).toHaveClass(/active/);
     const flow = page.locator('.flow-grid');
-    await flow.getByRole('button', { name: '创建议题' }).click();
+    const createFlowButton = flow.getByRole('button', { name: '创建议题' });
+    await createFlowButton.click();
     await expect(page.getByRole('heading', { name: '发起一个新议题' })).toBeVisible();
-    await page.getByRole('button', { name: '关闭' }).click();
+    await expect(page.getByLabel('议题标题')).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.getByRole('button', { name: '关闭' })).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.getByRole('button', { name: '发布议题' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(createFlowButton).toBeFocused();
     await flow.getByRole('button', { name: '认领议题' }).click();
     await expect(page.getByRole('button', { name: '等待认领', exact: true })).toHaveClass(/active/);
     await flow.getByRole('button', { name: '议题排期' }).click();
