@@ -122,6 +122,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 已有主库但没有 current 时，bootstrap 必须先停止 socket/service、防止新写入，再用目标 release 的崩溃安全 backup runner 创建并持久化一致备份，在副本上迁移和校验 `businessDataSha256`，最后才安装迁移后的独立副本。失败或中断必须从记录的原始备份恢复主库，保留该 root-only 备份，不得把空库或半迁移库当成成功状态。
 - bootstrap 在首次数据库替换和 `current` 切换前写入可 fsync 的 root-only 事务日志，记录目标 commit、原主库是 absent 还是对应的严格备份文件，以及阶段。开机/手动 recovery 对 bootstrap 的确定性结果是：停止服务、移除首次 current/previous、恢复原主库或删除本次新建主库及边车，然后清日志；恢复任一步失败返回 4 并保留证据。
 - 首次 current 切换后必须启动 socket/service并通过与 promote 相同的双 unit、稳定 PID、UID、cwd 和连续 HTTP 健康门禁；成功后写健康标记、持久化并清事务，`previous` 保持不存在。健康失败应完整回到“未 bootstrap”状态并返回 3；恢复失败返回 4。
+- bootstrap 或其他发布事务开始切换前必须关闭 root-owned 运行时写许可。候选可以在公网 80 完成只读 live health，但从首次启动到所有可回退步骤持久化完成之间，创建、编辑、删除、排序、认领、排期、报名、归档等业务写必须稳定返回 `503 RELEASE_IN_PROGRESS` 且没有数据库副作用；页面保留草稿并提示稍后重试。认证换取短期会话和公开读取不修改业务数据，可以继续。
+- 写许可必须绑定当前 release commit，不能使用可被旧版本/旧事务重放的固定布尔文件。只有健康 marker、previous 语义、业务指纹和事务“向前提交”状态均已 fsync 后，控制器才原子发布目标 commit 的写许可。一旦许可发布，任何后续清理失败或控制器退出都不得恢复启动前数据库或让已返回 2xx 的业务写丢失；recovery 必须识别 committed 阶段并向前完成 current/marker/清理。
+- 普通无事务启动也必须让服务进程的 release commit 与 root-owned 写许可一致；缺失、错误 commit、错误类型/权限/链接时读取仍可服务但业务写失败关闭。首次部署文档和生产验收必须在成功 bootstrap 后确认许可已发布，重启后仍匹配 current。
 - 含业务数据的预检目录必须遵守既有敏感副本清理门禁。bootstrap 与 promote/rollback/backup 共用同一个 root-only 维护锁，任何失败均不得误报成功。
 
 ## 5. 一致备份与恢复
@@ -182,6 +185,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 27. current、previous、journal、悬空指针或非链接路径任一已存在时 bootstrap 都拒绝；第二次 bootstrap 不改变健康 current、DB、备份数量和服务。无主库失败不得遗留新 DB/WAL/SHM。
 28. 同一 boot 先让 recovery 达到 active-exited，再在 promote 的 prepared/switched/healthy/previous 各阶段模拟控制器 SIGKILL；随后分别触发 `Restart=on-failure`、显式 service restart、timer 和人工 backup。每次启动门禁必须在业务 Node/backup runner 前恢复 orphan transaction，最终 current/previous/cwd 回到 from/originalPrevious，target runner 从未被 backup 调用。
 29. 正常 promote 持排他锁执行受控 restart 不与每次启动门禁死锁，只有 journal 中目标可被启动并完成健康门禁；伪造/陈旧授权、错误 phase/current、锁由非对应操作占用或控制器在放行边界退出都不能让未验收 target 成为持久运行版本。
+30. 在 bootstrap 的 target 已启动后分别阻塞 live health、healthy journal、marker/state sync、写许可和 clear journal；用真实会话提交创建/编辑/删除/排序/认领/排期/报名/归档。提交点前全部返回 503、revision/order/名单不变且页面草稿可重试；写许可发布后的任意 2xx 在控制器死亡和 recovery 后仍存在，禁止用启动前备份覆盖。
+31. 写许可缺失、commit 不匹配、普通/符号/多链接或权限异常时全部业务写失败关闭，公开 GET、health 和 access verify 可用；正常 bootstrap/promote/rollback 完成后许可精确匹配 current，服务重启继续允许写。
 
 ### 7.2 生产
 
@@ -240,3 +245,5 @@ Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固�
 首次部署旅程复审确认 README 的命令顺序在干净主机上确定失败：文档先执行 `promote`，控制器却要求解析并验证已有健康 `current`，systemd 单元又在其后才安装；首次目录也漏建 recovery 所需的 `/var/lib/fireside-release`。新增显式 bootstrap 状态机和从零验收，普通 promote 不再承担含糊的首次安装语义；该 P1 再次把成熟度连续计数归零。
 
 同一 boot 恢复复审确认 `RemainAfterExit=yes` 会让 recovery 首次成功后一直保持 active，后续 `Requires+After` 不再执行其 `ExecStart`。控制器若在 switched 等 journal 阶段被 SIGKILL，服务自动重启、显式 restart 或备份 timer 会直接采用未验收 target。新增每次 service/backup 启动的 transaction gate；同时保留正常 promote 持锁同步 restart 的无死锁路径。该 P1 使连续计数继续为 0。
+
+bootstrap 数据复审发现 live health 窗口已经由 socket 向公网开放业务写，而后续 healthy/marker/sync/clear 任一步失败仍会用启动前备份覆盖主库，形成“用户收到 2xx 后数据消失”。采用按 release commit 绑定的 root-owned 写许可：可回退阶段业务写统一 503；许可发布是不可逆提交点，之后 recovery 只能向前完成，不能恢复旧数据库。该数据丢失 P1 再次把成熟度计数归零。
