@@ -98,6 +98,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
+- `RemainAfterExit` 的开机 recovery 只能作为本次开机的第一道门，不能代替每次启动门禁。`fireside.service` 每次自动/显式启动和 `fireside-backup.service` 每次 timer/人工启动都必须先执行 root-owned transaction gate：无 journal 才直接通过；有 journal 且发布锁空闲表示控制器已成为 orphan，必须在 Node 或 backup runner 执行前恢复；有 journal且锁被当前受控 promote 持有时，只允许与已校验 journal 阶段、current 指针和目标完全一致的那次受控服务重启，不能让普通并发启动猜测放行。
+- 每次启动门禁不能与持排他锁同步等待 `systemctl restart` 的正常 promote 自锁死，也不能把调用者环境、可写 marker 或“lock 正忙”本身当作授权。受控 restart 与 orphan 的区分必须绑定 root-owned事务、当前指针和活跃控制器所有权；控制器在放行点前后异常退出时，下一次 service/backup 入口仍须先恢复，且 backup 绝不能从未验收 target 执行或 prune。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
 - 含生产备份副本且已授权给 `fireside-build` 的 preflight stage 必须确认递归删除成功且路径消失后，才能取消 EXIT trap、写 transaction 或切换 `current`。显式清理失败必须以 2 停在切换前并记录稳定错误；trap 的兜底清理失败也必须可见，不能静默把敏感副本当作已删除。
 - healthy marker 的 manifest digest 必须先独立计算、检查命令状态并验证为 64 位 SHA-256（仅显式 legacy current 可用固定标记），再写 marker；禁止让 command substitution 失败被外层 `printf` 成功掩盖。marker 生成/持久化失败属于提升失败，必须回到调用前版本。
@@ -110,6 +112,17 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 发布前先对一致备份副本运行新版本启动/迁移和完整性检查。
 - 不可逆 schema 变化必须使用 expand/migrate/contract 分阶段策略，保证当前和上一 release 都能读取回滚期数据库。
 - 健康检查失败不得删除上一 release、旧数据库副本或最新备份。
+
+### FR-OPS-011 新主机首次自举
+
+- 文档中的“首次准备”必须能在没有 `current`、`previous` 和运行中 Fireside 服务的新主机上从零完成，不能把已有健康 `current` 当作隐含前置条件。控制器提供显式 `bootstrap <commit>`；普通 `promote` 继续只处理已有健康版本升级，两种语义不得自动猜测。
+- bootstrap 只在 `current`、`previous`、发布事务三者均不存在时运行；任一已存在（包括错误类型、悬空链接或半完成状态）都拒绝。目标 release 仍须通过完整 commit、manifest、运行树和预检门禁。第二次 bootstrap 必须拒绝且不改变 current、数据库、备份或服务。
+- systemd 单元、`fireside`/`fireside-build` 身份、root-only 密钥、`/var/lib/fireside-release`、生产状态和备份目录是 bootstrap 的显式前置条件。README 必须先安装/加载单元并让 recovery 进入本次开机的 active-exited 状态，再执行 install/bootstrap；不能先 promote、后安装单元。
+- 无主库时，候选在 root-only 临时目录创建 `seed=false` 的空业务库并通过健康、公开读取、关闭和业务指纹检查，再以 `fireside:fireside 0600` 安装为生产库；不得在预检前建立 `current`。失败恢复后不得遗留 current/previous、空主库、WAL/SHM 或健康标记。
+- 已有主库但没有 current 时，bootstrap 必须先停止 socket/service、防止新写入，再用目标 release 的崩溃安全 backup runner 创建并持久化一致备份，在副本上迁移和校验 `businessDataSha256`，最后才安装迁移后的独立副本。失败或中断必须从记录的原始备份恢复主库，保留该 root-only 备份，不得把空库或半迁移库当成成功状态。
+- bootstrap 在首次数据库替换和 `current` 切换前写入可 fsync 的 root-only 事务日志，记录目标 commit、原主库是 absent 还是对应的严格备份文件，以及阶段。开机/手动 recovery 对 bootstrap 的确定性结果是：停止服务、移除首次 current/previous、恢复原主库或删除本次新建主库及边车，然后清日志；恢复任一步失败返回 4 并保留证据。
+- 首次 current 切换后必须启动 socket/service并通过与 promote 相同的双 unit、稳定 PID、UID、cwd 和连续 HTTP 健康门禁；成功后写健康标记、持久化并清事务，`previous` 保持不存在。健康失败应完整回到“未 bootstrap”状态并返回 3；恢复失败返回 4。
+- 含业务数据的预检目录必须遵守既有敏感副本清理门禁。bootstrap 与 promote/rollback/backup 共用同一个 root-only 维护锁，任何失败均不得误报成功。
 
 ## 5. 一致备份与恢复
 
@@ -164,6 +177,11 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 22. 在 umask 022 且锁不存在时执行 install/promote/recover 的锁准备逻辑，结果必须为 root:root 0600 普通单链接文件；预置 0644 时安全修权，预置 symlink/目录/非 root/多链接时拒绝。`nobody` 无法打开或持锁，backup 与 controller 的共享/排他互斥仍成立。
 23. 在开发仓库 local config 设置 `url.*.insteadOf` 指向攻击者 bare main，并用 `core.attributesFile`/`.git/info/attributes` 对 tracked 文件设置 `export-ignore`；生产授权、tree 和归档仍只能来自固定 GitHub fetch 的 root-owned bare 仓库，假 main 与被隐藏文件均不能进入结果。
 24. 候选迁移分别在不递增 revision 时改写 title/summary、把一个非空 meeting URL 替换为另一非空 secret；计数、revision、presence 与 order 均保持不变，`businessDataSha256` 必须变化并在切换前退出 2。只 ADD COLUMN/default/index 的 schema 扩展必须保持该 hash 并通过。
+25. 干净 fixture 按 README 从创建目录、安装/加载 unit、install 到 `bootstrap` 后在 80 端口健康；初始没有 current/previous/DB，成功后 current 指向目标、previous 仍不存在、主库私有且 status 为 clean。
+26. 无 current 但已有业务库时，bootstrap 必须先生成一致备份；预检、数据库安装、指针、restart、health、marker 和清 journal 各阶段失败/中断都恢复原业务指纹与“无 current”状态。恢复失败返回 4 并保留 journal；成功恢复返回 3，重复 recovery 幂等。
+27. current、previous、journal、悬空指针或非链接路径任一已存在时 bootstrap 都拒绝；第二次 bootstrap 不改变健康 current、DB、备份数量和服务。无主库失败不得遗留新 DB/WAL/SHM。
+28. 同一 boot 先让 recovery 达到 active-exited，再在 promote 的 prepared/switched/healthy/previous 各阶段模拟控制器 SIGKILL；随后分别触发 `Restart=on-failure`、显式 service restart、timer 和人工 backup。每次启动门禁必须在业务 Node/backup runner 前恢复 orphan transaction，最终 current/previous/cwd 回到 from/originalPrevious，target runner 从未被 backup 调用。
+29. 正常 promote 持排他锁执行受控 restart 不与每次启动门禁死锁，只有 journal 中目标可被启动并完成健康门禁；伪造/陈旧授权、错误 phase/current、锁由非对应操作占用或控制器在放行边界退出都不能让未验收 target 成为持久运行版本。
 
 ### 7.2 生产
 
@@ -218,3 +236,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固定 GitHub URL 改到攻击者 bare remote，`core.attributesFile`/info attributes 还能让 archive 丢文件。授权与产物不能再复用开发仓库配置：固定远端 fetch、commit/tree/archive 必须全部在 root-owned 临时 bare 仓库完成。
 
 数据门禁复审构造出同 revision 内容破坏反例：现有计数、revision 与敏感字段 presence 都无法区分标题/摘要被改写，或一个非空会议链接被换成另一个。新增 hash 必须只覆盖既有业务值而排除 schema，从而同时拒绝静默数据变化并允许 expand-only schema 迁移。
+
+首次部署旅程复审确认 README 的命令顺序在干净主机上确定失败：文档先执行 `promote`，控制器却要求解析并验证已有健康 `current`，systemd 单元又在其后才安装；首次目录也漏建 recovery 所需的 `/var/lib/fireside-release`。新增显式 bootstrap 状态机和从零验收，普通 promote 不再承担含糊的首次安装语义；该 P1 再次把成熟度连续计数归零。
+
+同一 boot 恢复复审确认 `RemainAfterExit=yes` 会让 recovery 首次成功后一直保持 active，后续 `Requires+After` 不再执行其 `ExecStart`。控制器若在 switched 等 journal 阶段被 SIGKILL，服务自动重启、显式 restart 或备份 timer 会直接采用未验收 target。新增每次 service/backup 启动的 transaction gate；同时保留正常 promote 持锁同步 restart 的无死锁路径。该 P1 使连续计数继续为 0。

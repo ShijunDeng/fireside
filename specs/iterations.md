@@ -222,3 +222,5 @@
 - 修复复审阻断 K：固定维护锁若由 root umask022 首次创建成0644，普通用户可只读打开并取得排他 flock，阻断发布/备份。控制器统一把固定锁创建/修权/验证为 root:root 0600 普通单链接文件；nobody 无法打开，backup 仍复用同一 inode。
 - 修复复审阻断 L：开发仓库 local `url.*.insteadOf` 可把权威 GitHub 查询劫持到假 remote，`core.attributesFile`/info attributes 可改变 archive。生产改为在 root-owned 空 bare repo 中从固定 HTTPS main fetch，并只从该 repo 授权/tree/archive；开发 repo 不再是信任根。
 - 修复复审阻断 M：迁移门禁只有计数、revision 和字段 presence，无法发现同 revision 标题/摘要损坏或非空会议链接替换。新增排除 schema、固定序列化既有业务列的 `businessDataSha256`；内容改写拒绝，单纯 ADD COLUMN/default/index 通过。
+- 端到端部署阻断 N：README 把新机流程写成 install→promote→安装 unit，但 promote 必须先有健康 current，干净主机确定性退出 2，且 recovery 的 `/var/lib/fireside-release` 未创建。新增显式 `bootstrap`：只接受无 current/previous/journal 的首次状态；空库失败恢复为无库，已有业务库先一致备份且任何失败/中断恢复原指纹；成功才留下首个 current、健康服务和空 previous。README 从零到 80 健康、重复拒绝与 boot recovery 都要自动化和真实生产验证。
+- 同一 boot 恢复阻断 O：`RemainAfterExit=yes` 使 recovery 第一次完成后不再被 service/backup 的 Requires 重跑；控制器在 switched 等阶段被 SIGKILL 后，自动/人工 restart 会直接启动未验收 target，timer 还会从 target 执行 root backup runner。service 与 backup 每次启动前必须有不依赖 active-exited 状态的 root transaction gate；orphan journal 在 Node/backup 前恢复，正常 promote 持锁同步 restart 不能死锁，未验收 target runner 不能参与备份。
