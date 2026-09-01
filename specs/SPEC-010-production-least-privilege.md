@@ -81,6 +81,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 生产发布唯一入口是预装到 `/usr/local/sbin` 与 `/usr/local/libexec` 的 `root:root`、开发用户不可写控制器；禁止通过 `sudo` 直接执行可写 Git 工作树中的脚本。生产路径固定，不接受调用者用环境变量覆盖 release、状态、备份、仓库或服务名。
 - 预装控制器及其任一子脚本必须在解析测试模式、降权用户、路径或 hook 之前识别生产控制器身份；只要调用环境包含 `FIRESIDE_RELEASE_*` 或其他已定义的测试路径/用户覆盖变量，就必须以退出码 2 拒绝，不能仅忽略。该边界也必须由随生产标记复制到隔离目录的控制器夹具验证，不能只测试工作树入口。
 - 控制器不得让 root Git 继承调用者的 `HOME`、XDG、全局/系统配置、`core.fsmonitor`、hooks 或其他可执行配置。所有 Git 读取都必须使用固定 PATH、空的 global/system config，并在命令行禁用 repository-local fsmonitor 与 hooks；隔离生产夹具须注入恶意 HOME/XDG 与仓库本地 fsmonitor 哨兵，证明 status/archive/授权检查前后均不会执行。
+- 本地 Git replace/graft 语义不能改写已由 GitHub 授权的对象身份；所有 rev-parse/tree/archive/dirty 命令必须禁用 replacement refs。开发用户创建 `refs/replace/<authorized-commit>` 后，候选归档仍必须来自原始 commit/tree，不能采用替换对象。
 - root 工具的临时目录、代理和 systemd/DBus 目标同样不能由调用者决定：控制器固定 root-only `TMPDIR`，清除大小写代理、`NO_PROXY`、DBus/SYSTEMD 变量；健康 curl 还必须显式 `--noproxy '*'`。manifest 校验不得在调用者目录创建随后按路径重新打开的 root 临时文件，systemctl/systemd-run 只能连接本机系统 manager。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
 - 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 HTTPS GitHub 仓库在隔离 Git 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
@@ -152,6 +153,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 16. 临时 bare remote 流程证明“按 443 URL push → 显式 fetch tracking ref → 精确校验”可复现；生产 install 另以固定 HTTPS `refs/heads/main` 为权威，开发用户篡改本地 `refs/remotes/origin/main` 不能授权未推送 commit。
 17. 注入 manifest digest 读取/hash 失败；不得生成空 digest healthy marker，不得把目标记为 previous/healthy，提升必须按事务语义自动恢复。
 18. 在合法 manifest 后增加排序位于尾部且含换行/Tab 的路径，或让尾部 stat/hash 失败；即使生成器已输出的前缀与磁盘 manifest 完全相等，验证仍必须失败。
+19. 为已授权 commit 创建指向恶意 commit 的本地 `refs/replace`；controller 的 tree、archive 和最终 marker 必须仍对应原对象，替换内容不得进入候选。
 
 ### 7.2 生产
 
@@ -194,3 +196,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 移除不可信 TMPDIR 时使用 process substitution 又暴露了 producer 状态丢失：`cmp` 只看到合法前缀即可成功，无法得知 manifest 复算器在尾部非法路径/stat/hash 上已经失败。实现必须用 `pipefail` 覆盖的完整 pipeline 或 root 私有临时文件同时检查生成和比较状态。
 
 发布文档和授权链也存在闭环缺口：直接向 SSH URL push 不会更新命名 remote 的 tracking ref，而本地 ref 本身又可由开发用户改写。文档必须显式 fetch/验证；生产控制器则从固定 HTTPS GitHub `refs/heads/main` 读取权威 commit，不能把开发者仓库元数据当授权根。
+
+主动复核补充：即使 commit SHA 由 GitHub 精确授权，本地 `refs/replace/<commit>` 仍可让默认 `git archive` 读取另一对象。隔离 Git 命令必须统一设置 no-replace 语义，并以恶意替换树证明归档身份没有被本地元数据改写。

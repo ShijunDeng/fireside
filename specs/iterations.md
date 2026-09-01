@@ -216,3 +216,4 @@
 - 阻断 G 的同类状态掩蔽：healthy marker 直接在 `printf` 参数中计算 manifest digest，内部 hash 失败会被外层成功吞掉并写空 digest。实现必须先独立计算并验证 digest；失败触发自动恢复，不能留下未来不可回滚的“健康”版本。
 - manifest 复算也不能用丢失 producer 状态的 process substitution：若尾部路径含换行/Tab 或 stat/hash 失败，`cmp` 可能只比较已输出的合法前缀并误判相等。必须让生成器和比较器状态共同受 `pipefail` 门禁，并加入非法尾部路径回归。
 - 发布流程补强：按 SSH URL push 不更新 `refs/remotes/origin/main`，README 必须显式 fetch 后再验证；生产 controller 不能信任开发用户可改写的本地 tracking ref，须从固定 HTTPS GitHub 权威 main 核对精确 commit。
+- 本地主动审计阻断 H：GitHub 精确 SHA 授权后，本地 `refs/replace/<commit>` 仍可让默认 rev/tree/archive 采用攻击者替换对象。所有 release Git 命令必须禁用 replacement refs，并用恶意替换 commit 证明候选仍来自原始树。
