@@ -253,5 +253,6 @@
 - 敏感preflight孤儿阻断 AP：随机`/run/fireside-promote.*`在chown后被SIGKILL会跨命令遗留，下一次同UID且带网的npm lifecycle可扫描并外传生产DB。改为root-only固定父目录+仅当次无网unit绑定暴露；有网build明确隐藏父目录，每次主锁入口先停旧transient再清孤儿。
 - leader先死进程组阻断 AQ：AI首修仍以`transaction_owner_is_active || return 0`开头；worker leader在watchdog进入前被SIGKILL时会跳过同session后代枚举，迟到子进程仍可复活指针/journal。恢复必须在leader缺失时仍按记录PGID/session清空后代。
 - 私有仓库认证阻断 AR：真实生产 install 使用固定 HTTPS 权威远端，私有 GitHub 在无凭证隔离环境中必然失败，已通过 SSH 443 推送与回读的 commit 仍无法部署。控制器改为固定 GitHub SSH 443，且只使用 root-owned 0600 单链接的专用只读 deploy key/known_hosts；先清空默认 identities，并禁用 SSH config、agent、证书、代理、密码、交互和调用环境覆盖，host key 或凭证元数据异常均在候选创建前失败关闭。
+- 非 root 候选自测阻断 AS：controller 故障注入夹具要求 root owner/chown/进程组能力，而生产候选 `npm run check` 正确由隔离 `fireside-build` 执行，导致本机 root 通过、真实 install 32 项失败。提交前可信工作区必须跑完全部 controller 套件；候选构建中该 root-only suite 以明确原因整套 skip，其余单元/API/typecheck/build仍为硬门禁。禁止放宽生产 root-only断言或让 root执行候选测试代码。
 
-本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR 九个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。
+本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR/AS 十个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。

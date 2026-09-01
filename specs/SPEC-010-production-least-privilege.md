@@ -89,6 +89,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 GitHub SSH 443 仓库在隔离 Git/SSH 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
+- 候选的 `npm run check` 必须能由隔离的非 root `fireside-build` 身份完成。需要真实 root owner/chown/进程组能力的 controller 故障注入套件只能在提交与推送前由可信工作区显式运行，候选构建中须以清晰原因整套 skip；不得为了让候选通过而把生产 root-only 元数据断言改为当前用户，也不得让 root 执行候选仓库的测试代码。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
 - 迁移前后还必须比较不含 schema 的 `businessDataSha256`：按主键稳定序列化既有 topics 全业务列、participant 姓名/规范名/时间和 order 行。它必须检测同 revision 的标题/摘要改写及非空到非空会议链接替换，同时允许只新增 schema/索引/带默认值的新列；候选自身 before/after 和 origin 对迁移前后副本均须一致。
 - 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
@@ -246,6 +247,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 58. 在敏感preflight stage已chown后 SIGKILL controller，等待或保留旧transient，再用与生产`npm ci`完全相同的UID/网络/sandbox哨兵扫描独特业务值；必须EACCES且无出网。下一个main-lock入口必须先同步停止旧unit、再清理只位于root-only固定父目录的孤儿stage；清理期间不存在活跃写者，异常类型/名称/所有者保留证据并失败关闭。
 59. 构造 switched v2 journal和独立session worker，让leader活着时派生忽略TERM、准备迟到写journal/current的同组子进程，然后在watchdog取锁前直接SIGKILL leader。恢复在原PGID/session为空前不得触指针；释放旧阻塞点后哨兵/journal/current均不复活，最终origin运行态一致。
 60. 在私有 GitHub 仓库上以清空 HOME、Git config、SSH agent 的生产等价环境执行权威 fetch；专用 SSH 443 deploy key 与 known_hosts 元数据正确时精确取得 main，任一文件或父目录缺失、链接、非 root、key/known_hosts 非 0600、多链接或父目录可被组/其他用户写时在联网前拒绝。注入 `GIT_SSH_COMMAND`、`SSH_AUTH_SOCK`、恶意 `~/.ssh/config`、默认 `id_*`、证书、密码提示、ProxyCommand/Jump 与替代 identity 均不能改变实际命令；host key 不匹配必须失败，HTTPS 无匿名凭证不能成为部署阻断。
+61. 同一 commit 先以可信 root 工作区执行完整 controller 47 项故障注入并通过，再以 `fireside-build` 和生产构建 sandbox 执行 `npm run check`；应用/API/备份/日历等非特权测试必须通过，controller 套件明确报告因 root fixture ownership 被 skip，候选仍完成 typecheck 与双端 build。生产 install 不得因测试夹具尝试 chown root 失败，也不得改为 root 执行候选 lifecycle/test。
 
 ### 7.2 生产
 
@@ -338,3 +340,5 @@ backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护�
 runtime可读性复审确认只检查release子树会漏掉`/opt/fireside/releases`等父目录0700漂移，root gate成功但应用启动EACCES循环。固定绝对父链须逐级校验root所有、不可写和other+x；该高价值P2使成熟度计数保持0。
 
 首次真实 install 新增阻断 AR：固定 HTTPS 权威远端无法匿名读取私有仓库，导致已通过 SSH 推送并精确回读的 commit 仍无法成为候选。权威来源改为固定 GitHub SSH 443，并把身份与 host 信任收敛到专用 root-owned 只读 deploy key/known_hosts；必须清空默认 identities 并关闭配置、agent、证书、代理、密码及交互回退。该生产可部署性 P1 使成熟度计数继续为 0。
+
+AR 修复后的首次隔离构建又新增阻断 AS：controller 故障注入夹具要求创建 root-owned 固定状态，而候选 `npm run check` 正确地由 `fireside-build` 执行，原测试却无条件尝试 chown root，造成 32 项假失败。该套件不得把生产断言降级为当前 UID，也不能让 root 执行候选代码；改为提交前可信 root 全量执行、候选非 root 构建中显式整套 skip，其余测试/typecheck/build继续作为硬门禁。该生产构建可执行性 P1 使成熟度计数继续为 0。
