@@ -255,5 +255,6 @@
 - 私有仓库认证阻断 AR：真实生产 install 使用固定 HTTPS 权威远端，私有 GitHub 在无凭证隔离环境中必然失败，已通过 SSH 443 推送与回读的 commit 仍无法部署。控制器改为固定 GitHub SSH 443，且只使用 root-owned 0600 单链接的专用只读 deploy key/known_hosts；先清空默认 identities，并禁用 SSH config、agent、证书、代理、密码、交互和调用环境覆盖，host key 或凭证元数据异常均在候选创建前失败关闭。
 - 非 root 候选自测阻断 AS：controller 故障注入夹具要求 root owner/chown/进程组能力，而生产候选 `npm run check` 正确由隔离 `fireside-build` 执行，导致本机 root 通过、真实 install 32 项失败。提交前可信工作区必须跑完全部 controller 套件；候选构建中该 root-only suite 以明确原因整套 skip，其余单元/API/typecheck/build仍为硬门禁。禁止放宽生产 root-only断言或让 root执行候选测试代码。
 - 嵌套 npm bin 阻断 AT：真实 prune 后 Fastify 与 node-abi 的嵌套依赖各自包含 `.bin/semver`，原逻辑只删顶层 `.bin` 后把合法命令链接误报为越界。固化改为递归删除所有真实 `.bin` 目录，再对其余树保持零 symlink 门禁；测试同时覆盖嵌套清理和 `.bin` 外链接拒绝。
+- legacy npm bin 阻断 AU：候选安装成功后的首次 promote 被历史 current 的顶层/嵌套 `.bin` 命令链接拒绝。只有完全缺少 commit/metadata/manifest 且链接全集位于真实 `node_modules/**/.bin/` 的显式 legacy，才允许在主锁内先全量预检、再删除 `.bin`并fsync；其他链接或 manifested release 均零修改拒绝。
 
-本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR/AS/AT 十一个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。
+本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ/AR/AS/AT/AU 十二个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。

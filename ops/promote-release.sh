@@ -663,6 +663,7 @@ recover_committed_transaction() {
 release_is_explicit_legacy_runtime() {
   local release_path=$1
   [[ ! -e ${release_path}/RELEASE_COMMIT && ! -L ${release_path}/RELEASE_COMMIT \
+    && ! -e ${release_path}/RELEASE_METADATA && ! -L ${release_path}/RELEASE_METADATA \
     && ! -e ${release_path}/RELEASE_MANIFEST.sha256 && ! -L ${release_path}/RELEASE_MANIFEST.sha256 ]]
 }
 
@@ -1219,6 +1220,9 @@ if [[ ${origin} == "${target}" ]]; then
   check_live_release "${target}" || exit 2
   echo "Fireside release ${commit} is already current and healthy"
   exit 0
+fi
+if release_is_explicit_legacy_runtime "${origin}"; then
+  release_normalize_explicit_legacy_dependencies "${origin}" || exit 2
 fi
 release_validate_runtime_tree "${origin}" || exit 2
 check_live_release "${origin}" || { release_die 'current release is not healthy; refusing to record it as rollback target'; exit 2; }

@@ -91,6 +91,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
 - 候选的 `npm run check` 必须能由隔离的非 root `fireside-build` 身份完成。需要真实 root owner/chown/进程组能力的 controller 故障注入套件只能在提交与推送前由可信工作区显式运行，候选构建中须以清晰原因整套 skip；不得为了让候选通过而把生产 root-only 元数据断言改为当前用户，也不得让 root 执行候选仓库的测试代码。
 - `npm prune` 可能在任意嵌套依赖的 `.bin` 目录生成命令链接。release 不运行这些包命令，固化前必须递归删除所有真实 `.bin` 目录，再拒绝任何剩余符号链接；不能只删除顶层 `.bin` 后把合法嵌套链接误报为越界，也不能以“目标仍在 node_modules”泛化允许任意链接。
+- 从本轮 controller 之前的显式 legacy current 升级时，历史 release 可能只含 npm 的 `.bin` 命令链接而没有 identity/manifest。控制器可在主锁内做一次受限规范化：先证明 `RELEASE_COMMIT`、`RELEASE_METADATA`、manifest 全部缺失，且全部 symlink 都位于真实 `node_modules/**/.bin/` 内；只有完整预检通过才递归删除 `.bin` 并 fsync，再执行正常零链接/owner/mode/runtime 与 live health 门禁。任何其他链接必须零修改拒绝，不能把普通 manifested release 当 legacy 修补。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
 - 迁移前后还必须比较不含 schema 的 `businessDataSha256`：按主键稳定序列化既有 topics 全业务列、participant 姓名/规范名/时间和 order 行。它必须检测同 revision 的标题/摘要改写及非空到非空会议链接替换，同时允许只新增 schema/索引/带默认值的新列；候选自身 before/after 和 origin 对迁移前后副本均须一致。
 - 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
@@ -250,6 +251,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 60. 在私有 GitHub 仓库上以清空 HOME、Git config、SSH agent 的生产等价环境执行权威 fetch；专用 SSH 443 deploy key 与 known_hosts 元数据正确时精确取得 main，任一文件或父目录缺失、链接、非 root、key/known_hosts 非 0600、多链接或父目录可被组/其他用户写时在联网前拒绝。注入 `GIT_SSH_COMMAND`、`SSH_AUTH_SOCK`、恶意 `~/.ssh/config`、默认 `id_*`、证书、密码提示、ProxyCommand/Jump 与替代 identity 均不能改变实际命令；host key 不匹配必须失败，HTTPS 无匿名凭证不能成为部署阻断。
 61. 同一 commit 先以可信 root 工作区执行完整 controller 47 项故障注入并通过，再以 `fireside-build` 和生产构建 sandbox 执行 `npm run check`；应用/API/备份/日历等非特权测试必须通过，controller 套件明确报告因 root fixture ownership 被 skip，候选仍完成 typecheck 与双端 build。生产 install 不得因测试夹具尝试 chown root 失败，也不得改为 root 执行候选 lifecycle/test。
 62. 构造顶层与至少两层嵌套 `node_modules/<pkg>/node_modules/.bin/<link>`；候选固化后所有 `.bin` 目录均不存在且必需运行时模块仍可加载。另在 `.bin` 外放置内部或越界 symlink，两者都必须拒绝候选，不能创建 immutable release 或改变 current。
+63. 用缺少全部 release identity 文件、仅在顶层/嵌套 `.bin` 含链接的真实 legacy current 执行 promote；规范化后路径不变、全部 `.bin` 消失、旧 MainPID 在受控 restart 前不受影响，随后兼容预检与提升成功。若存在 `.bin` 外链接、`.bin` 本身为链接、任一 identity 文件或异常类型，必须在删除任何 `.bin` 前退出 2，current/previous/journal与全部旧树字节不变。
 
 ### 7.2 生产
 
@@ -346,3 +348,5 @@ runtime可读性复审确认只检查release子树会漏掉`/opt/fireside/releas
 AR 修复后的首次隔离构建又新增阻断 AS：controller 故障注入夹具要求创建 root-owned 固定状态，而候选 `npm run check` 正确地由 `fireside-build` 执行，原测试却无条件尝试 chown root，造成 32 项假失败。该套件不得把生产断言降级为当前 UID，也不能让 root 执行候选代码；改为提交前可信 root 全量执行、候选非 root 构建中显式整套 skip，其余测试/typecheck/build继续作为硬门禁。该生产构建可执行性 P1 使成熟度计数继续为 0。
 
 AS 修复后的真实 `npm prune` 新增阻断 AT：Fastify 与 node-abi 的嵌套依赖各自带有合法 `.bin/semver`，原固化逻辑只删除顶层 `.bin`，随后把嵌套命令链接误判为不支持的依赖链接。固化必须递归删除全部真实 `.bin` 目录后继续零链接门禁；该生产安装可执行性 P1 使成熟度计数继续为 0。
+
+候选安装完成后的首次 promote 新增阻断 AU：线上 legacy current 本身仍保留 npm 顶层与嵌套 `.bin` 命令链接，严格 runtime tree 门禁因此在事务前拒绝。控制器需对“无任何 identity 文件且链接全集只在真实 `.bin` 内”的显式 legacy 提供一次受限、先完整验证后删除并 fsync 的规范化；其他链接或 manifested tree 一律不修改。该可升级性 P1 使成熟度计数继续为 0。

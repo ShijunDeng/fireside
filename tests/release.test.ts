@@ -218,6 +218,45 @@ describe('版本化发布门禁', {
     assert.equal(accepted.status, 0, accepted.stderr);
   });
 
+  it('仅规范化链接全集位于 npm .bin 的显式 legacy release', async () => {
+    const root = await temporaryDirectory('fireside-release-legacy-links-');
+    const legacy = path.join(root, 'legacy');
+    const dependencies = path.join(legacy, 'node_modules');
+    const topBin = path.join(dependencies, '.bin');
+    const nestedBin = path.join(dependencies, 'one/node_modules/.bin');
+    await mkdir(topBin, { recursive: true });
+    await mkdir(nestedBin, { recursive: true });
+    await symlink('../command.js', path.join(topBin, 'command'));
+    await symlink('../command.js', path.join(nestedBin, 'command'));
+
+    const normalize = () => run('bash', [
+      '-c',
+      'source "$1"; release_normalize_explicit_legacy_dependencies "$2"',
+      'legacy-links',
+      releaseLib,
+      legacy,
+    ], { env: { ...process.env, FIRESIDE_RELEASE_TEST_MODE: '1' } });
+    const normalized = normalize();
+    assert.equal(normalized.status, 0, normalized.stderr);
+    await assert.rejects(stat(topBin));
+    await assert.rejects(stat(nestedBin));
+
+    await mkdir(topBin, { recursive: true });
+    await symlink('../command.js', path.join(topBin, 'command'));
+    const outside = path.join(dependencies, 'runtime-link');
+    await symlink('runtime.js', outside);
+    const rejected = normalize();
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /outside npm command directories/);
+    assert.equal(await readlink(path.join(topBin, 'command')), '../command.js');
+    assert.equal(await readlink(outside), 'runtime.js');
+
+    await writeFile(path.join(legacy, 'RELEASE_METADATA'), 'schema=1\n');
+    const manifested = normalize();
+    assert.notEqual(manifested.status, 0);
+    assert.match(manifested.stderr, /cannot be normalized as legacy/);
+  });
+
   it('从完整 commit 归档构建候选，不复制 ignored 陈旧产物且不切 current', async () => {
     const root = await temporaryDirectory('fireside-release-install-');
     const source = path.join(root, 'source');

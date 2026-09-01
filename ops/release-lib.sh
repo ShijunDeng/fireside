@@ -85,6 +85,29 @@ release_sanitize_runtime_dependencies() {
   fi
 }
 
+release_normalize_explicit_legacy_dependencies() {
+  local release_path=$1
+  local dependencies_root=${release_path}/node_modules
+  local identity
+  for identity in RELEASE_COMMIT RELEASE_METADATA RELEASE_MANIFEST.sha256; do
+    [[ ! -e ${release_path}/${identity} && ! -L ${release_path}/${identity} ]] \
+      || { release_die 'manifested release cannot be normalized as legacy'; return 1; }
+  done
+  [[ -d ${dependencies_root} && ! -L ${dependencies_root} ]] \
+    || { release_die 'legacy dependencies root is invalid'; return 1; }
+  if find "${release_path}" -type l \
+    ! \( -path "${dependencies_root}/.bin/*" -o -path "${dependencies_root}/*/.bin/*" \) \
+    -print -quit | grep -q .; then
+    release_die 'legacy release contains a link outside npm command directories'
+    return 1
+  fi
+  release_sanitize_runtime_dependencies "${dependencies_root}" || return 1
+  if [[ ${FIRESIDE_RELEASE_TEST_MODE:-0} != 1 ]]; then
+    /bin/sync -f "${dependencies_root}" || return 1
+    /bin/sync -f "${release_path}" || return 1
+  fi
+}
+
 release_systemctl() {
   /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/systemctl "$@"
 }
