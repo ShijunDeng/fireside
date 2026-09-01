@@ -33,5 +33,6 @@
 | [SPEC-005](./SPEC-005-topic-revision.md) | Accepted | 议题聚合版本、If-Match 并发保护与陈旧操作恢复 |
 | [SPEC-006](./SPEC-006-poster-privacy-layout.md) | Accepted | 宣讲海报 Unicode 凭证脱敏、极限布局与最新快照生成 |
 | [SPEC-007](./SPEC-007-activity-phase.md) | Accepted | 活动 UPCOMING / LIVE / ENDED 派生阶段与权威动作准入 |
+| [SPEC-008](./SPEC-008-dialog-stack.md) | Ready | 叠层弹窗唯一所有权、草稿保护、焦点与共享滚动锁 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。
