@@ -219,3 +219,4 @@
 - 本地主动审计阻断 H：GitHub 精确 SHA 授权后，本地 `refs/replace/<commit>` 仍可让默认 rev/tree/archive 采用攻击者替换对象。所有 release Git 命令必须禁用 replacement refs，并用恶意替换 commit 证明候选仍来自原始树。
 - 修复复审阻断 I：三次数据库 preflight 成功后，删除已 chown 给 build 用户的敏感副本 stage 若失败，旧脚本仍取消 trap 并切换版本。只有显式清理成功且路径消失才可写 transaction；清理故障必须返回 2、保持双指针/journal 不变并保留可见错误。
 - 修复复审阻断 J：当前生产 origin 的旧 backup CLI 没有 fsync/互斥/孤儿恢复，首次 promote 若用 origin 备份就无法自举安全链。正常提升改用已校验 target runner，rollback 使用调用前 current runner；夹具记录实际 runner，沙箱同时隐藏 `/etc/fireside.env`。
+- 修复复审阻断 K：固定维护锁若由 root umask022 首次创建成0644，普通用户可只读打开并取得排他 flock，阻断发布/备份。控制器统一把固定锁创建/修权/验证为 root:root 0600 普通单链接文件；nobody 无法打开，backup 仍复用同一 inode。
