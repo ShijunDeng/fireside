@@ -221,3 +221,4 @@
 - 修复复审阻断 J：当前生产 origin 的旧 backup CLI 没有 fsync/互斥/孤儿恢复，首次 promote 若用 origin 备份就无法自举安全链。正常提升改用已校验 target runner，rollback 使用调用前 current runner；夹具记录实际 runner，沙箱同时隐藏 `/etc/fireside.env`。
 - 修复复审阻断 K：固定维护锁若由 root umask022 首次创建成0644，普通用户可只读打开并取得排他 flock，阻断发布/备份。控制器统一把固定锁创建/修权/验证为 root:root 0600 普通单链接文件；nobody 无法打开，backup 仍复用同一 inode。
 - 修复复审阻断 L：开发仓库 local `url.*.insteadOf` 可把权威 GitHub 查询劫持到假 remote，`core.attributesFile`/info attributes 可改变 archive。生产改为在 root-owned 空 bare repo 中从固定 HTTPS main fetch，并只从该 repo 授权/tree/archive；开发 repo 不再是信任根。
+- 修复复审阻断 M：迁移门禁只有计数、revision 和字段 presence，无法发现同 revision 标题/摘要损坏或非空会议链接替换。新增排除 schema、固定序列化既有业务列的 `businessDataSha256`；内容改写拒绝，单纯 ADD COLUMN/default/index 通过。

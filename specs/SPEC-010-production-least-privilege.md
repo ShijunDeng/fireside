@@ -89,6 +89,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
+- 迁移前后还必须比较不含 schema 的 `businessDataSha256`：按主键稳定序列化既有 topics 全业务列、participant 姓名/规范名/时间和 order 行。它必须检测同 revision 的标题/摘要改写及非空到非空会议链接替换，同时允许只新增 schema/索引/带默认值的新列；候选自身 before/after 和 origin 对迁移前后副本均须一致。
 - 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
 - 共同维护锁 `/run/fireside-release.lock` 必须由 root 以 0600 创建，并在每次控制器操作前验证为 `root:root`、普通文件、单链接、非符号链接；不能依赖调用者 umask。普通用户不得只读打开后用排他 flock 制造本地发布/备份 DoS，backup 与 controller 必须继续锁住同一 inode。
 - 首次从历史版本提升时不能调用缺少本规格 fsync/互斥/孤儿恢复的旧 current backup CLI：正常 promote 使用已通过 manifest 与权威 main 授权的 target backup runner；rollback 使用调用前 current 的已健康 runner。runner 任一失败仍在切换前退出，且备份 transient sandbox 必须显式隐藏 `/etc/fireside.env`。
@@ -162,6 +163,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 21. 用“旧 origin runner 写旧哨兵、target runner 写安全哨兵”的夹具证明首次 promote 只执行 target backup CLI；成功后 rollback 使用调用前 current 的安全 runner。安全 runner 的 file/dir sync 故障仍须保持双指针/journal不变且不 prune，备份进程不可读取密钥文件。
 22. 在 umask 022 且锁不存在时执行 install/promote/recover 的锁准备逻辑，结果必须为 root:root 0600 普通单链接文件；预置 0644 时安全修权，预置 symlink/目录/非 root/多链接时拒绝。`nobody` 无法打开或持锁，backup 与 controller 的共享/排他互斥仍成立。
 23. 在开发仓库 local config 设置 `url.*.insteadOf` 指向攻击者 bare main，并用 `core.attributesFile`/`.git/info/attributes` 对 tracked 文件设置 `export-ignore`；生产授权、tree 和归档仍只能来自固定 GitHub fetch 的 root-owned bare 仓库，假 main 与被隐藏文件均不能进入结果。
+24. 候选迁移分别在不递增 revision 时改写 title/summary、把一个非空 meeting URL 替换为另一非空 secret；计数、revision、presence 与 order 均保持不变，`businessDataSha256` 必须变化并在切换前退出 2。只 ADD COLUMN/default/index 的 schema 扩展必须保持该 hash 并通过。
 
 ### 7.2 生产
 
@@ -214,3 +216,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 维护锁审计确认首次 root 控制器可在 umask 022 下创建 0644 lock；Linux flock 允许普通用户对只读 fd 取得排他锁，因此可永久阻断发布和备份。生产控制器必须统一创建/修权/验证固定锁，recovery 先行后 backup 复用该受保护 inode。
 
 Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固定 GitHub URL 改到攻击者 bare remote，`core.attributesFile`/info attributes 还能让 archive 丢文件。授权与产物不能再复用开发仓库配置：固定远端 fetch、commit/tree/archive 必须全部在 root-owned 临时 bare 仓库完成。
+
+数据门禁复审构造出同 revision 内容破坏反例：现有计数、revision 与敏感字段 presence 都无法区分标题/摘要被改写，或一个非空会议链接被换成另一个。新增 hash 必须只覆盖既有业务值而排除 schema，从而同时拒绝静默数据变化并允许 expand-only schema 迁移。
