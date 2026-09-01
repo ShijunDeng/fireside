@@ -83,10 +83,10 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 预装控制器及其任一子脚本必须在解析测试模式、降权用户、路径或 hook 之前识别生产控制器身份；只要调用环境包含 `FIRESIDE_RELEASE_*` 或其他已定义的测试路径/用户覆盖变量，就必须以退出码 2 拒绝，不能仅忽略。该边界也必须由随生产标记复制到隔离目录的控制器夹具验证，不能只测试工作树入口。
 - 控制器不得让 root Git 继承调用者的 `HOME`、XDG、全局/系统配置、`core.fsmonitor`、hooks 或其他可执行配置。所有 Git 读取都必须使用固定 PATH、空的 global/system config，并在命令行禁用 repository-local fsmonitor 与 hooks；隔离生产夹具须注入恶意 HOME/XDG 与仓库本地 fsmonitor 哨兵，证明 status/archive/授权检查前后均不会执行。
 - 本地 Git replace/graft 语义不能改写已由 GitHub 授权的对象身份；所有 rev-parse/tree/archive/dirty 命令必须禁用 replacement refs。开发用户创建 `refs/replace/<authorized-commit>` 后，候选归档仍必须来自原始 commit/tree，不能采用替换对象。
-- 禁止从开发用户仓库执行权威 `ls-remote` 或生成发布 archive：repository-local `url.*.insteadOf`、`core.attributesFile`、`.git/info/attributes` 等仍可改写远端和归档。生产必须把固定 HTTPS GitHub main fetch 到 root-owned、空配置的临时 bare 仓库，commit 授权、tree 与 archive 全部来自该仓库；开发工作树只参与 HEAD/dirty 的非授权性前置检查。
+- 禁止从开发用户仓库执行权威 `ls-remote` 或生成发布 archive：repository-local `url.*.insteadOf`、`core.attributesFile`、`.git/info/attributes` 等仍可改写远端和归档。生产必须把固定 GitHub SSH 443 main fetch 到 root-owned、空配置的临时 bare 仓库，commit 授权、tree 与 archive 全部来自该仓库；开发工作树只参与 HEAD/dirty 的非授权性前置检查。私有仓库读取只允许固定 root-owned 单链接专用只读 deploy key 与 known_hosts。SSH 必须先清空默认 identity，再仅追加固定 key，并禁用用户 SSH config、agent、证书、代理/跳板、密码、交互认证和连接复用；调用环境不能改写远端、身份、host key 或 SSH 命令。
 - root 工具的临时目录、代理和 systemd/DBus 目标同样不能由调用者决定：控制器固定 root-only `TMPDIR`，清除大小写代理、`NO_PROXY`、DBus/SYSTEMD 变量；健康 curl 还必须显式 `--noproxy '*'`。manifest 校验不得在调用者目录创建随后按路径重新打开的 root 临时文件，systemctl/systemd-run 只能连接本机系统 manager。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
-- 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 HTTPS GitHub 仓库在隔离 Git 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
+- 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 GitHub SSH 443 仓库在隔离 Git/SSH 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
@@ -201,7 +201,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 13. 注入攻击者 `TMPDIR`、`GIT_CONFIG_PARAMETERS`、`GIT_EXEC_PATH`、`GIT_TRACE*`、大小写代理与 `DBUS_SYSTEM_BUS_ADDRESS`/SYSTEMD 变量；manifest 比较只能使用 root 私有临时对象，本机健康请求不得到达假代理，systemd 操作不得连接调用者总线。真实候选 health 失败时仍须回退，不能被代理的伪造 200 判健康。
 14. 生产等价 health hook 分别返回“socket inactive + service active”“socket active + service inactive”，两种都必须失败；只有两者各自 active 才继续 PID/cwd/UID、稳定窗和 HTTP 校验。
 15. 让 preflight root 不存在、不可写或让 `mktemp/chmod/install/chown` 逐点失败；不得创建 `/fireside.db` 或 fixed preflight root 外文件，指针/业务指纹不变。把待删除 previous 链接替换为不可删除项时，recover/rollback 必须返回 4、保留 transaction，不能报告成功或 3。
-16. 临时 bare remote 流程证明“按 443 URL push → 显式 fetch tracking ref → 精确校验”可复现；生产 install 另以固定 HTTPS `refs/heads/main` 为权威，开发用户篡改本地 `refs/remotes/origin/main` 不能授权未推送 commit。
+16. 临时 bare remote 流程证明“按 443 URL push → 显式 fetch tracking ref → 精确校验”可复现；生产 install 另以固定 GitHub SSH 443 `refs/heads/main` 为权威，开发用户篡改本地 `refs/remotes/origin/main` 不能授权未推送 commit。
 17. 注入 manifest digest 读取/hash 失败；不得生成空 digest healthy marker，不得把目标记为 previous/healthy，提升必须按事务语义自动恢复。
 18. 在合法 manifest 后增加排序位于尾部且含换行/Tab 的路径，或让尾部 stat/hash 失败；即使生成器已输出的前缀与磁盘 manifest 完全相等，验证仍必须失败。
 19. 为已授权 commit 创建指向恶意 commit 的本地 `refs/replace`；controller 的 tree、archive 和最终 marker 必须仍对应原对象，替换内容不得进入候选。
@@ -245,6 +245,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 57. 在 prepared journal 落盘后、watchdog READY 前仅 SIGKILL `flock --close` 监督PID，并强watchdog/gate先于旧worker继续；恢复者必须根据journal owner清空旧进程组，旧worker不得再写journal/切current，并发布命令不得入锁。watchdog启动故障下 current/previous/DB/permit/active均不变，prepared journal要么安全清理要么保留并返回4。
 58. 在敏感preflight stage已chown后 SIGKILL controller，等待或保留旧transient，再用与生产`npm ci`完全相同的UID/网络/sandbox哨兵扫描独特业务值；必须EACCES且无出网。下一个main-lock入口必须先同步停止旧unit、再清理只位于root-only固定父目录的孤儿stage；清理期间不存在活跃写者，异常类型/名称/所有者保留证据并失败关闭。
 59. 构造 switched v2 journal和独立session worker，让leader活着时派生忽略TERM、准备迟到写journal/current的同组子进程，然后在watchdog取锁前直接SIGKILL leader。恢复在原PGID/session为空前不得触指针；释放旧阻塞点后哨兵/journal/current均不复活，最终origin运行态一致。
+60. 在私有 GitHub 仓库上以清空 HOME、Git config、SSH agent 的生产等价环境执行权威 fetch；专用 SSH 443 deploy key 与 known_hosts 元数据正确时精确取得 main，任一文件或父目录缺失、链接、非 root、key/known_hosts 非 0600、多链接或父目录可被组/其他用户写时在联网前拒绝。注入 `GIT_SSH_COMMAND`、`SSH_AUTH_SOCK`、恶意 `~/.ssh/config`、默认 `id_*`、证书、密码提示、ProxyCommand/Jump 与替代 identity 均不能改变实际命令；host key 不匹配必须失败，HTTPS 无匿名凭证不能成为部署阻断。
 
 ### 7.2 生产
 
@@ -286,7 +287,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 
 移除不可信 TMPDIR 时使用 process substitution 又暴露了 producer 状态丢失：`cmp` 只看到合法前缀即可成功，无法得知 manifest 复算器在尾部非法路径/stat/hash 上已经失败。实现必须用 `pipefail` 覆盖的完整 pipeline 或 root 私有临时文件同时检查生成和比较状态。
 
-发布文档和授权链也存在闭环缺口：直接向 SSH URL push 不会更新命名 remote 的 tracking ref，而本地 ref 本身又可由开发用户改写。文档必须显式 fetch/验证；生产控制器则从固定 HTTPS GitHub `refs/heads/main` 读取权威 commit，不能把开发者仓库元数据当授权根。
+发布文档和授权链也存在闭环缺口：直接向 SSH URL push 不会更新命名 remote 的 tracking ref，而本地 ref 本身又可由开发用户改写。文档必须显式 fetch/验证；生产控制器则从固定 GitHub SSH 443 `refs/heads/main` 读取权威 commit，不能把开发者仓库元数据当授权根。
 
 主动复核补充：即使 commit SHA 由 GitHub 精确授权，本地 `refs/replace/<commit>` 仍可让默认 `git archive` 读取另一对象。隔离 Git 命令必须统一设置 no-replace 语义，并以恶意替换树证明归档身份没有被本地元数据改写。
 
@@ -335,3 +336,5 @@ backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护�
 `flock --close`监督者复审确认单独SIGKILL监督PID会提前释放锁而留下活跃mutating worker，watchdog可与旧worker并发并被复活journal。worker改为独立进程组；接管者发现锁空闲但owner仍活跃时必须验证并终止/reap整组后才恢复。该一致性P1使成熟度计数保持0。
 
 runtime可读性复审确认只检查release子树会漏掉`/opt/fireside/releases`等父目录0700漂移，root gate成功但应用启动EACCES循环。固定绝对父链须逐级校验root所有、不可写和other+x；该高价值P2使成熟度计数保持0。
+
+首次真实 install 新增阻断 AR：固定 HTTPS 权威远端无法匿名读取私有仓库，导致已通过 SSH 推送并精确回读的 commit 仍无法成为候选。权威来源改为固定 GitHub SSH 443，并把身份与 host 信任收敛到专用 root-owned 只读 deploy key/known_hosts；必须清空默认 identities 并关闭配置、agent、证书、代理、密码及交互回退。该生产可部署性 P1 使成熟度计数继续为 0。

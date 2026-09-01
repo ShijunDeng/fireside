@@ -1231,6 +1231,51 @@ phase=prepared
     await assert.rejects(readFile(sentinel));
   });
 
+  it('权威私库 fetch 固定 SSH 443、专用身份与 host pin', async () => {
+    const result = run('bash', [
+      '-c',
+      'source "$1"; ssh_command=$(release_authoritative_ssh_command); eval "$ssh_command -G ssh.github.com"',
+      'authoritative-ssh',
+      releaseLib,
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    const config = result.stdout;
+    assert.match(config, /^user git$/m);
+    assert.match(config, /^hostname ssh\.github\.com$/m);
+    assert.match(config, /^port 443$/m);
+    assert.match(config, /^batchmode yes$/m);
+    assert.match(config, /^identitiesonly yes$/m);
+    assert.match(config, /^identityagent none$/m);
+    assert.match(config, /^identityfile none$/m);
+    assert.match(config, /^certificatefile none$/m);
+    assert.match(config, /^stricthostkeychecking true$/m);
+    assert.match(config, /^userknownhostsfile \/etc\/fireside-release\/github_known_hosts$/m);
+    assert.match(config, /^globalknownhostsfile \/dev\/null$/m);
+    assert.match(config, /^updatehostkeys false$/m);
+    assert.match(config, /^verifyhostkeydns false$/m);
+    assert.match(config, /^passwordauthentication no$/m);
+    assert.match(config, /^kbdinteractiveauthentication no$/m);
+    assert.match(config, /^numberofpasswordprompts 0$/m);
+    assert.match(config, /^clearallforwardings yes$/m);
+    assert.match(config, /^permitlocalcommand no$/m);
+    assert.match(config, /^requesttty false$/m);
+    assert.match(config, /^controlmaster false$/m);
+
+    const releaseLibSource = await readFile(releaseLib, 'utf8');
+    assert.match(releaseLibSource, /IdentityFile=none -i \/etc\/fireside-release\/github_readonly_ed25519/);
+    assert.match(releaseLibSource, /KnownHostsCommand=none/);
+    assert.match(releaseLibSource, /ProxyCommand=none -o ProxyJump=none/);
+    assert.doesNotMatch(releaseLibSource, /\/root\/\.ssh/);
+    const installSource = await readFile(installScript, 'utf8');
+    assert.match(installSource, /ssh:\/\/git@ssh\.github\.com:443\/ShijunDeng\/fireside\.git/);
+    assert.match(installSource, /release_git_authoritative_fetch "\$\{auth_repo\}"/);
+    assert.doesNotMatch(installSource, /https:\/\/github\.com\/ShijunDeng\/fireside\.git/);
+    assert.equal(
+      await readFile(path.join(projectRoot, 'ops/controller-assets/github_known_hosts'), 'utf8'),
+      '[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n',
+    );
+  });
+
   it('socket 与 service 必须各自 active，任一单边 active 都不通过', () => {
     const script = `
 source "$1"

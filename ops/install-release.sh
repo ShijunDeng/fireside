@@ -34,7 +34,7 @@ if [[ ${production_mode} == 1 ]]; then
   build_user=fireside-build
   preflight_root=/run
   sensitive_preflight_root=/var/lib/fireside-release/preflight
-  authoritative_remote=https://github.com/ShijunDeng/fireside.git
+  authoritative_remote=ssh://git@ssh.github.com:443/ShijunDeng/fireside.git
   authoritative_ref=refs/heads/main
 elif [[ ${test_mode} == 1 ]]; then
   source_root=${FIRESIDE_SOURCE_ROOT:?test source root is required}
@@ -126,7 +126,11 @@ preflight_stage=$(mktemp -d "${sensitive_preflight_root}/install.${commit}.XXXXX
 source_archive=$(mktemp "${releases_root}/.${commit}.source.XXXXXXXX.tar")
 
 release_git -C / init --quiet --bare "${auth_repo}"
-release_git -C "${auth_repo}" fetch --quiet --no-tags --depth=1 "${authoritative_remote}" "${authoritative_ref}"
+if [[ ${production_mode} == 1 ]]; then
+  release_git_authoritative_fetch "${auth_repo}"
+else
+  release_git -C "${auth_repo}" fetch --quiet --no-tags --depth=1 "${authoritative_remote}" "${authoritative_ref}"
+fi
 resolved_commit=$(release_git -C "${auth_repo}" rev-parse 'FETCH_HEAD^{commit}')
 [[ ${resolved_commit} == "${commit}" ]] || release_die 'release commit is not authorized by the authoritative main head'
 

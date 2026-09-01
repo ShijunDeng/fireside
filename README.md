@@ -104,11 +104,13 @@ sudo install -d -o root -g root -m 0755 /opt/fireside/releases
 sudo install -d -o fireside -g fireside -m 0700 /var/lib/fireside
 sudo install -d -o root -g root -m 0700 /var/lib/fireside-release
 sudo install -d -o root -g root -m 0700 /var/backups/fireside
+sudo install -d -o root -g root -m 0700 /etc/fireside-release
 sudo stat -c '%U:%G:%a %n' \
-  /opt/fireside/releases /var/lib/fireside /var/lib/fireside-release /var/backups/fireside
+  /opt/fireside/releases /var/lib/fireside /var/lib/fireside-release \
+  /var/backups/fireside /etc/fireside-release
 ```
 
-上述输出必须依次为 `root:root:755`、`fireside:fireside:700`、`root:root:700`、`root:root:700`。如果账户或目录已存在，应先核对而不是删除重建；任一目录缺失或元数据不符都不得继续启动 recovery。生产共享口令只写入 `/etc/fireside.env`：
+上述输出必须依次为 `root:root:755`、`fireside:fireside:700`、`root:root:700`、`root:root:700`、`root:root:700`。如果账户或目录已存在，应先核对而不是删除重建；任一目录缺失或元数据不符都不得继续启动 recovery。生产共享口令只写入 `/etc/fireside.env`：
 
 ```dotenv
 FIRESIDE_WRITE_KEY=<由安全随机源生成的 32 至 256 字符值>
@@ -122,6 +124,21 @@ sudo chmod 0600 /etc/fireside.env
 ```
 
 不要把真实口令放入仓库、命令参数、URL、聊天记录或 systemd unit。systemd manager 会在降权前读取环境文件；`fireside` 服务账户不需要、也不应能直接打开它。
+
+为生产 controller 创建仓库专属的只读 deploy key，并用 GitHub CLI 添加到本仓库；不要复用个人写 key。主机公钥 pin 来自 GitHub 官方公布的 ED25519 key，并作为已审阅 controller asset 安装，不能用 `accept-new` 或单独信任现场 `ssh-keyscan`：
+
+```bash
+sudo ssh-keygen -q -t ed25519 -N '' \
+  -C fireside-production-readonly \
+  -f /etc/fireside-release/github_readonly_ed25519
+gh repo deploy-key add /etc/fireside-release/github_readonly_ed25519.pub \
+  --repo ShijunDeng/fireside --title fireside-production-readonly
+sudo install -o root -g root -m 0600 ops/controller-assets/github_known_hosts \
+  /etc/fireside-release/github_known_hosts
+sudo chmod 0600 /etc/fireside-release/github_readonly_ed25519
+```
+
+命令不得增加 `--allow-write`。GitHub 仓库设置中须复核该 deploy key 为只读；私钥、host pin 或其父目录元数据异常时，controller 必须在联网与候选构建前失败关闭。
 
 ### 构建并安装版本化 release
 
@@ -156,7 +173,7 @@ git diff --exit-code
 sudo /usr/local/sbin/fireside-release install "${commit}"
 ```
 
-`install` 从该 commit 生成唯一源码归档，不读取 ignored `server-build/`；npm lifecycle 只以 `fireside-build` 运行，测试/构建/数据库预检使用独立 cgroup，含生产备份副本的预检没有外网。root 在构建身份退出后生成包含 commit、Git tree、源码归档 SHA-256、Node/npm 版本和完整文件集合/模式/大小/哈希的 manifest。候选安装完成仍不会改变 `current`。
+`install` 通过固定 GitHub SSH 443 远端核对私有仓库 main，并从该 commit 生成唯一源码归档，不读取 ignored `server-build/`；权威读取只使用 root-owned 的专用只读 deploy key 与 host-key 文件，禁用用户 SSH 配置、默认 identities、agent、证书、代理、密码和交互认证。npm lifecycle 只以 `fireside-build` 运行，测试/构建/数据库预检使用独立 cgroup，含生产备份副本的预检没有外网。root 在构建身份退出后生成包含 commit、Git tree、源码归档 SHA-256、Node/npm 版本和完整文件集合/模式/大小/哈希的 manifest。候选安装完成仍不会改变 `current`。
 
 `promote` 在同一维护锁内确认当前版本健康、创建在线备份、让候选迁移隔离副本，再让旧版本读取同一副本验证回滚兼容。只有全部通过才写入 fsync 事务日志、原子切换、重启，并以 socket/service、稳定 MainPID、UID、实际 cwd 和连续健康请求验收。失败自动恢复调用前版本；回退成功返回 3，回退本身失败返回 4，锁冲突返回 75。
 

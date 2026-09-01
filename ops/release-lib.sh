@@ -22,6 +22,54 @@ release_git() {
     /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
 }
 
+release_validate_authoritative_ssh_material() {
+  local credential_root=/etc/fireside-release
+  local identity_file=${credential_root}/github_readonly_ed25519
+  local known_hosts_file=${credential_root}/github_known_hosts
+  local metadata mode parent expected_known_host actual_known_host
+  for parent in / /etc; do
+    [[ -d ${parent} && ! -L ${parent} && $(stat -c '%u:%g' -- "${parent}") == 0:0 ]] \
+      || { release_die "authoritative SSH parent is invalid: ${parent}"; return 1; }
+    mode=$(stat -c '%a' -- "${parent}") || return 1
+    (( (8#${mode} & 8#022) == 0 )) \
+      || { release_die "authoritative SSH parent is writable by another identity: ${parent}"; return 1; }
+  done
+  [[ -d ${credential_root} && ! -L ${credential_root} ]] \
+    || { release_die 'authoritative SSH credential directory is invalid'; return 1; }
+  metadata=$(stat -c '%u:%g:%a' -- "${credential_root}") || return 1
+  [[ ${metadata} == 0:0:700 ]] \
+    || { release_die 'authoritative SSH credential directory metadata is invalid'; return 1; }
+  local filename
+  for filename in "${identity_file}" "${known_hosts_file}"; do
+    [[ -f ${filename} && ! -L ${filename} ]] \
+      || { release_die "authoritative SSH credential is invalid: ${filename}"; return 1; }
+    metadata=$(stat -c '%u:%g:%a:%h' -- "${filename}") || return 1
+    [[ ${metadata} == 0:0:600:1 ]] \
+      || { release_die "authoritative SSH credential metadata is invalid: ${filename}"; return 1; }
+  done
+  expected_known_host='[ssh.github.com]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+  actual_known_host=$(<"${known_hosts_file}") || return 1
+  [[ ${actual_known_host} == "${expected_known_host}" ]] \
+    || { release_die 'authoritative GitHub host key pin is invalid'; return 1; }
+}
+
+release_authoritative_ssh_command() {
+  printf '%s\n' '/usr/bin/ssh -F /dev/null -o HostName=ssh.github.com -o User=git -o Port=443 -o BatchMode=yes -o IdentityFile=none -i /etc/fireside-release/github_readonly_ed25519 -o IdentitiesOnly=yes -o IdentityAgent=none -o CertificateFile=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/fireside-release/github_known_hosts -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no -o VerifyHostKeyDNS=no -o KnownHostsCommand=none -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=0 -o PreferredAuthentications=publickey -o ProxyCommand=none -o ProxyJump=none -o ClearAllForwardings=yes -o PermitLocalCommand=no -o RequestTTY=no -o ControlMaster=no -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2'
+}
+
+release_git_authoritative_fetch() {
+  local auth_repo=$1
+  local ssh_command
+  release_validate_authoritative_ssh_material || return 1
+  ssh_command=$(release_authoritative_ssh_command) || return 1
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_SSH_VARIANT=ssh GIT_SSH_COMMAND="${ssh_command}" \
+    /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+      -C "${auth_repo}" fetch --quiet --no-tags --depth=1 \
+      ssh://git@ssh.github.com:443/ShijunDeng/fireside.git refs/heads/main
+}
+
 release_systemctl() {
   /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/systemctl "$@"
 }
