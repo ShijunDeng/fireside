@@ -78,12 +78,18 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 
 ### FR-OPS-010 候选门禁、原子提升与失败回滚
 
+- 生产发布唯一入口是预装到 `/usr/local/sbin` 与 `/usr/local/libexec` 的 `root:root`、开发用户不可写控制器；禁止通过 `sudo` 直接执行可写 Git 工作树中的脚本。生产路径固定，不接受调用者用环境变量覆盖 release、状态、备份、仓库或服务名。
+- 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
+- `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
+- 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
 - 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
 - 提升时先解析并保存当前健康 release，再原子切换 `current`、重启服务并在有界时间内检查 HTTP 健康和 MainPID 实际运行目录。两项都成功后才原子更新 `previous` 为原健康 release并报告成功。
 - 新服务启动、健康或运行目录验证失败时，工具必须自动把 `current` 原子切回原健康 release、重启并验证恢复；返回非零且不得自动恢复数据库。若回退服务也不健康，必须返回独立的致命错误，保留 socket、状态、备份和两个 release 供人工处置。
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
+- `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
+- 健康门禁不是单次 200：socket 与 service active，MainPID UID 为 `fireside`、cwd 精确指向目标 release，PID 在稳定观察窗不变化，且多个新连接健康请求连续成功。previous 更新或其持久化失败也视为提升失败并恢复原版本。
 
 ### FR-OPS-007 数据库迁移兼容
 
@@ -128,6 +134,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 6. 发布测试从提交导出而非复制 ignored build；陈旧/篡改 manifest、必需文件符号链接、非完整 commit 和 root lifecycle 均被拒绝。
 7. 候选语法/依赖/隔离数据库预检任一失败时 `current` 不变；提升后健康失败自动恢复原链接和服务；`previous` 只记录已确认健康版本；显式回滚具有同样门禁。
 8. 备份故障注入覆盖 file sync、首次 directory sync、prune 与末次 directory sync；未持久化新份时不删除旧份。模拟上次崩溃的旧孤儿会被清除，新鲜/非匹配/非 root/符号链接目标不会被触碰。
+9. commit 不属于授权远端 main、root 控制器可写、manifest 外新增文件、构建残留进程、旧版本不能读取候选迁移副本均在切换前拒绝；测试/预检证明无外网且不能读取生产 state/env/backup 原件。
+10. 对 journal、current 切换、restart、health 和 previous 更新逐点模拟 SIGKILL；`recover` 与开机 recovery 均恢复调用前两个指针，不采用故障候选、不恢复数据库，重复执行幂等。
 
 ### 7.2 生产
 
@@ -139,6 +147,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 6. 手动触发一次在线备份并完成隔离恢复演练；生产业务指纹不变，备份日志无敏感字段。
 7. `systemd-analyze security` 不再报告 root、完整 capability、开放 home、共享 tmp 或可写系统目录；记录最终 exposure 分数但以真实功能/权限验证为准。
 8. 用故意无法启动的隔离候选执行生产等价提升测试，验证自动回退后公网 socket、本机健康、原 MainPID release 和业务指纹恢复；测试不得把故障候选留作 `previous`。
+9. `/usr/local` 的生产控制器和 recovery unit 为 root-owned、不可由 `dsj`/`fireside-build`/`fireside` 修改；日常发布不执行工作树脚本。完成一次持久 journal 故障恢复演练并证明开机顺序在应用之前。
 
 ## 8. 完成条件
 
