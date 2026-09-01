@@ -98,7 +98,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
-- `RemainAfterExit` 的开机 recovery 只能作为本次开机的第一道门，不能代替每次启动门禁。`fireside.service` 每次自动/显式启动和 `fireside-backup.service` 每次 timer/人工启动都必须先执行 root-owned transaction gate：无 journal 才直接通过；有 journal 且发布锁空闲表示控制器已成为 orphan，必须在 Node 或 backup runner 执行前恢复；有 journal且锁被当前受控 promote 持有时，只允许与已校验 journal 阶段、current 指针和目标完全一致的那次受控服务重启，不能让普通并发启动猜测放行。
+- `RemainAfterExit` 的开机 recovery 只能作为本次开机的第一道门，不能代替每次启动门禁。`fireside.service` 每次自动/显式启动和 `fireside-backup.service` 每次 timer/人工启动都必须先执行 root-owned transaction gate：有 journal 且发布锁空闲表示控制器已成为 orphan，必须在 Node 或 backup runner 执行前恢复；有 journal且锁被当前受控 promote 持有时，只允许与已校验 journal 阶段、current 指针和目标完全一致的那次受控服务重启，不能让普通并发启动猜测放行。
+- 无 journal 也不是可以直接放行：`/run` 跨重启会消失，gate 必须从受信 `current` 重新校验 release manifest 与 healthy marker，在同一把锁内原子重建 root-owned selector 和与 commit 精确匹配的写许可。坏类型、悬空/越界 current、缺失或错误 healthy marker 必须失败关闭，Node 与 backup runner 都不能启动；只有显式记录的 legacy current 可以走兼容标记。
 - 每次启动门禁不能与持排他锁同步等待 `systemctl restart` 的正常 promote 自锁死，也不能把调用者环境、可写 marker 或“lock 正忙”本身当作授权。受控 restart 与 orphan 的区分必须绑定 root-owned事务、当前指针和活跃控制器所有权；控制器在放行点前后异常退出时，下一次 service/backup 入口仍须先恢复，且 backup 绝不能从未验收 target 执行或 prune。
 - 新事务必须有至少 128-bit 随机 txid，并把 owner boot id、PID/starttime、固定控制器身份和锁 inode 作为附加证据。每次受控 service restart 使用 journal 内原子 fsync 的单次许可，绑定 txid、phase、expected commit、purpose 和递增 generation；gate 原子消费，旧许可、第二次 restart、错误 current/phase/owner/lock 一律拒绝。PID 或 lock-busy 单独都不是授权。
 - service gate 在同一锁内把已验证 commit 固化为 root-owned 不可变运行 selector，MainPID 的 WorkingDirectory/ExecStart 必须引用 selector 而不是可变 `current`，关闭 pre-gate→exec 的 current TOCTOU。gate 拿到锁时直接在同一 worker 内恢复，不得再次调用会重复 flock 的入口。
@@ -107,6 +108,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
 - fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
 - backup 不得与 root recovery 共用一个扩大写权限的 sandbox。使用独立 root-owned gate/recovery unit，再进入保持现有最小权限的 runner unit；runner 在取得共享锁后再次只读确认没有 journal并解析已健康 selector，防止 gate→runner 间竞态。任意 active transaction 都不得执行 target backup CLI 或 prune。
+- service gate 与 backup gate 的 orphan 语义不同：service gate 仅在旧 MainPID 已停止的 `ExecStartPre` 中允许无 restart 恢复，随后本次启动 origin；backup gate 若先于 watchdog 取得孤儿锁，必须执行完整的授权 restart、验证 origin MainPID/cwd/health、重建 selector/许可并清 journal后才能进入 runner，不能只回指针后让仍运行的 target 留在公网。也可以不清 journal并让本次 backup 失败等待 watchdog，但绝不能从 target 备份。
+- root gate 必须是没有 `EnvironmentFile=/etc/fireside.env` 的独立 unit，不能把 root `ExecStartPre` 直接放进应用 unit 而继承业务写入口口令。gate、watchdog、recovery 与 backup 的环境必须在日志和首个子进程前显式移除 `FIRESIDE_WRITE_KEY` 及会话密钥；只有非 root Node MainPID 可继承应用所需密钥。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
 - 含生产备份副本且已授权给 `fireside-build` 的 preflight stage 必须确认递归删除成功且路径消失后，才能取消 EXIT trap、写 transaction 或切换 `current`。显式清理失败必须以 2 停在切换前并记录稳定错误；trap 的兜底清理失败也必须可见，不能静默把敏感副本当作已删除。
 - healthy marker 的 manifest digest 必须先独立计算、检查命令状态并验证为 64 位 SHA-256（仅显式 legacy current 可用固定标记），再写 marker；禁止让 command substitution 失败被外层 `printf` 成功掩盖。marker 生成/持久化失败属于提升失败，必须回到调用前版本。
@@ -133,6 +136,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - bootstrap 或其他发布事务开始切换前必须关闭 root-owned 运行时写许可。候选可以在公网 80 完成只读 live health，但从首次启动到所有可回退步骤持久化完成之间，创建、编辑、删除、排序、认领、排期、报名、归档等业务写必须稳定返回 `503 RELEASE_IN_PROGRESS` 且没有数据库副作用；页面保留草稿并提示稍后重试。认证换取短期会话和公开读取不修改业务数据，可以继续。
 - 写许可必须绑定当前 release commit，不能使用可被旧版本/旧事务重放的固定布尔文件。只有健康 marker、previous 语义、业务指纹和事务“向前提交”状态均已 fsync 后，控制器才原子发布目标 commit 的写许可。一旦许可发布，任何后续清理失败或控制器退出都不得恢复启动前数据库或让已返回 2xx 的业务写丢失；recovery 必须识别 committed 阶段并向前完成 current/marker/清理。
 - `publish` 的 temp fsync、rename 和目录 fsync 有不同可见性，但调用者在进入已 fsync 的 committed phase 后不得再走回退分支；即使 rename 后目录 fsync 报错且并发请求已读到许可，recovery 也只能重试发布并向前完成。事务前 revoke 若 unlink 已可见但目录 fsync 失败，必须恢复 origin commit 的许可或留下可恢复 journal，不能在无事务状态静默永久 503。
+- 为消除 revoke 的无日志窗口，控制器必须先持久化可恢复 journal 与 active marker，再撤销 origin 写许可；journal/marker/revoke 任一步失败均按 journal 恢复 origin。journal 清理发生在许可持久化之后；若 active marker 的最终清理失败，watchdog/gate 仍须清除该过期标记，不能让备份永久拒绝。
 - 普通无事务启动也必须让服务进程的 release commit 与 root-owned 写许可一致；缺失、错误 commit、错误类型/权限/链接时读取仍可服务但业务写失败关闭。首次部署文档和生产验收必须在成功 bootstrap 后确认许可已发布，重启后仍匹配 current。
 - 含业务数据的预检目录必须遵守既有敏感副本清理门禁。bootstrap 与 promote/rollback/backup 共用同一个 root-only 维护锁，任何失败均不得误报成功。
 
@@ -202,6 +206,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 35. 用 DELETE journal、FULL 同步和 cache spill 建立真实 hot `fireside.db-journal` 后移走旧 main；bootstrap 必须退出 2，journal 类型/字节/hash 不变且不创建 current/DB/备份。另让 target 启动生成 journal 后在健康门禁失败，恢复结果严格等于初始 absent 或原备份，目录无 main/wal/shm/journal 残留。
 36. watchdog dispatcher exec 后立即退出、参数/锁 inode 错误、不发 READY、READY 超时、READY 后被 kill 等场景均不得形成无恢复者的 current 切换；只有 PID 1 收到对应 txid worker 的 READY 且 unit active 才继续。正常结束不重启，异常退出自动重启并恢复同 txid journal。
 37. 写许可 temp fsync、rename 前、rename 后目录 fsync 分别故障：rename 前业务写保持503；许可一旦可见后的任意2xx在命令失败/SIGKILL/recovery后仍存在。origin revoke 的 unlink 后 fsync 失败不得留下无journal的永久503。
+38. 删除整个 `/run/fireside-runtime` 模拟冷启动；分别让 service 与 persistent backup 先到达 gate，最终都须从受信 current 重建 selector/permit，MainPID/cwd/current/selector/permit一致且业务写成功。current 或 marker 为错误类型、悬空或摘要不匹配时，Node 与 backup runner 均不得执行。
+39. target 已启动后杀死 controller，并强制 backup gate 先于 watchdog 取得锁；恢复后必须是 origin MainPID/cwd/current/selector/permit全一致，target runner 未执行、无备份/prune副作用。若 backup gate选择交给 watchdog，则本次任务明确失败且 journal 保留到 watchdog 完整恢复。
+40. 从 `/proc/<pid>/environ` 和测试哨兵证明 service/backup gate、recovery、watchdog及其子进程均不含业务写口令或会话密钥；应用 Node 仍可完成合法认证。unit 不得因应用 `EnvironmentFile` 把密钥传给 root gate。
 
 ### 7.2 生产
 
@@ -268,3 +275,5 @@ bootstrap 数据复审发现 live health 窗口已经由 socket 向公网开放�
 SQLite 恢复复审还构造出真实 hot rollback journal：无 main 时若遗漏 `fireside.db-journal`，安装的新库会在首次打开时被旧 journal 回放成损坏页，失败恢复又留下 journal 导致永久重试循环。边车边界扩展到 wal/shm/journal，并要求拒绝孤儿、停止 workload 后清理与目录 fsync。该 P1 继续保持成熟度计数为 0。
 
 watchdog 就绪复审确认异步 `systemd-run` 只证明 dispatcher 被 exec，不能证明守护者仍活着并在等待锁；若随后 controller 死亡，原 P1 仍存在。增加 Type=notify 的 txid 就绪握手、active 复查、异常自动重启和最小 capability 沙箱。该 P1 继续保持成熟度计数为 0。
+
+易失运行态与 gate 竞态复审确认两条 P1：无 journal 冷启动会丢失 selector/permit；target 已启动后的 orphan 若由 backup gate 用 no-restart 语义恢复，会留下 MainPID 与 current/permit 裂脑。无事务 gate 改为从健康 current 重建运行态；backup orphan 必须完整 restart+health 或失败交给 watchdog。写许可 revoke 还必须后移到 journal/active marker 持久化之后，消除无日志永久 503。成熟度连续计数保持 0。
