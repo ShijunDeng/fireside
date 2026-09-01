@@ -7,6 +7,14 @@ import Database from 'better-sqlite3';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../server/app.js';
 
+const ifMatch = (revision: number) => ({ 'if-match': `"${revision}"` });
+
+const readTopic = async (instance: FastifyInstance, id: number) => {
+  const response = await instance.inject({ method: 'GET', url: `/api/topics/${id}` });
+  assert.equal(response.statusCode, 200);
+  return response.json() as { id: number; revision: number; [key: string]: unknown };
+};
+
 describe('围炉夜话 API', () => {
   let app: FastifyInstance;
 
@@ -64,9 +72,15 @@ describe('围炉夜话 API', () => {
     });
     assert.equal(created.statusCode, 201);
     const id = created.json().id as number;
+    const createdRevision = created.json().revision as number;
+    const missingRevision = await protectedApp.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers, payload: { title: '不应写入' },
+    });
+    assert.equal(missingRevision.statusCode, 428);
+    assert.equal(missingRevision.json().code, 'TOPIC_REVISION_REQUIRED');
     const secretMeeting = 'https://meet.example.test/team?passcode=top-secret';
     const scheduled = await protectedApp.inject({
-      method: 'POST', url: `/api/topics/${id}/schedule`, headers,
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: { ...headers, ...ifMatch(createdRevision) },
       payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 40, room: '三楼会议室', meetingUrl: secretMeeting },
     });
     assert.equal(scheduled.statusCode, 200);
@@ -84,7 +98,7 @@ describe('围炉夜话 API', () => {
     assert.equal(meeting.json().meetingUrl, secretMeeting);
 
     const sensitiveRoom = await protectedApp.inject({
-      method: 'POST', url: `/api/topics/${id}/schedule`, headers,
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: { ...headers, ...ifMatch((await readTopic(protectedApp, id)).revision) },
       payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: `线上入口：${secretMeeting}`, meetingUrl: '' },
     });
     assert.equal(sensitiveRoom.statusCode, 400);
@@ -106,31 +120,37 @@ describe('围炉夜话 API', () => {
     });
     assert.equal(created.statusCode, 201);
     assert.equal(created.json().status, 'OPEN');
+    assert.equal(created.json().revision, 1);
     const id = created.json().id as number;
 
-    const claimed = await app.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '分享者' } });
+    const claimed = await app.inject({ method: 'POST', url: `/api/topics/${id}/claim`, headers: ifMatch(created.json().revision), payload: { presenter: '分享者' } });
     assert.equal(claimed.statusCode, 200);
     assert.equal(claimed.json().status, 'CLAIMED');
     assert.equal(claimed.json().presenter, '分享者');
+    assert.equal(claimed.json().revision, 2);
 
     const scheduledAt = new Date(Date.now() + 86_400_000).toISOString();
     const scheduled = await app.inject({
       method: 'POST',
       url: `/api/topics/${id}/schedule`,
+      headers: ifMatch(claimed.json().revision),
       payload: { scheduledAt, duration: 45, room: '测试会议室' },
     });
     assert.equal(scheduled.statusCode, 200);
     assert.equal(scheduled.json().status, 'SCHEDULED');
     assert.equal(scheduled.json().duration, 45);
+    assert.equal(scheduled.json().revision, 3);
 
     const archived = await app.inject({
       method: 'POST',
       url: `/api/topics/${id}/archive`,
+      headers: ifMatch(scheduled.json().revision),
       payload: { takeaway: '测试覆盖完整流程。', materialUrl: 'https://example.com/notes' },
     });
     assert.equal(archived.statusCode, 200);
     assert.equal(archived.json().status, 'ARCHIVED');
     assert.equal(archived.json().takeaway, '测试覆盖完整流程。');
+    assert.equal(archived.json().revision, 4);
 
     const topics = await app.inject({ method: 'GET', url: '/api/topics?status=ARCHIVED' });
     assert.equal(topics.statusCode, 200);
@@ -147,9 +167,9 @@ describe('围炉夜话 API', () => {
       payload: { title: '并发认领', summary: '同一个议题只能有一位分享者。', proposer: 'A', tags: [] },
     });
     const firstId = first.json().id as number;
-    const claim = await app.inject({ method: 'POST', url: `/api/topics/${firstId}/claim`, payload: { presenter: 'B' } });
+    const claim = await app.inject({ method: 'POST', url: `/api/topics/${firstId}/claim`, headers: ifMatch(first.json().revision), payload: { presenter: 'B' } });
     assert.equal(claim.statusCode, 200);
-    const duplicate = await app.inject({ method: 'POST', url: `/api/topics/${firstId}/claim`, payload: { presenter: 'C' } });
+    const duplicate = await app.inject({ method: 'POST', url: `/api/topics/${firstId}/claim`, headers: ifMatch(claim.json().revision), payload: { presenter: 'C' } });
     assert.equal(duplicate.statusCode, 409);
 
     const second = await app.inject({
@@ -158,6 +178,7 @@ describe('围炉夜话 API', () => {
     });
     const invalidSchedule = await app.inject({
       method: 'POST', url: `/api/topics/${second.json().id}/schedule`,
+      headers: ifMatch(second.json().revision),
       payload: { scheduledAt: new Date().toISOString(), duration: 30, room: '线上' },
     });
     assert.equal(invalidSchedule.statusCode, 409);
@@ -180,29 +201,36 @@ describe('围炉夜话 API', () => {
     assert.equal(created.json().presenter, '自荐者');
     const id = created.json().id as number;
 
-    const released = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} });
+    const released = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, headers: ifMatch(created.json().revision), payload: {} });
     assert.equal(released.statusCode, 200);
     assert.equal(released.json().status, 'OPEN');
     assert.equal(released.json().presenter, null);
-    const duplicateRelease = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} });
+    assert.equal(released.json().revision, 2);
+    const duplicateRelease = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, headers: ifMatch(released.json().revision), payload: {} });
     assert.equal(duplicateRelease.statusCode, 409);
 
-    await app.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '接力者' } });
+    const reclaimed = await app.inject({ method: 'POST', url: `/api/topics/${id}/claim`, headers: ifMatch(released.json().revision), payload: { presenter: '接力者' } });
+    assert.equal(reclaimed.statusCode, 200);
+    assert.equal(reclaimed.json().revision, 3);
     const scheduledAt = new Date(Date.now() + 2 * 86_400_000).toISOString();
     const scheduled = await app.inject({
       method: 'POST',
       url: `/api/topics/${id}/schedule`,
+      headers: ifMatch(reclaimed.json().revision),
       payload: { scheduledAt, duration: 50, room: '纠错会议室' },
     });
     assert.equal(scheduled.statusCode, 200);
+    assert.equal(scheduled.json().revision, 4);
     const archived = await app.inject({
       method: 'POST',
       url: `/api/topics/${id}/archive`,
+      headers: ifMatch(scheduled.json().revision),
       payload: { takeaway: '这段内容将在撤销归档时清空。', materialUrl: 'https://example.com/flow' },
     });
     assert.equal(archived.statusCode, 200);
+    assert.equal(archived.json().revision, 5);
 
-    const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} });
+    const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(archived.json().revision), payload: {} });
     assert.equal(unarchived.statusCode, 200);
     assert.equal(unarchived.json().status, 'SCHEDULED');
     assert.equal(unarchived.json().scheduledAt, scheduledAt);
@@ -210,15 +238,17 @@ describe('围炉夜话 API', () => {
     assert.equal(unarchived.json().takeaway, null);
     assert.equal(unarchived.json().materialUrl, null);
     assert.equal(unarchived.json().archivedAt, null);
+    assert.equal(unarchived.json().revision, 6);
 
-    const unscheduled = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    const unscheduled = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(unarchived.json().revision), payload: {} });
     assert.equal(unscheduled.statusCode, 200);
     assert.equal(unscheduled.json().status, 'CLAIMED');
     assert.equal(unscheduled.json().presenter, '接力者');
     assert.equal(unscheduled.json().scheduledAt, null);
     assert.equal(unscheduled.json().duration, null);
     assert.equal(unscheduled.json().room, null);
-    const duplicateUnschedule = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    assert.equal(unscheduled.json().revision, 7);
+    const duplicateUnschedule = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(unscheduled.json().revision), payload: {} });
     assert.equal(duplicateUnschedule.statusCode, 409);
   });
 
@@ -231,6 +261,7 @@ describe('围炉夜话 API', () => {
     const meetingUrl = `https://meet.example.com/fireside/${'long-path-'.repeat(12)}?room=weekly`;
     const scheduled = await app.inject({
       method: 'POST', url: `/api/topics/${id}/schedule`,
+      headers: ifMatch(created.json().revision),
       payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 60, room: '线上会议', meetingUrl },
     });
     assert.equal(scheduled.statusCode, 200);
@@ -252,20 +283,29 @@ describe('围炉夜话 API', () => {
     const topic = (topics.json() as { id: number; participantCount: number }[]).find((item) => item.id === id);
     assert.equal(topic?.participantCount, 2);
 
-    await app.inject({ method: 'POST', url: `/api/topics/${id}/archive`, payload: { takeaway: '参会闭环完成。', materialUrl: '' } });
+    const revisionAfterJoins = (await readTopic(app, id)).revision;
+    const archived = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/archive`, headers: ifMatch(revisionAfterJoins),
+      payload: { takeaway: '参会闭环完成。', materialUrl: '' },
+    });
+    assert.equal(archived.statusCode, 200);
     const joinArchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '迟到者' } });
     assert.equal(joinArchived.statusCode, 409);
     assert.equal(joinArchived.json().code, 'TOPIC_STATE_CONFLICT');
     const leaveArchived = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(leaveArchived.statusCode, 409);
 
-    await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} });
+    const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(archived.json().revision), payload: {} });
+    assert.equal(unarchived.statusCode, 200);
     const left = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(left.statusCode, 204);
     const afterLeave = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
     assert.deepEqual((afterLeave.json() as { name: string }[]).map(({ name }) => name), ['小林']);
 
-    const unscheduled = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    const unscheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/unschedule`,
+      headers: ifMatch((await readTopic(app, id)).revision), payload: {},
+    });
     assert.equal(unscheduled.statusCode, 200);
     assert.equal(unscheduled.json().meetingUrl, null);
     const afterUnschedule = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
@@ -277,6 +317,7 @@ describe('围炉夜话 API', () => {
     });
     const invalidUrl = await app.inject({
       method: 'POST', url: `/api/topics/${invalidUrlTopic.json().id}/schedule`,
+      headers: ifMatch(invalidUrlTopic.json().revision),
       payload: { scheduledAt: new Date().toISOString(), duration: 30, room: '线上', meetingUrl: 'javascript:alert(1)' },
     });
     assert.equal(invalidUrl.statusCode, 400);
@@ -288,6 +329,7 @@ describe('围炉夜话 API', () => {
       payload: { title: '地点边界议题', summary: '会议秘密只能进入受保护字段。', proposer: '组织者', presenter: '组织者', tags: [] },
     });
     const id = created.json().id as number;
+    let revision = created.json().revision as number;
     const sensitiveRooms = [
       'https://meet.example.test/join?passcode=omega',
       '线上入口：https://meet.example.test/join?pwd=omega',
@@ -299,6 +341,7 @@ describe('围炉夜话 API', () => {
     for (const room of sensitiveRooms) {
       const response = await app.inject({
         method: 'POST', url: `/api/topics/${id}/schedule`,
+        headers: ifMatch(revision),
         payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room, meetingUrl: '' },
       });
       assert.equal(response.statusCode, 400, room);
@@ -307,18 +350,22 @@ describe('围炉夜话 API', () => {
 
     const scheduled = await app.inject({
       method: 'POST', url: `/api/topics/${id}/schedule`,
+      headers: ifMatch(revision),
       payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '腾讯会议室 A', meetingUrl: '' },
     });
     assert.equal(scheduled.statusCode, 200);
+    revision = scheduled.json().revision;
     for (const room of ['密码学读书会', '3号会议室', '三楼围炉会议室']) {
-      assert.equal((await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { room } })).statusCode, 200, room);
+      const response = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(revision), payload: { room } });
+      assert.equal(response.statusCode, 200, room);
+      revision = response.json().revision;
     }
     for (const room of sensitiveRooms) {
-      const response = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { room } });
+      const response = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(revision), payload: { room } });
       assert.equal(response.statusCode, 400, room);
       assert.equal(response.json().code, 'SENSITIVE_ROOM_CONTENT', room);
     }
-    await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+    await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(revision) });
   });
 
   it('拒绝缺少关键信息的议题', async () => {
@@ -335,38 +382,169 @@ describe('围炉夜话 API', () => {
     const id = created.json().id as number;
     const updated = await app.inject({
       method: 'PATCH', url: `/api/topics/${id}`,
+      headers: ifMatch(created.json().revision),
       payload: { title: '编辑后的议题', summary: '修改后的简介。', proposer: '新发起人', tags: ['新标签', 'CRUD'] },
     });
     assert.equal(updated.statusCode, 200);
     assert.equal(updated.json().title, '编辑后的议题');
     assert.deepEqual(updated.json().tags, ['新标签', 'CRUD']);
 
-    const invalidUrl = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { materialUrl: 'javascript:alert(1)' } });
+    const invalidUrl = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(updated.json().revision), payload: { materialUrl: 'javascript:alert(1)' } });
     assert.equal(invalidUrl.statusCode, 400);
     const bypassState = await app.inject({
       method: 'PATCH', url: `/api/topics/${id}`,
+      headers: ifMatch(updated.json().revision),
       payload: { scheduledAt: new Date().toISOString(), duration: 30, room: '越级排期' },
     });
     assert.equal(bypassState.statusCode, 409);
 
-    const deleted = await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(updated.json().revision) });
     assert.equal(deleted.statusCode, 204);
-    const duplicate = await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+    const duplicate = await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(updated.json().revision) });
     assert.equal(duplicate.statusCode, 404);
     const topics = await app.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(topics.json().some((topic: { id: number }) => topic.id === id), false);
   });
 
+  it('要求所有议题命令携带强 If-Match 并拒绝非法格式', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '版本头契约', summary: '验证全部命令的前置条件。', proposer: '测试者', tags: [] },
+    });
+    const id = created.json().id as number;
+    const commands = [
+      { method: 'PATCH', url: `/api/topics/${id}`, payload: { title: '缺少版本' } },
+      { method: 'DELETE', url: `/api/topics/${id}` },
+      { method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '分享者' } },
+      { method: 'POST', url: `/api/topics/${id}/release`, payload: {} },
+      { method: 'POST', url: `/api/topics/${id}/schedule`, payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '会议室' } },
+      { method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} },
+      { method: 'POST', url: `/api/topics/${id}/archive`, payload: { takeaway: '', materialUrl: '' } },
+      { method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} },
+    ] as const;
+    for (const command of commands) {
+      const response = await app.inject(command);
+      assert.equal(response.statusCode, 428, `${command.method} ${command.url}`);
+      assert.equal(response.json().code, 'TOPIC_REVISION_REQUIRED');
+    }
+
+    for (const value of ['', '1', 'W/"1"', '*', '"0"', '"01"', '"-1"', '"1", "2"', '"abc"']) {
+      const response = await app.inject({
+        method: 'PATCH', url: `/api/topics/${id}`, headers: { 'if-match': value }, payload: { title: '非法版本' },
+      });
+      assert.equal(response.statusCode, 400, value);
+      assert.equal(response.json().code, 'INVALID_TOPIC_REVISION', value);
+    }
+    assert.equal((await readTopic(app, id)).revision, 1);
+  });
+
+  it('拒绝陈旧编辑和删除且保留较新的议题内容', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '陈旧写保护', summary: '两个协作者从同一个快照开始。', proposer: '测试者', tags: [] },
+    });
+    const id = created.json().id as number;
+    const snapshotRevision = created.json().revision as number;
+    const firstEdit = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(snapshotRevision), payload: { title: '先提交的标题' },
+    });
+    assert.equal(firstEdit.statusCode, 200);
+    assert.equal(firstEdit.json().revision, snapshotRevision + 1);
+
+    const staleEdit = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(snapshotRevision), payload: { summary: '不应覆盖的新简介' },
+    });
+    assert.equal(staleEdit.statusCode, 412);
+    assert.equal(staleEdit.json().code, 'TOPIC_REVISION_CONFLICT');
+    assert.equal(staleEdit.json().currentRevision, snapshotRevision + 1);
+    const staleDelete = await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(snapshotRevision) });
+    assert.equal(staleDelete.statusCode, 412);
+    assert.equal(staleDelete.json().code, 'TOPIC_REVISION_CONFLICT');
+
+    const authoritative = await readTopic(app, id);
+    assert.equal(authoritative.title, '先提交的标题');
+    assert.equal(authoritative.summary, '两个协作者从同一个快照开始。');
+    assert.equal(authoritative.revision, snapshotRevision + 1);
+  });
+
+  it('报名推进聚合版本并让陈旧取消排期失败且不丢名单', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '报名版本保护', summary: '报名发生后旧确认不能清空名单。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    assert.equal(created.json().revision, 1);
+    const id = created.json().id as number;
+    const scheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: ifMatch(1),
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 45, room: '报名会议室' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    assert.equal(scheduled.json().revision, 2);
+
+    const firstJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: 'Alice' } });
+    assert.equal(firstJoin.statusCode, 201);
+    assert.equal((await readTopic(app, id)).revision, 3);
+    const duplicateJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: ' alice ' } });
+    assert.equal(duplicateJoin.statusCode, 409);
+    assert.equal((await readTopic(app, id)).revision, 3);
+    const secondJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '小林' } });
+    assert.equal(secondJoin.statusCode, 201);
+    assert.equal((await readTopic(app, id)).revision, 4);
+    const left = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
+    assert.equal(left.statusCode, 204);
+    assert.equal((await readTopic(app, id)).revision, 5);
+    const missingLeave = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
+    assert.equal(missingLeave.statusCode, 404);
+    assert.equal((await readTopic(app, id)).revision, 5);
+
+    const beforeStaleDelete = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const staleDelete = await app.inject({
+      method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(scheduled.json().revision),
+    });
+    assert.equal(staleDelete.statusCode, 412);
+    assert.equal(staleDelete.json().currentRevision, 5);
+    const afterStaleDelete = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(afterStaleDelete.headers['x-order-version'], beforeStaleDelete.headers['x-order-version']);
+    assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['小林']);
+
+    const staleUnschedule = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(scheduled.json().revision), payload: {},
+    });
+    assert.equal(staleUnschedule.statusCode, 412);
+    assert.equal(staleUnschedule.json().currentRevision, 5);
+    assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['小林']);
+
+    const unscheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(5), payload: {},
+    });
+    assert.equal(unscheduled.statusCode, 200);
+    assert.equal(unscheduled.json().revision, 6);
+    assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json(), []);
+  });
+
   it('持久化完整的手动排序并拒绝不完整列表', async () => {
     const before = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
-    const ids = (before.json() as { id: number }[]).map(({ id }) => id);
+    const beforeTopics = before.json() as { id: number; revision: number; updatedAt: string }[];
+    const ids = beforeTopics.map(({ id }) => id);
     const baseVersion = Number(before.headers['x-order-version']);
     const reversed = [...ids].reverse();
     const reordered = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed, baseVersion } });
     assert.equal(reordered.statusCode, 204);
     assert.equal(Number(reordered.headers['x-order-version']), baseVersion + 1);
     const after = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
-    assert.deepEqual((after.json() as { id: number }[]).map(({ id }) => id), reversed);
+    const afterTopics = after.json() as { id: number; revision: number; updatedAt: string }[];
+    assert.deepEqual(afterTopics.map(({ id }) => id), reversed);
+    const beforeById = new Map(beforeTopics.map(({ id, revision, updatedAt }) => [id, { revision, updatedAt }]));
+    for (const topic of afterTopics) {
+      assert.deepEqual({ revision: topic.revision, updatedAt: topic.updatedAt }, beforeById.get(topic.id));
+    }
+    const reorderedTarget = afterTopics[0];
+    const editAfterReorder = await app.inject({
+      method: 'PATCH', url: `/api/topics/${reorderedTarget.id}`, headers: ifMatch(reorderedTarget.revision),
+      payload: { summary: '排序后原议题版本仍然有效。' },
+    });
+    assert.equal(editAfterReorder.statusCode, 200);
+    assert.equal(editAfterReorder.json().revision, reorderedTarget.revision + 1);
 
     const currentVersion = Number(after.headers['x-order-version']);
     const incomplete = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed.slice(1), baseVersion: currentVersion } });
@@ -393,7 +571,11 @@ describe('数据库兼容性与并发', () => {
     await rotatedApp.ready();
     assert.equal((await rotatedApp.inject({ method: 'GET', url: '/api/topics' })).json()[0].title, '口令轮换议题');
     assert.equal((await rotatedApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-write-key': 'old-key' }, payload: { title: '不应成功' } })).statusCode, 401);
-    const updated = await rotatedApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-write-key': 'new-key' }, payload: { title: '新口令生效' } });
+    const updated = await rotatedApp.inject({
+      method: 'PATCH', url: `/api/topics/${id}`,
+      headers: { 'x-fireside-write-key': 'new-key', ...ifMatch(created.json().revision) },
+      payload: { title: '新口令生效' },
+    });
     assert.equal(updated.statusCode, 200);
     assert.equal(updated.json().title, '新口令生效');
     await rotatedApp.close();
@@ -450,8 +632,8 @@ describe('数据库兼容性与并发', () => {
     await firstStart.ready();
     const seeded = await firstStart.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(seeded.json().length, 4);
-    for (const topic of seeded.json() as { id: number }[]) {
-      const deleted = await firstStart.inject({ method: 'DELETE', url: `/api/topics/${topic.id}` });
+    for (const topic of seeded.json() as { id: number; revision: number }[]) {
+      const deleted = await firstStart.inject({ method: 'DELETE', url: `/api/topics/${topic.id}`, headers: ifMatch(topic.revision) });
       assert.equal(deleted.statusCode, 204);
     }
     await firstStart.close();
@@ -501,10 +683,17 @@ describe('数据库兼容性与并发', () => {
     const migrationApp = buildApp({ databasePath, seed: false, serveStatic: false });
     await migrationApp.ready();
     const response = await migrationApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
-    assert.deepEqual((response.json() as { title: string; position: number }[]).map(({ title, position }) => ({ title, position })), [
+    const migratedTopics = response.json() as { title: string; position: number; revision: number }[];
+    assert.deepEqual(migratedTopics.map(({ title, position }) => ({ title, position })), [
       { title: '旧议题一', position: 1 },
       { title: '旧议题二', position: 2 },
     ]);
+    assert.deepEqual(migratedTopics.map(({ revision }) => revision), [1, 1]);
+    const migratedDb = new Database(databasePath);
+    const revisionColumn = (migratedDb.prepare("PRAGMA table_info('topics')").all() as { name: string; notnull: number; dflt_value: string | null }[])
+      .find(({ name }) => name === 'revision');
+    assert.deepEqual(revisionColumn && { notnull: revisionColumn.notnull, defaultValue: revisionColumn.dflt_value }, { notnull: 1, defaultValue: '1' });
+    migratedDb.close();
     await migrationApp.close();
     await rm(directory, { recursive: true, force: true });
   });
@@ -547,18 +736,19 @@ describe('数据库兼容性与并发', () => {
       position: number; title: string; summary: string; proposer: string; presenter: string | null;
       tags: string[]; status: string; scheduledAt: string | null; duration: number | null;
       room: string | null; takeaway: string | null; materialUrl: string | null;
-      createdAt: string; updatedAt: string; archivedAt: string | null;
+      createdAt: string; updatedAt: string; archivedAt: string | null; revision: number;
     }>;
     assert.deepEqual(firstTopics.map(({ title, position }) => ({ title, position })), [
       { title: '旧议题乙', position: 1 },
       { title: '旧议题丙', position: 2 },
       { title: '旧议题甲', position: 3 },
     ]);
+    assert.deepEqual(firstTopics.map(({ revision }) => revision), [1, 1, 1]);
     await firstStart.close();
 
     const verifyBusinessData = new Database(databasePath);
     const afterRows = verifyBusinessData.prepare('SELECT * FROM topics ORDER BY id').all() as Array<Record<string, unknown> & { position: number }>;
-    const legacyBusinessColumns = ({ position: _position, meeting_url: _meetingUrl, ...row }: Record<string, unknown> & { position: number }) => row;
+    const legacyBusinessColumns = ({ position: _position, meeting_url: _meetingUrl, revision: _revision, ...row }: Record<string, unknown> & { position: number }) => row;
     assert.deepEqual(afterRows.map(legacyBusinessColumns), beforeRows.map(legacyBusinessColumns));
     verifyBusinessData.close();
 
@@ -621,11 +811,15 @@ describe('数据库兼容性与并发', () => {
       payload: { title: '并发火种', summary: '只能被一个人成功认领。', proposer: '发起人', tags: [] },
     });
     const id = created.json().id as number;
+    const revision = created.json().revision as number;
     const [first, second] = await Promise.all([
-      firstApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '认领人甲' } }),
-      secondApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '认领人乙' } }),
+      firstApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, headers: ifMatch(revision), payload: { presenter: '认领人甲' } }),
+      secondApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, headers: ifMatch(revision), payload: { presenter: '认领人乙' } }),
     ]);
-    assert.deepEqual([first.statusCode, second.statusCode].sort(), [200, 409]);
+    assert.deepEqual([first.statusCode, second.statusCode].sort(), [200, 412]);
+    const loser = first.statusCode === 412 ? first : second;
+    assert.equal(loser.json().code, 'TOPIC_REVISION_CONFLICT');
+    assert.equal(loser.json().currentRevision, revision + 1);
     const winner = first.statusCode === 200 ? first.json().presenter : second.json().presenter;
     const topics = await firstApp.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(topics.json()[0].presenter, winner);
@@ -651,23 +845,31 @@ describe('数据库兼容性与并发', () => {
       payload: { title: '并发编辑议题', summary: '编辑标题时另一实例进行排期。', proposer: '发起人', tags: [] },
     });
     const id = created.json().id as number;
-    await lifecycleApp.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '分享人' } });
+    const claimed = await lifecycleApp.inject({
+      method: 'POST', url: `/api/topics/${id}/claim`, headers: ifMatch(created.json().revision), payload: { presenter: '分享人' },
+    });
+    assert.equal(claimed.statusCode, 200);
 
-    const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { title: '并发后的新标题' } });
+    const pendingEdit = editingApp.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(claimed.json().revision), payload: { title: '并发后的新标题' },
+    });
     await readReached;
     const scheduledAt = new Date(Date.now() + 86_400_000).toISOString();
     const scheduled = await lifecycleApp.inject({
       method: 'POST', url: `/api/topics/${id}/schedule`,
+      headers: ifMatch(claimed.json().revision),
       payload: { scheduledAt, duration: 50, room: '并发测试会议室' },
     });
     assert.equal(scheduled.statusCode, 200);
     releaseUpdate();
     const edited = await pendingEdit;
-    assert.equal(edited.statusCode, 200);
+    assert.equal(edited.statusCode, 412);
+    assert.equal(edited.json().code, 'TOPIC_REVISION_CONFLICT');
+    assert.equal(edited.json().currentRevision, claimed.json().revision + 1);
 
     const topics = await lifecycleApp.inject({ method: 'GET', url: '/api/topics' });
     const finalTopic = topics.json()[0];
-    assert.equal(finalTopic.title, '并发后的新标题');
+    assert.equal(finalTopic.title, '并发编辑议题');
     assert.equal(finalTopic.status, 'SCHEDULED');
     assert.equal(finalTopic.presenter, '分享人');
     assert.equal(finalTopic.scheduledAt, scheduledAt);
@@ -683,13 +885,15 @@ describe('数据库兼容性与并发', () => {
       name: string;
       setup?: (instance: FastifyInstance, id: number) => Promise<void>;
       editPayload: Record<string, unknown>;
-      transition: (instance: FastifyInstance, id: number) => Promise<{ statusCode: number }>;
+      transition: (instance: FastifyInstance, id: number, revision: number) => Promise<{ statusCode: number }>;
       verify: (topic: Record<string, unknown>) => void;
     };
     const scheduledAt = new Date(Date.now() + 86_400_000).toISOString();
     const schedule = async (instance: FastifyInstance, id: number) => {
+      const revision = (await readTopic(instance, id)).revision;
       const response = await instance.inject({
         method: 'POST', url: `/api/topics/${id}/schedule`,
+        headers: ifMatch(revision),
         payload: { scheduledAt, duration: 45, room: '原排期会议室', meetingUrl: 'https://meet.example.test/original' },
       });
       assert.equal(response.statusCode, 200);
@@ -698,7 +902,7 @@ describe('数据库兼容性与并发', () => {
       {
         name: '退出认领',
         editPayload: { presenter: '陈旧分享人' },
-        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} }),
+        transition: (instance, id, revision) => instance.inject({ method: 'POST', url: `/api/topics/${id}/release`, headers: ifMatch(revision), payload: {} }),
         verify: (topic) => {
           assert.equal(topic.status, 'OPEN');
           assert.equal(topic.presenter, null);
@@ -708,7 +912,7 @@ describe('数据库兼容性与并发', () => {
         name: '取消排期',
         setup: schedule,
         editPayload: { scheduledAt: new Date(Date.now() + 172_800_000).toISOString(), duration: 60, room: '陈旧新地点' },
-        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} }),
+        transition: (instance, id, revision) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(revision), payload: {} }),
         verify: (topic) => {
           assert.equal(topic.status, 'CLAIMED');
           assert.equal(topic.scheduledAt, null);
@@ -720,14 +924,16 @@ describe('数据库兼容性与并发', () => {
         name: '撤销归档',
         setup: async (instance, id) => {
           await schedule(instance, id);
+          const revision = (await readTopic(instance, id)).revision;
           const response = await instance.inject({
             method: 'POST', url: `/api/topics/${id}/archive`,
+            headers: ifMatch(revision),
             payload: { takeaway: '原始沉淀', materialUrl: 'https://example.test/original' },
           });
           assert.equal(response.statusCode, 200);
         },
         editPayload: { takeaway: '陈旧沉淀', materialUrl: 'https://example.test/stale' },
-        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} }),
+        transition: (instance, id, revision) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(revision), payload: {} }),
         verify: (topic) => {
           assert.equal(topic.status, 'SCHEDULED');
           assert.equal(topic.takeaway, null);
@@ -755,15 +961,19 @@ describe('数据库兼容性与并发', () => {
       });
       const id = created.json().id as number;
       await raceCase.setup?.(lifecycleApp, id);
+      const snapshotRevision = (await readTopic(lifecycleApp, id)).revision;
 
-      const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: raceCase.editPayload });
+      const pendingEdit = editingApp.inject({
+        method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(snapshotRevision), payload: raceCase.editPayload,
+      });
       await readReached;
-      const transitioned = await raceCase.transition(lifecycleApp, id);
+      const transitioned = await raceCase.transition(lifecycleApp, id, snapshotRevision);
       assert.equal(transitioned.statusCode, 200, `${raceCase.name}应成功`);
       releaseUpdate();
       const edited = await pendingEdit;
-      assert.equal(edited.statusCode, 409, `${raceCase.name}后陈旧编辑应冲突`);
-      assert.equal(edited.json().code, 'TOPIC_STATE_CONFLICT');
+      assert.equal(edited.statusCode, 412, `${raceCase.name}后陈旧编辑应冲突`);
+      assert.equal(edited.json().code, 'TOPIC_REVISION_CONFLICT');
+      assert.equal(edited.json().currentRevision, snapshotRevision + 1);
       const topics = await lifecycleApp.inject({ method: 'GET', url: '/api/topics' });
       raceCase.verify(topics.json()[0] as Record<string, unknown>);
 
@@ -790,10 +1000,13 @@ describe('数据库兼容性与并发', () => {
       payload: { title: '并发删除', summary: '删除后不能被编辑复活。', proposer: '发起人', presenter: '分享人', tags: [] },
     });
     const id = created.json().id as number;
+    const revision = created.json().revision as number;
 
-    const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { presenter: '陈旧分享人' } });
+    const pendingEdit = editingApp.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(revision), payload: { presenter: '陈旧分享人' },
+    });
     await readReached;
-    assert.equal((await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}` })).statusCode, 204);
+    assert.equal((await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(revision) })).statusCode, 204);
     releaseUpdate();
     const edited = await pendingEdit;
     assert.equal(edited.statusCode, 404);
@@ -838,8 +1051,10 @@ describe('数据库兼容性与并发', () => {
     assert.equal(staleAfterCreate.statusCode, 409);
 
     const beforeDelete = await firstApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
-    const beforeDeleteIds = (beforeDelete.json() as { id: number }[]).map(({ id }) => id);
-    await secondApp.inject({ method: 'DELETE', url: `/api/topics/${beforeDeleteIds.at(-1)}` });
+    const beforeDeleteTopics = beforeDelete.json() as { id: number; revision: number }[];
+    const beforeDeleteIds = beforeDeleteTopics.map(({ id }) => id);
+    const deleteTarget = beforeDeleteTopics.at(-1)!;
+    await secondApp.inject({ method: 'DELETE', url: `/api/topics/${deleteTarget.id}`, headers: ifMatch(deleteTarget.revision) });
     const staleAfterDelete = await firstApp.inject({
       method: 'POST', url: '/api/topics/reorder',
       payload: { orderedIds: beforeDeleteIds, baseVersion: Number(beforeDelete.headers['x-order-version']) },

@@ -3,6 +3,7 @@ export type TopicStatus = 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED';
 export interface Topic {
   id: number;
   position: number;
+  revision: number;
   title: string;
   summary: string;
   proposer: string;

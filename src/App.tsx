@@ -630,7 +630,21 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const dialogRef = useDialogA11y(onClose);
+  const [editRevision, setEditRevision] = useState(topic?.revision ?? 1);
+  const [revisionConflict, setRevisionConflict] = useState('');
+  const [revisionConflictAttempt, setRevisionConflictAttempt] = useState(0);
+  const revisionConflictRef = useRef<HTMLDivElement>(null);
+  const conflictCloseHandled = useRef(false);
+  function closeModal() {
+    if (kind === 'edit' && revisionConflict && onConflict) {
+      if (conflictCloseHandled.current) return;
+      conflictCloseHandled.current = true;
+      onConflict('已放弃本地草稿');
+      return;
+    }
+    onClose();
+  }
+  const dialogRef = useDialogA11y(closeModal);
   const copy = {
     create: { eyebrow: 'ADD A SPARK', title: '发起一个新议题', intro: '不必是完整答案，一个真实的问题就足够成为火种。' },
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
@@ -642,6 +656,73 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
     edit: { eyebrow: 'TEND THE FIRE', title: '编辑议题', intro: '更新议题信息，让每一位围炉伙伴看到准确的线索。' },
     delete: { eyebrow: 'REMOVE A SPARK', title: '删除这个议题？', intro: '删除后，相关的认领、排期与归档信息也会永久消失。' },
   }[kind];
+
+  useEffect(() => {
+    if (!revisionConflict) return;
+    const frame = window.requestAnimationFrame(() => revisionConflictRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [revisionConflict, revisionConflictAttempt]);
+
+  function editPayload(data: FormData) {
+    if (!topic) return {} as Parameters<typeof api.update>[2];
+    const payload: Parameters<typeof api.update>[2] = {};
+    const text = (name: string) => String(data.get(name) ?? '').trim();
+    const tags = () => text('tags').split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
+    const setTextIfChanged = <Key extends 'title' | 'summary' | 'proposer' | 'presenter' | 'room' | 'meetingUrl' | 'takeaway' | 'materialUrl'>(
+      key: Key,
+      original: string | null,
+    ) => {
+      const value = text(key);
+      if (value !== (original ?? '').trim()) payload[key] = value;
+    };
+
+    setTextIfChanged('title', topic.title);
+    setTextIfChanged('summary', topic.summary);
+    setTextIfChanged('proposer', topic.proposer);
+    const nextTags = tags();
+    if (nextTags.length !== topic.tags.length || nextTags.some((tag, index) => tag !== topic.tags[index])) payload.tags = nextTags;
+    if (data.has('presenter')) setTextIfChanged('presenter', topic.presenter);
+    if (data.has('scheduledAt')) {
+      const value = text('scheduledAt');
+      if (value !== formatDateTimeInput(topic.scheduledAt)) payload.scheduledAt = new Date(value).toISOString();
+    }
+    if (data.has('duration')) {
+      const value = Number(data.get('duration'));
+      if (value !== topic.duration) payload.duration = value;
+    }
+    if (data.has('room')) setTextIfChanged('room', legacyMeetingUrl(topic.room) ? '线上会议' : topic.room);
+    if (data.has('meetingUrl')) setTextIfChanged('meetingUrl', topicMeetingUrl(topic));
+    if (data.has('takeaway')) setTextIfChanged('takeaway', topic.takeaway);
+    if (data.has('materialUrl')) setTextIfChanged('materialUrl', topic.materialUrl);
+    return payload;
+  }
+
+  async function recoverEditConflict(conflict: ApiError) {
+    if (!topic || !onConflict) {
+      setError('议题版本已变化，请关闭后刷新再试');
+      setSubmitting(false);
+      return;
+    }
+    try {
+      const latest = await api.topic(topic.id);
+      if (latest.status !== topic.status) {
+        onConflict('议题状态已变化，本次修改未执行');
+        return;
+      }
+      setEditRevision(latest.revision);
+      setRevisionConflict(`${conflict.message}。你的表单内容仍然保留；再次保存会基于最新版重试，关闭则放弃草稿并同步最新版。`);
+      setRevisionConflictAttempt((attempt) => attempt + 1);
+      setError('');
+      setSubmitting(false);
+    } catch (latestError) {
+      if (latestError instanceof ApiError && latestError.status === 404) {
+        onConflict('议题已被删除，本次修改未执行');
+        return;
+      }
+      setError(latestError instanceof Error ? `已检测到版本冲突，但读取最新版失败：${latestError.message}` : '已检测到版本冲突，但读取最新版失败，请稍后重试');
+      setSubmitting(false);
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -661,10 +742,10 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
         });
         onComplete(selfPresent ? '议题已发布并由你分享，接下来可以安排时间' : '新火种已放到炉边，等待同伴认领');
       } else if (kind === 'claim' && topic) {
-        await api.claim(topic.id, String(data.get('presenter')));
+        await api.claim(topic.id, topic.revision, String(data.get('presenter')));
         onComplete('认领成功，期待你把好奇变成一次分享');
       } else if (kind === 'schedule' && topic) {
-        await api.schedule(topic.id, {
+        await api.schedule(topic.id, topic.revision, {
           scheduledAt: new Date(String(data.get('scheduledAt'))).toISOString(),
           duration: Number(data.get('duration')),
           room: String(data.get('room')),
@@ -672,41 +753,44 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
         });
         onComplete('排期完成，炉边已经为这次分享留好位置');
       } else if (kind === 'archive' && topic) {
-        await api.archive(topic.id, {
+        await api.archive(topic.id, topic.revision, {
           takeaway: String(data.get('takeaway')),
           materialUrl: String(data.get('materialUrl')),
         });
         onComplete('议题已归档，这簇火光被好好保存了');
       } else if (kind === 'release' && topic) {
-        await api.release(topic.id);
+        await api.release(topic.id, topic.revision);
         onComplete('议题已重新开放认领');
       } else if (kind === 'unschedule' && topic) {
-        await api.unschedule(topic.id);
+        await api.unschedule(topic.id, topic.revision);
         onComplete('排期已取消，议题回到准备中');
       } else if (kind === 'unarchive' && topic) {
-        await api.unarchive(topic.id);
+        await api.unarchive(topic.id, topic.revision);
         onComplete('归档已撤销，议题恢复为已排期');
       } else if (kind === 'edit' && topic) {
-        const payload: Parameters<typeof api.update>[1] = {
-          title: String(data.get('title')),
-          summary: String(data.get('summary')),
-          proposer: String(data.get('proposer')),
-          tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
-        };
-        if (data.has('presenter')) payload.presenter = String(data.get('presenter'));
-        if (data.has('scheduledAt')) payload.scheduledAt = new Date(String(data.get('scheduledAt'))).toISOString();
-        if (data.has('duration')) payload.duration = Number(data.get('duration'));
-        if (data.has('room')) payload.room = String(data.get('room'));
-        if (data.has('meetingUrl')) payload.meetingUrl = String(data.get('meetingUrl'));
-        if (data.has('takeaway')) payload.takeaway = String(data.get('takeaway'));
-        if (data.has('materialUrl')) payload.materialUrl = String(data.get('materialUrl'));
-        await api.update(topic.id, payload);
+        const payload = editPayload(data);
+        if (Object.keys(payload).length === 0) {
+          setError('没有需要保存的修改');
+          setSubmitting(false);
+          return;
+        }
+        await api.update(topic.id, editRevision, payload);
         onComplete('议题信息已更新');
       } else if (kind === 'delete' && topic) {
-        await api.remove(topic.id);
+        await api.remove(topic.id, topic.revision);
         onComplete('议题已删除');
       }
     } catch (err) {
+      if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
+        if (kind === 'edit') {
+          await recoverEditConflict(err);
+          return;
+        }
+        if (onConflict) {
+          onConflict(err.message);
+          return;
+        }
+      }
       if (err instanceof ApiError && err.status === 409 && onConflict) {
         onConflict(err.message);
         return;
@@ -717,9 +801,9 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
   }
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && closeModal()}>
       <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1}>
-        <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
+        <button className="modal-close" onClick={closeModal} aria-label="关闭"><X size={19} /></button>
         <span className="modal-eyebrow"><Sparkles size={14} />{copy.eyebrow}</span>
         <h2 id="modal-title">{copy.title}</h2>
         <p className="modal-intro">{copy.intro}</p>
@@ -777,9 +861,10 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
           {kind === 'release' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>分享人署名会被清空，议题内容继续保留。</span></p></div>}
           {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>日历事件与现有报名会被移除，分享人和议题内容继续保留。</span></p></div>}
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
+          {revisionConflict && <div ref={revisionConflictRef} className="form-error" role="alert" tabIndex={-1}>{revisionConflict}</div>}
           {error && <div className="form-error" role="alert">{error}</div>}
           <button className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
-            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? '保存修改' : '确认删除'}
+            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? revisionConflict ? '基于最新版再次保存' : '保存修改' : '确认删除'}
             {!submitting && <ChevronRight size={17} />}
           </button>
         </form>

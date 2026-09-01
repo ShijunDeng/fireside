@@ -30,5 +30,6 @@
 | [SPEC-002](./SPEC-002-crud-sort-calendar.md) | Accepted | 完整 CRUD、持久化排序、月历与周历 |
 | [SPEC-003](./SPEC-003-quality-loop.md) | Implementing | 独立 agent 持续审查与质量收敛循环 |
 | [SPEC-004](./SPEC-004-end-to-end-collaboration.md) | Implementing | 端到端协作、参会、宣讲海报与公网写入边界 |
+| [SPEC-005](./SPEC-005-topic-revision.md) | Accepted | 议题聚合版本、If-Match 并发保护与陈旧操作恢复 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

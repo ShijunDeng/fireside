@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -86,13 +86,13 @@ export function buildApp(options: AppOptions = {}) {
   const writeKey = options.writeKey ?? process.env.FIRESIDE_WRITE_KEY ?? '';
   const databasePath = options.databasePath ?? process.env.DATABASE_PATH ?? path.join(projectRoot, 'data', 'fireside.db');
   const db = createDatabase(databasePath, options.seed ?? true);
+  const expectedRevisions = new WeakMap<FastifyRequest, number>();
   const readOrderVersion = () => (db.prepare('SELECT version FROM topic_order_state WHERE id = 1').get() as { version: number }).version;
   const bumpOrderVersion = () => db.prepare('UPDATE topic_order_state SET version = version + 1 WHERE id = 1').run();
   const setPositions = (orderedIds: number[]) => {
-    const update = db.prepare('UPDATE topics SET position = ?, updated_at = ? WHERE id = ?');
-    const now = new Date().toISOString();
-    orderedIds.forEach((id, index) => update.run(-(index + 1), now, id));
-    orderedIds.forEach((id, index) => update.run(index + 1, now, id));
+    const update = db.prepare('UPDATE topics SET position = ? WHERE id = ?');
+    orderedIds.forEach((id, index) => update.run(-(index + 1), id));
+    orderedIds.forEach((id, index) => update.run(index + 1, id));
   };
 
   app.addHook('onClose', async () => db.close());
@@ -110,6 +110,39 @@ export function buildApp(options: AppOptions = {}) {
       return reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '需要正确的围炉口令才能继续协作' });
     }
   });
+
+  app.addHook('preHandler', async (request, reply) => {
+    const pathOnly = request.url.split('?')[0];
+    const directMutation = ['PATCH', 'DELETE'].includes(request.method) && /^\/api\/topics\/\d+$/.test(pathOnly);
+    const lifecycleMutation = request.method === 'POST'
+      && /^\/api\/topics\/\d+\/(?:claim|release|schedule|unschedule|archive|unarchive)$/.test(pathOnly);
+    if (!directMutation && !lifecycleMutation) return;
+    const header = request.headers['if-match'];
+    const candidate = Array.isArray(header) ? header.join(',') : header;
+    if (candidate === undefined) {
+      return reply.code(428).send({ code: 'TOPIC_REVISION_REQUIRED', message: '请刷新议题后再执行这个操作' });
+    }
+    const matched = /^"([1-9]\d*)"$/.exec(candidate);
+    const revision = matched ? Number(matched[1]) : Number.NaN;
+    if (!Number.isSafeInteger(revision)) {
+      return reply.code(400).send({ code: 'INVALID_TOPIC_REVISION', message: '议题版本格式不正确' });
+    }
+    expectedRevisions.set(request, revision);
+  });
+
+  const expectedRevision = (request: FastifyRequest) => expectedRevisions.get(request)!;
+  const topicCommandFailure = (reply: FastifyReply, id: number, revision: number, stateMessage: string) => {
+    const latest = db.prepare('SELECT revision FROM topics WHERE id = ?').get(id) as { revision: number } | undefined;
+    if (!latest) return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (latest.revision !== revision) {
+      return reply.code(412).send({
+        code: 'TOPIC_REVISION_CONFLICT',
+        message: '议题已被其他协作者更新，本次操作未执行',
+        currentRevision: latest.revision,
+      });
+    }
+    return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: stateMessage });
+  };
 
   app.get('/api/health', async () => ({ ok: true, service: 'fireside', time: new Date().toISOString() }));
   app.get('/api/access', async () => ({ enabled: Boolean(writeKey) }));
@@ -168,6 +201,19 @@ export function buildApp(options: AppOptions = {}) {
     return (rows as Parameters<typeof rowToTopic>[0][]).map(toPublicTopic);
   });
 
+  app.get('/api/topics/:id', async (request, reply) => {
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const row = db.prepare(`
+      SELECT topics.*,
+        (SELECT COUNT(*) FROM topic_participants WHERE topic_id = topics.id) AS participant_count
+      FROM topics WHERE id = ?
+    `).get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+    return row
+      ? toPublicTopic(row)
+      : reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+  });
+
   app.get('/api/stats', async () => {
     const grouped = db.prepare('SELECT status, COUNT(*) AS count FROM topics GROUP BY status').all() as { status: string; count: number }[];
     const counts = Object.fromEntries(grouped.map(({ status, count }) => [status, count]));
@@ -207,8 +253,12 @@ export function buildApp(options: AppOptions = {}) {
       return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
     }
     const row = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!row) return reply.code(404).send({ message: '没有找到这个议题' });
+    if (!row) return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
     const current = rowToTopic(row);
+    const revision = expectedRevision(request);
+    if (current.revision !== revision) {
+      return topicCommandFailure(reply, params.data.id, revision, '当前状态不能修改这些字段，请按议题流程操作');
+    }
     const fieldsByStatus = {
       OPEN: ['presenter', 'scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl'],
       CLAIMED: ['scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl'],
@@ -233,29 +283,34 @@ export function buildApp(options: AppOptions = {}) {
     if (body.data.materialUrl !== undefined) updates.push({ column: 'material_url', value: body.data.materialUrl || null });
     updates.push({ column: 'updated_at', value: new Date().toISOString() });
     const requiresStateMatch = Object.keys(body.data).some((field) => stateRestrictedEditFields.has(field));
-    const result = db.prepare(`UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')} WHERE id = ?${requiresStateMatch ? ' AND status = ?' : ''}`)
-      .run(...updates.map(({ value }) => value), params.data.id, ...(requiresStateMatch ? [current.status] : []));
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '议题状态已变化，已同步最新结果，请重新确认后再编辑' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    const updated = db.prepare(`
+      UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')}, revision = revision + 1
+      WHERE id = ? AND revision = ?${requiresStateMatch ? ' AND status = ?' : ''}
+      RETURNING *
+    `).get(...updates.map(({ value }) => value), params.data.id, revision, ...(requiresStateMatch ? [current.status] : [])) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '议题状态已变化，请重新确认后再编辑');
+    return toPublicTopic(updated);
   });
 
   app.delete('/api/topics/:id', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const deleted = db.transaction(() => {
-      const result = db.prepare('DELETE FROM topics WHERE id = ?').run(params.data.id);
-      if (result.changes === 0) return false;
+    const revision = expectedRevision(request);
+    const outcome = db.transaction(() => {
+      const result = db.prepare('DELETE FROM topics WHERE id = ? AND revision = ?').run(params.data.id, revision);
+      if (result.changes === 0) {
+        const latest = db.prepare('SELECT revision FROM topics WHERE id = ?').get(params.data.id) as { revision: number } | undefined;
+        return latest ? { status: 'conflict' as const, currentRevision: latest.revision } : { status: 'missing' as const };
+      }
       const remainingIds = (db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[]).map(({ id }) => id);
       setPositions(remainingIds);
       bumpOrderVersion();
-      return true;
+      return { status: 'deleted' as const };
     }).immediate();
-    if (!deleted) return reply.code(404).send({ message: '没有找到这个议题' });
+    if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (outcome.status === 'conflict') {
+      return reply.code(412).send({ code: 'TOPIC_REVISION_CONFLICT', message: '议题已被其他协作者更新，本次未删除', currentRevision: outcome.currentRevision });
+    }
     reply.header('X-Order-Version', String(readOrderVersion()));
     return reply.code(204).send();
   });
@@ -288,29 +343,25 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     const body = claimSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
-    const result = db.prepare("UPDATE topics SET presenter = ?, status = 'CLAIMED', updated_at = ? WHERE id = ? AND status = 'OPEN'")
-      .run(body.data.presenter, new Date().toISOString(), params.data.id);
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '这个议题已经被认领或排期' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    const revision = expectedRevision(request);
+    const updated = db.prepare(`
+      UPDATE topics SET presenter = ?, status = 'CLAIMED', updated_at = ?, revision = revision + 1
+      WHERE id = ? AND status = 'OPEN' AND revision = ? RETURNING *
+    `).get(body.data.presenter, new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '这个议题已经被认领或排期');
+    return toPublicTopic(updated);
   });
 
   app.post('/api/topics/:id/release', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const result = db.prepare("UPDATE topics SET presenter = NULL, status = 'OPEN', updated_at = ? WHERE id = ? AND status = 'CLAIMED'")
-      .run(new Date().toISOString(), params.data.id);
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '只有准备中的议题可以重新开放认领' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    const revision = expectedRevision(request);
+    const updated = db.prepare(`
+      UPDATE topics SET presenter = NULL, status = 'OPEN', updated_at = ?, revision = revision + 1
+      WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING *
+    `).get(new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有准备中的议题可以重新开放认领');
+    return toPublicTopic(updated);
   });
 
   app.post('/api/topics/:id/schedule', async (request, reply) => {
@@ -320,37 +371,35 @@ export function buildApp(options: AppOptions = {}) {
     if (analyzeMeetingRoom(body.data.room).sensitive) {
       return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
     }
-    const result = db.prepare("UPDATE topics SET scheduled_at = ?, duration = ?, room = ?, meeting_url = ?, status = 'SCHEDULED', updated_at = ? WHERE id = ? AND status = 'CLAIMED'")
-      .run(body.data.scheduledAt, body.data.duration, body.data.room, body.data.meetingUrl || null, new Date().toISOString(), params.data.id);
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '议题需要先被认领，才能安排分享' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    const revision = expectedRevision(request);
+    const updated = db.prepare(`
+      UPDATE topics
+      SET scheduled_at = ?, duration = ?, room = ?, meeting_url = ?, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
+      WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING *
+    `).get(body.data.scheduledAt, body.data.duration, body.data.room, body.data.meetingUrl || null, new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '议题需要先被认领，才能安排分享');
+    return toPublicTopic(updated);
   });
 
   app.post('/api/topics/:id/unschedule', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const revision = expectedRevision(request);
     const outcome = db.transaction(() => {
-      const result = db.prepare(`
+      const updated = db.prepare(`
         UPDATE topics
-        SET scheduled_at = NULL, duration = NULL, room = NULL, meeting_url = NULL, status = 'CLAIMED', updated_at = ?
-        WHERE id = ? AND status = 'SCHEDULED'
-      `).run(new Date().toISOString(), params.data.id);
-      if (result.changes === 0) return false;
+        SET scheduled_at = NULL, duration = NULL, room = NULL, meeting_url = NULL,
+            status = 'CLAIMED', updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'SCHEDULED' AND revision = ? RETURNING *
+      `).get(new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+      if (!updated) return null;
       db.prepare('DELETE FROM topic_participants WHERE topic_id = ?').run(params.data.id);
-      return true;
+      return updated;
     }).immediate();
     if (!outcome) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '只有已排期的议题可以取消排期' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
+      return topicCommandFailure(reply, params.data.id, revision, '只有已排期的议题可以取消排期');
     }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(outcome);
   });
 
   app.post('/api/topics/:id/archive', async (request, reply) => {
@@ -358,32 +407,26 @@ export function buildApp(options: AppOptions = {}) {
     const body = archiveSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
     const now = new Date().toISOString();
-    const result = db.prepare("UPDATE topics SET takeaway = ?, material_url = ?, status = 'ARCHIVED', archived_at = ?, updated_at = ? WHERE id = ? AND status = 'SCHEDULED'")
-      .run(body.data.takeaway, body.data.materialUrl || null, now, now, params.data.id);
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '只有已排期的议题可以归档' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    const revision = expectedRevision(request);
+    const updated = db.prepare(`
+      UPDATE topics SET takeaway = ?, material_url = ?, status = 'ARCHIVED', archived_at = ?, updated_at = ?, revision = revision + 1
+      WHERE id = ? AND status = 'SCHEDULED' AND revision = ? RETURNING *
+    `).get(body.data.takeaway, body.data.materialUrl || null, now, now, params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有已排期的议题可以归档');
+    return toPublicTopic(updated);
   });
 
   app.post('/api/topics/:id/unarchive', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const result = db.prepare(`
+    const revision = expectedRevision(request);
+    const updated = db.prepare(`
       UPDATE topics
-      SET takeaway = NULL, material_url = NULL, archived_at = NULL, status = 'SCHEDULED', updated_at = ?
-      WHERE id = ? AND status = 'ARCHIVED'
-    `).run(new Date().toISOString(), params.data.id);
-    if (result.changes === 0) {
-      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-      return exists
-        ? reply.code(409).send({ message: '只有已归档的议题可以撤销归档' })
-        : reply.code(404).send({ message: '没有找到这个议题' });
-    }
-    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+      SET takeaway = NULL, material_url = NULL, archived_at = NULL, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
+      WHERE id = ? AND status = 'ARCHIVED' AND revision = ? RETURNING *
+    `).get(new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有已归档的议题可以撤销归档');
+    return toPublicTopic(updated);
   });
 
   app.get('/api/topics/:id/meeting-access', async (request, reply) => {
@@ -422,6 +465,7 @@ export function buildApp(options: AppOptions = {}) {
       const now = new Date().toISOString();
       const result = db.prepare('INSERT INTO topic_participants (topic_id, name, normalized_name, created_at) VALUES (?, ?, ?, ?)')
         .run(params.data.id, body.data.name, normalizedName, now);
+      db.prepare('UPDATE topics SET revision = revision + 1, updated_at = ? WHERE id = ?').run(now, params.data.id);
       return { status: 'ok' as const, participant: { id: Number(result.lastInsertRowid), topicId: params.data.id, name: body.data.name, createdAt: now } };
     }).immediate();
     if (outcome.status === 'missing') return reply.code(404).send({ message: '没有找到这个议题' });
@@ -442,7 +486,9 @@ export function buildApp(options: AppOptions = {}) {
       if (topic.status !== 'SCHEDULED') return 'invalid' as const;
       const result = db.prepare('DELETE FROM topic_participants WHERE id = ? AND topic_id = ?')
         .run(params.data.participantId, params.data.id);
-      return result.changes === 1 ? 'ok' as const : 'missing-participant' as const;
+      if (result.changes !== 1) return 'missing-participant' as const;
+      db.prepare('UPDATE topics SET revision = revision + 1, updated_at = ? WHERE id = ?').run(new Date().toISOString(), params.data.id);
+      return 'ok' as const;
     }).immediate();
     if (outcome === 'missing-topic') return reply.code(404).send({ message: '没有找到这个议题' });
     if (outcome === 'invalid') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '活动已结束或取消，不能修改报名' });

@@ -7,6 +7,7 @@ function topic(overrides: Partial<Topic> = {}): Topic {
   return {
     id: 1,
     position: 1,
+    revision: 1,
     title: '把好奇举成一支火炬',
     summary: '从真实的问题出发，分享一次仍在生长的探索。',
     proposer: '发起人',

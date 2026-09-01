@@ -1,8 +1,21 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type APIRequestContext } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
 const writeKey = 'e2e-fireside-write-key';
 const writeHeaders = { 'X-Fireside-Write-Key': writeKey };
+const revisionHeaders = (revision: number) => ({ ...writeHeaders, 'If-Match': `"${revision}"` });
+
+async function latestTopic(request: APIRequestContext, id: number) {
+  const response = await request.get(`/api/topics/${id}`);
+  if (!response.ok()) throw new Error(`Failed to read topic ${id}: ${response.status()}`);
+  return response.json() as Promise<{ id: number; revision: number; title: string }>;
+}
+
+async function deleteLatestTopic(request: APIRequestContext, id: number) {
+  const topic = await latestTopic(request, id);
+  const response = await request.delete(`/api/topics/${id}`, { headers: revisionHeaders(topic.revision) });
+  if (response.status() !== 204) throw new Error(`Failed to delete topic ${id}: ${response.status()}`);
+}
 
 test.describe('议题管理工作台', () => {
   test.beforeEach(async ({ page }) => {
@@ -168,8 +181,8 @@ test.describe('议题管理工作台', () => {
     const created = await request.post('/api/topics', { headers: writeHeaders, data: {
       title: protectedTitle, summary: '公开页面可以看到议题，但不能看到会议凭证和报名姓名。', proposer: '隐私组织者', presenter: '隐私组织者', tags: ['隐私'],
     } });
-    const topic = await created.json() as { id: number };
-    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+    const topic = await created.json() as { id: number; revision: number };
+    await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
       scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(), duration: 40, room: '三楼围炉会议室', meetingUrl: secretMeeting,
     } });
     await request.post(`/api/topics/${topic.id}/participants`, { headers: writeHeaders, data: { name: '不公开的报名人' } });
@@ -230,7 +243,7 @@ test.describe('议题管理工作台', () => {
     const cleanupIds = (await allTopics.json() as { id: number; title: string }[])
       .filter((item) => item.title === protectedTitle || item.title === retainedTitle)
       .map(({ id }) => id);
-    await Promise.all(cleanupIds.map((id) => request.delete(`/api/topics/${id}`, { headers: writeHeaders })));
+    await Promise.all(cleanupIds.map((id) => deleteLatestTopic(request, id)));
   });
 
   test('报名弹窗遇到活动状态冲突会关闭并同步权威结果', async ({ page, request }, testInfo) => {
@@ -238,24 +251,25 @@ test.describe('议题管理工作台', () => {
     const created = await request.post('/api/topics', { headers: writeHeaders, data: {
       title, summary: '打开报名后由另一位协调者归档。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
     } });
-    const topic = await created.json() as { id: number };
-    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+    const topic = await created.json() as { id: number; revision: number };
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
       scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '冲突测试会议室', meetingUrl: '',
     } });
+    const scheduledTopic = await scheduled.json() as { revision: number };
 
     await page.goto('/');
     const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
     await card.getByRole('button', { name: '报名参加' }).click();
     const dialog = page.getByRole('dialog');
     await dialog.getByLabel('你的名字').fill('晚到的参与者');
-    const archived = await request.post(`/api/topics/${topic.id}/archive`, { headers: writeHeaders, data: { takeaway: '由另一位协调者完成归档。', materialUrl: '' } });
+    const archived = await request.post(`/api/topics/${topic.id}/archive`, { headers: revisionHeaders(scheduledTopic.revision), data: { takeaway: '由另一位协调者完成归档。', materialUrl: '' } });
     expect(archived.status()).toBe(200);
     await dialog.getByRole('button', { name: '确认报名' }).click();
     await expect(dialog).toHaveCount(0);
     await expect(card).toContainText('已经归档');
     await expect(page.getByText(/已同步最新状态/)).toBeVisible();
 
-    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
+    await deleteLatestTopic(request, topic.id);
   });
 
   test('陈旧编辑遇到取消排期会关闭并同步权威状态', async ({ page, request }, testInfo) => {
@@ -263,17 +277,18 @@ test.describe('议题管理工作台', () => {
     const created = await request.post('/api/topics', { headers: writeHeaders, data: {
       title, summary: '编辑排期时由另一位协调者取消排期。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
     } });
-    const topic = await created.json() as { id: number };
-    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+    const topic = await created.json() as { id: number; revision: number };
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
       scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '原会议室', meetingUrl: '',
     } });
+    const scheduledTopic = await scheduled.json() as { revision: number };
 
     await page.goto('/');
     const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
     await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
     const dialog = page.getByRole('dialog');
     await dialog.getByLabel('地点 / 参与说明').fill('陈旧新地点');
-    const unscheduled = await request.post(`/api/topics/${topic.id}/unschedule`, { headers: writeHeaders, data: {} });
+    const unscheduled = await request.post(`/api/topics/${topic.id}/unschedule`, { headers: revisionHeaders(scheduledTopic.revision), data: {} });
     expect(unscheduled.status()).toBe(200);
     await dialog.getByRole('button', { name: '保存修改' }).click();
 
@@ -282,7 +297,123 @@ test.describe('议题管理工作台', () => {
     await expect(card).not.toContainText('陈旧新地点');
     await expect(page.getByText(/已同步最新状态/)).toBeVisible();
 
-    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
+    await deleteLatestTopic(request, topic.id);
+  });
+
+  test('陈旧内容编辑保留草稿，并由用户基于最新版显式重试', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `内容版本冲突验收-${marker}`;
+    const remoteTitle = `另一位协作者更新的标题-${marker}`;
+    const localSummary = `仍需保留的本地草稿-${marker}`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title, summary: '双方从同一份议题快照开始编辑。', proposer: '版本测试', tags: ['并发'],
+    } });
+    const topic = await created.json() as { id: number; revision: number };
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+    const dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '编辑议题' }) });
+    await dialog.getByLabel('一句话简介').fill(localSummary);
+
+    const remoteEdit = await request.patch(`/api/topics/${topic.id}`, {
+      headers: revisionHeaders(topic.revision),
+      data: { title: remoteTitle },
+    });
+    expect(remoteEdit.status()).toBe(200);
+    await dialog.getByRole('button', { name: '保存修改' }).click();
+
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole('alert')).toContainText('议题已被其他协作者更新');
+    await expect(dialog.getByLabel('一句话简介')).toHaveValue(localSummary);
+    await dialog.getByRole('button', { name: '基于最新版再次保存' }).click();
+
+    await expect(dialog).toHaveCount(0);
+    const mergedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: remoteTitle, exact: true }) });
+    await expect(mergedCard).toContainText(localSummary);
+    const latest = await request.get(`/api/topics/${topic.id}`);
+    expect(await latest.json()).toEqual(expect.objectContaining({ title: remoteTitle, summary: localSummary }));
+    await deleteLatestTopic(request, topic.id);
+  });
+
+  test('陈旧内容编辑可放弃草稿，并立即同步远端版本', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `放弃冲突草稿验收-${marker}`;
+    const remoteTitle = `远端权威标题-${marker}`;
+    const originalSummary = '关闭冲突弹窗时，本地草稿不能写入服务端。';
+    const localDraft = `应被放弃的本地简介-${marker}`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title, summary: originalSummary, proposer: '冲突恢复测试', tags: ['并发'],
+    } });
+    const topic = await created.json() as { id: number; revision: number };
+
+    await page.goto('/');
+    const originalCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await originalCard.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+    const dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '编辑议题' }) });
+    await dialog.getByLabel('一句话简介').fill(localDraft);
+
+    const remoteEdit = await request.patch(`/api/topics/${topic.id}`, {
+      headers: revisionHeaders(topic.revision),
+      data: { title: remoteTitle },
+    });
+    expect(remoteEdit.status()).toBe(200);
+    await dialog.getByRole('button', { name: '保存修改' }).click();
+    await expect(dialog.getByRole('alert')).toContainText('议题已被其他协作者更新');
+    await expect(dialog.getByLabel('一句话简介')).toHaveValue(localDraft);
+
+    await dialog.getByRole('button', { name: '关闭' }).click();
+    await expect(dialog).toHaveCount(0);
+    const syncedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: remoteTitle, exact: true }) });
+    await expect(syncedCard).toContainText(originalSummary);
+    await expect(syncedCard).not.toContainText(localDraft);
+    const latest = await request.get(`/api/topics/${topic.id}`);
+    expect(await latest.json()).toEqual(expect.objectContaining({ title: remoteTitle, summary: originalSummary }));
+    await deleteLatestTopic(request, topic.id);
+  });
+
+  test('陈旧删除拒绝抹掉新报名，并要求重新确认', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `陈旧删除报名保护-${marker}`;
+    const participantName = `新报名伙伴-${marker}`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title, summary: '删除确认期间的新报名必须被完整保留。', proposer: '删除测试', presenter: '删除测试', tags: ['报名'],
+    } });
+    const topic = await created.json() as { id: number; revision: number };
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, {
+      headers: revisionHeaders(topic.revision),
+      data: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 40, room: '版本测试会议室', meetingUrl: '' },
+    });
+    expect(scheduled.status()).toBe(200);
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
+    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
+    const joined = await request.post(`/api/topics/${topic.id}/participants`, {
+      headers: writeHeaders,
+      data: { name: participantName },
+    });
+    expect(joined.status()).toBe(201);
+    await page.getByRole('button', { name: '确认删除' }).click();
+
+    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toHaveCount(0);
+    await expect(page.getByText(/议题已被其他协作者更新/)).toBeVisible();
+    await expect(card).toBeVisible();
+    await expect(card).toContainText('1 人报名');
+    await card.getByRole('button', { name: /报名参加/ }).click();
+    const participantsDialog = page.getByRole('dialog');
+    await expect(participantsDialog.getByText(participantName)).toBeVisible();
+    await participantsDialog.getByRole('button', { name: '关闭' }).click();
+
+    await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
+    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
+    await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith(`/api/topics/${topic.id}`)
+        && response.request().method() === 'DELETE' && response.status() === 204),
+      page.getByRole('button', { name: '确认删除' }).click(),
+    ]);
+    await expect(card).toHaveCount(0);
   });
 
   test('未来排期一键生成脱敏的 1080×1440 PNG 海报并恢复焦点', async ({ page, request }, testInfo) => {
@@ -300,8 +431,8 @@ test.describe('议题管理工作台', () => {
       tags: ['海报', '密码: gamma'],
     } });
     expect(created.ok()).toBe(true);
-    const topic = await created.json() as { id: number };
-    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+    const topic = await created.json() as { id: number; revision: number };
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
       scheduledAt: future.toISOString(), duration: 45, room: '三楼围炉会议室', meetingUrl: secretUrl,
     } });
     expect(scheduled.ok()).toBe(true);
@@ -309,8 +440,8 @@ test.describe('议题管理工作台', () => {
       title: `过期海报验收 ${marker}`, summary: '过期排期不能继续宣传。', proposer: '海报测试', presenter: '海报测试', tags: [],
     } });
     expect(pastCreated.ok()).toBe(true);
-    const pastTopic = await pastCreated.json() as { id: number };
-    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { headers: writeHeaders, data: {
+    const pastTopic = await pastCreated.json() as { id: number; revision: number };
+    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { headers: revisionHeaders(pastTopic.revision), data: {
       scheduledAt: past.toISOString(), duration: 30, room: '旧会议室', meetingUrl: '',
     } });
     expect(pastScheduled.ok()).toBe(true);
@@ -367,8 +498,8 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByRole('img', { name: /围炉夜话宣讲海报/ })).toBeVisible();
     await page.getByRole('button', { name: '关闭' }).click();
 
-    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
-    await request.delete(`/api/topics/${pastTopic.id}`, { headers: writeHeaders });
+    await deleteLatestTopic(request, topic.id);
+    await deleteLatestTopic(request, pastTopic.id);
   });
 
   test('统计与五步说明进入真实功能', async ({ page }) => {
@@ -410,10 +541,10 @@ test.describe('议题管理工作台', () => {
         headers: writeHeaders,
         data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
       });
-      const topic = await created.json() as { id: number };
+      const topic = await created.json() as { id: number; revision: number };
       ids.push(topic.id);
       await request.post(`/api/topics/${topic.id}/schedule`, {
-        headers: writeHeaders,
+        headers: revisionHeaders(topic.revision),
         data: { scheduledAt: scheduledAt.toISOString(), duration: 30, room: '月历测试会议室', meetingUrl: '' },
       });
     }
@@ -437,7 +568,7 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByText('标签最多 5 个')).toBeVisible();
     await page.getByRole('button', { name: '关闭' }).click();
 
-    await Promise.all(ids.map((id) => request.delete(`/api/topics/${id}`, { headers: writeHeaders })));
+    await Promise.all(ids.map((id) => deleteLatestTopic(request, id)));
   });
 
   test('上移按钮保存手动顺序，刷新后保持', async ({ page }) => {

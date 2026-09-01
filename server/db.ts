@@ -7,6 +7,7 @@ import type { Topic, TopicStatus } from './types.js';
 type TopicRow = {
   id: number;
   position: number;
+  revision: number;
   title: string;
   summary: string;
   proposer: string;
@@ -29,6 +30,7 @@ export function rowToTopic(row: TopicRow): Topic {
   return {
     id: row.id,
     position: row.position,
+    revision: row.revision,
     title: row.title,
     summary: row.summary,
     proposer: row.proposer,
@@ -122,6 +124,7 @@ export function createDatabase(databasePath: string, seed = true) {
     CREATE TABLE IF NOT EXISTS topics (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       position INTEGER NOT NULL DEFAULT 0,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
       title TEXT NOT NULL,
       summary TEXT NOT NULL,
       proposer TEXT NOT NULL,
@@ -165,6 +168,9 @@ export function createDatabase(databasePath: string, seed = true) {
   }
   if (!columns.some((column) => column.name === 'meeting_url')) {
     db.exec('ALTER TABLE topics ADD COLUMN meeting_url TEXT');
+  }
+  if (!columns.some((column) => column.name === 'revision')) {
+    db.exec('ALTER TABLE topics ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)');
   }
   const positionIndex = (db.prepare("PRAGMA index_list('topics')").all() as { name: string; unique: number }[])
     .find(({ name }) => name === 'idx_topics_position');
