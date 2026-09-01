@@ -232,3 +232,4 @@
 - gate 竞态阻断 U：target 已启动后 controller 死亡，backup gate 可能先于 watchdog 得锁；若套用 service 的 no-restart 恢复，会出现运行 target、指针/许可却为 origin 的裂脑。service gate 只在旧进程已停时 no-restart；backup gate 必须完整授权 restart+health 后才清 journal并运行 runner，或保留 journal并让本次备份失败等待 watchdog。确定性故障注入必须同时核对 MainPID/cwd/current/selector/permit与实际 runner。
 - 写屏障时序阻断 V：先 revoke 再创建 journal 时，unlink 已可见而目录 fsync 失败会留下无 journal 永久 503。先持久化 journal/active marker再 revoke，失败统一恢复 origin；journal 后的陈旧 active marker由 gate/watchdog幂等清理。
 - 密钥隔离阻断 W：把 root gate 直接写进含 `EnvironmentFile=/etc/fireside.env` 的 app unit，会让 controller 及其子进程继承业务写口令。service gate 改为无 EnvironmentFile 的独立 root unit，controller入口先清除应用密钥；`/proc` 与哨兵验证 gate/watchdog/recovery/backup 均不继承，只有非 root Node 持有所需密钥。
+- 敏感 pending DB 阻断 X：bootstrap 原子替换前的完整数据库副本曾已 chown 给应用 UID，SIGKILL 会永久遗留 `.bootstrap.<pid>` 且 recovery 不清理。固定 root-only pending 名并纳入类型/所有者/链接数严格恢复清理；rename 后才降权最终主库，逐阶段崩溃注入证明无应用可读孤儿。
