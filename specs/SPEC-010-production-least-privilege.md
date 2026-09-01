@@ -58,10 +58,12 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - `ProtectKernelTunables=true`、`ProtectKernelModules=true`、`ProtectControlGroups=true`、`ProtectClock=true`、`ProtectHostname=true`；
 - `RestrictSUIDSGID=true`、`LockPersonality=true`、`RestrictRealtime=true`、`RestrictNamespaces=true`；
 - `ProtectProc=invisible`、`ProcSubset=pid`、`SystemCallArchitectures=native`；
-- `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`；
+- `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`；其中 `AF_NETLINK` 仅用于 Fastify 启动日志调用 Node `os.networkInterfaces()` 读取接口地址，应用仍无任何网络管理 capability；
 - 空 `CapabilityBoundingSet` 与 `AmbientCapabilities`。
 
 若某项与 Node/Fastify/SQLite 的实际运行冲突，只能在记录确定性失败证据后做最小放宽，并回写本规格；不得为追求评分加入未经运行验证的指令。
+
+首次真实 systemd 启动已确定性证明：只允许 UNIX/IPv4/IPv6 时，Fastify 的监听日志在 `uv_interface_addresses` 以 errno 97 失败并使进程退出；加入 `AF_NETLINK` 是维持现有启动日志所需的最小放宽，不恢复 root、capability、写系统目录或其他地址族。
 
 ## 4. 构建与版本化发布
 
