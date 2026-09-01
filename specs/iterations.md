@@ -206,3 +206,4 @@
 - 紧随项：页面承诺的周/月历参与闭环和 Pixel 当前日期定位；请求解析稳定 400/413/415。两者均已由独立证据确认，Iteration 023 完成后继续，不能停止循环。
 - 实现中独立审计阻断 A：生产 `systemd-run` 预检曾把 stdout 重定向到 `/dev/null`，而调用方用 command substitution 取得三次业务指纹，导致生产变量均为空且错误地“比较相等”；测试 hook 有输出所以未复现。修复必须让生产分支取得并解析非空 JSON 指纹，空/畸形输出直接拒绝，并以候选篡改指纹夹具证明不能切换。
 - 实现中独立审计阻断 B：recovery oneshot 曾由 app service 以 `Wants+After` 拉起且没有 `RemainAfterExit`；正常 promote 写 journal 后重启 app 会再次启动 recovery、撤销刚完成的切换，而 recovery 失败又不能阻止 app。修复必须使用失败可阻断的依赖与“本次开机只执行一次并保持 active-exited”的语义，真实 systemd restart 不得重跑 recovery；新 boot / 手动 recover 仍须恢复未完成 journal。
+- 修复复审阻断 C：开机 recovery 最初仍对共同维护锁使用非阻塞 `flock`；Persistent backup timer 若先取得共享锁，recovery 会立即 75，app 因 Requires 也无法启动且不会靠 `Restart=on-failure` 自动重试。开机 recovery 必须在有界时间等待既有维护任务，且 backup unit 本身也必须 `Requires+After` 同一个 active-exited recovery，保证应用与补跑备份两条启动路径都先完成恢复。
