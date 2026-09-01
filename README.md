@@ -25,7 +25,7 @@
 ```bash
 npm install
 npm run build
-PORT=80 HOST=0.0.0.0 npm start
+PORT=443 HOST=0.0.0.0 npm start
 ```
 
 默认数据库位于 `data/fireside.db`。可通过 `DATABASE_PATH` 指定其他位置。
@@ -69,4 +69,4 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now fireside
 ```
 
-服务监听 `0.0.0.0:80`，更新代码后运行 `npm ci && npm run build && sudo systemctl restart fireside`。
+服务监听 `0.0.0.0:443`，更新代码后运行 `npm ci && npm run build && sudo systemctl restart fireside`。当前应用直接提供 HTTP；如需标准 HTTPS，还需要在服务前配置 TLS 证书和反向代理。
