@@ -46,7 +46,7 @@ test.describe('议题管理工作台', () => {
     const card = page.getByRole('article').filter({ hasText: '浏览器 CRUD 验收议题' });
     await expect(card).toBeVisible();
 
-    await card.getByRole('button', { name: /编辑/ }).click();
+    await card.getByRole('button', { name: '编辑 浏览器 CRUD 验收议题', exact: true }).click();
     await page.getByLabel('议题标题').fill('已更新的 CRUD 验收议题');
     await page.getByRole('button', { name: '保存修改' }).click();
     const updatedCard = page.getByRole('article').filter({ hasText: '已更新的 CRUD 验收议题' });
@@ -249,6 +249,33 @@ test.describe('议题管理工作台', () => {
     await dialog.getByRole('button', { name: '确认报名' }).click();
     await expect(dialog).toHaveCount(0);
     await expect(card).toContainText('已经归档');
+    await expect(page.getByText(/已同步最新状态/)).toBeVisible();
+
+    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
+  });
+
+  test('陈旧编辑遇到取消排期会关闭并同步权威状态', async ({ page, request }, testInfo) => {
+    const title = `编辑冲突验收-${testInfo.project.name}-${Date.now()}`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title, summary: '编辑排期时由另一位协调者取消排期。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
+    } });
+    const topic = await created.json() as { id: number };
+    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+      scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '原会议室', meetingUrl: '',
+    } });
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByLabel('地点 / 参与说明').fill('陈旧新地点');
+    const unscheduled = await request.post(`/api/topics/${topic.id}/unschedule`, { headers: writeHeaders, data: {} });
+    expect(unscheduled.status()).toBe(200);
+    await dialog.getByRole('button', { name: '保存修改' }).click();
+
+    await expect(dialog).toHaveCount(0);
+    await expect(card).toContainText('已被认领');
+    await expect(card).not.toContainText('陈旧新地点');
     await expect(page.getByText(/已同步最新状态/)).toBeVisible();
 
     await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });

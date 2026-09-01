@@ -605,6 +605,130 @@ describe('数据库兼容性与并发', () => {
     await rm(directory, { recursive: true, force: true });
   });
 
+  it('状态相关编辑与反向生命周期交错时使用状态 CAS', async () => {
+    type RaceCase = {
+      name: string;
+      setup?: (instance: FastifyInstance, id: number) => Promise<void>;
+      editPayload: Record<string, unknown>;
+      transition: (instance: FastifyInstance, id: number) => Promise<{ statusCode: number }>;
+      verify: (topic: Record<string, unknown>) => void;
+    };
+    const scheduledAt = new Date(Date.now() + 86_400_000).toISOString();
+    const schedule = async (instance: FastifyInstance, id: number) => {
+      const response = await instance.inject({
+        method: 'POST', url: `/api/topics/${id}/schedule`,
+        payload: { scheduledAt, duration: 45, room: '原排期会议室', meetingUrl: 'https://meet.example.test/original' },
+      });
+      assert.equal(response.statusCode, 200);
+    };
+    const cases: RaceCase[] = [
+      {
+        name: '退出认领',
+        editPayload: { presenter: '陈旧分享人' },
+        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} }),
+        verify: (topic) => {
+          assert.equal(topic.status, 'OPEN');
+          assert.equal(topic.presenter, null);
+        },
+      },
+      {
+        name: '取消排期',
+        setup: schedule,
+        editPayload: { scheduledAt: new Date(Date.now() + 172_800_000).toISOString(), duration: 60, room: '陈旧新地点' },
+        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} }),
+        verify: (topic) => {
+          assert.equal(topic.status, 'CLAIMED');
+          assert.equal(topic.scheduledAt, null);
+          assert.equal(topic.duration, null);
+          assert.equal(topic.room, null);
+        },
+      },
+      {
+        name: '撤销归档',
+        setup: async (instance, id) => {
+          await schedule(instance, id);
+          const response = await instance.inject({
+            method: 'POST', url: `/api/topics/${id}/archive`,
+            payload: { takeaway: '原始沉淀', materialUrl: 'https://example.test/original' },
+          });
+          assert.equal(response.statusCode, 200);
+        },
+        editPayload: { takeaway: '陈旧沉淀', materialUrl: 'https://example.test/stale' },
+        transition: (instance, id) => instance.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} }),
+        verify: (topic) => {
+          assert.equal(topic.status, 'SCHEDULED');
+          assert.equal(topic.takeaway, null);
+          assert.equal(topic.materialUrl, null);
+        },
+      },
+    ];
+
+    for (const raceCase of cases) {
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-state-edit-race-'));
+      const databasePath = path.join(directory, 'shared.db');
+      let signalRead!: () => void;
+      let releaseUpdate!: () => void;
+      const readReached = new Promise<void>((resolve) => { signalRead = resolve; });
+      const updateReleased = new Promise<void>((resolve) => { releaseUpdate = resolve; });
+      const editingApp = buildApp({
+        databasePath, seed: false, serveStatic: false,
+        beforeTopicUpdate: async () => { signalRead(); await updateReleased; },
+      });
+      const lifecycleApp = buildApp({ databasePath, seed: false, serveStatic: false });
+      await Promise.all([editingApp.ready(), lifecycleApp.ready()]);
+      const created = await lifecycleApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title: `${raceCase.name}竞态`, summary: '状态转换必须胜过陈旧编辑。', proposer: '发起人', presenter: '原分享人', tags: [] },
+      });
+      const id = created.json().id as number;
+      await raceCase.setup?.(lifecycleApp, id);
+
+      const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: raceCase.editPayload });
+      await readReached;
+      const transitioned = await raceCase.transition(lifecycleApp, id);
+      assert.equal(transitioned.statusCode, 200, `${raceCase.name}应成功`);
+      releaseUpdate();
+      const edited = await pendingEdit;
+      assert.equal(edited.statusCode, 409, `${raceCase.name}后陈旧编辑应冲突`);
+      assert.equal(edited.json().code, 'TOPIC_STATE_CONFLICT');
+      const topics = await lifecycleApp.inject({ method: 'GET', url: '/api/topics' });
+      raceCase.verify(topics.json()[0] as Record<string, unknown>);
+
+      await Promise.all([editingApp.close(), lifecycleApp.close()]);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('状态相关编辑暂停期间被删除时返回 404', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-state-edit-delete-'));
+    const databasePath = path.join(directory, 'shared.db');
+    let signalRead!: () => void;
+    let releaseUpdate!: () => void;
+    const readReached = new Promise<void>((resolve) => { signalRead = resolve; });
+    const updateReleased = new Promise<void>((resolve) => { releaseUpdate = resolve; });
+    const editingApp = buildApp({
+      databasePath, seed: false, serveStatic: false,
+      beforeTopicUpdate: async () => { signalRead(); await updateReleased; },
+    });
+    const deletingApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await Promise.all([editingApp.ready(), deletingApp.ready()]);
+    const created = await deletingApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '并发删除', summary: '删除后不能被编辑复活。', proposer: '发起人', presenter: '分享人', tags: [] },
+    });
+    const id = created.json().id as number;
+
+    const pendingEdit = editingApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { presenter: '陈旧分享人' } });
+    await readReached;
+    assert.equal((await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}` })).statusCode, 204);
+    releaseUpdate();
+    const edited = await pendingEdit;
+    assert.equal(edited.statusCode, 404);
+
+    await Promise.all([editingApp.close(), deletingApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
+
   it('排序版本 CAS 阻止陈旧写并在成员变化后失效', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-order-cas-'));
     const databasePath = path.join(directory, 'shared.db');

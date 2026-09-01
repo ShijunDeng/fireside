@@ -59,6 +59,9 @@ const reorderSchema = z.object({
   baseVersion: z.number().int().nonnegative(),
 });
 const participantSchema = z.object({ name: nonEmptyText('参与者姓名', 30) });
+const stateRestrictedEditFields = new Set([
+  'presenter', 'scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl',
+]);
 
 type AppOptions = {
   databasePath?: string;
@@ -208,7 +211,7 @@ export function buildApp(options: AppOptions = {}) {
       ARCHIVED: [],
     } as const;
     if (fieldsByStatus[current.status].some((field) => field in body.data)) {
-      return reply.code(409).send({ message: '当前状态不能修改这些字段，请按议题流程操作' });
+      return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '当前状态不能修改这些字段，请按议题流程操作' });
     }
     await options.beforeTopicUpdate?.();
     const updates: { column: string; value: unknown }[] = [];
@@ -224,9 +227,15 @@ export function buildApp(options: AppOptions = {}) {
     if (body.data.takeaway !== undefined) updates.push({ column: 'takeaway', value: body.data.takeaway });
     if (body.data.materialUrl !== undefined) updates.push({ column: 'material_url', value: body.data.materialUrl || null });
     updates.push({ column: 'updated_at', value: new Date().toISOString() });
-    const result = db.prepare(`UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')} WHERE id = ?`)
-      .run(...updates.map(({ value }) => value), params.data.id);
-    if (result.changes === 0) return reply.code(404).send({ message: '没有找到这个议题' });
+    const requiresStateMatch = Object.keys(body.data).some((field) => stateRestrictedEditFields.has(field));
+    const result = db.prepare(`UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')} WHERE id = ?${requiresStateMatch ? ' AND status = ?' : ''}`)
+      .run(...updates.map(({ value }) => value), params.data.id, ...(requiresStateMatch ? [current.status] : []));
+    if (result.changes === 0) {
+      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
+      return exists
+        ? reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '议题状态已变化，已同步最新结果，请重新确认后再编辑' })
+        : reply.code(404).send({ message: '没有找到这个议题' });
+    }
     return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
