@@ -97,6 +97,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 提升时先解析并保存当前健康 release，再原子切换 `current`、重启服务并在有界时间内检查 HTTP 健康和 MainPID 实际运行目录。两项都成功后才原子更新 `previous` 为原健康 release并报告成功。
 - 新服务启动、健康或运行目录验证失败时，工具必须自动把 `current` 原子切回原健康 release、重启并验证恢复；返回非零且不得自动恢复数据库。若回退服务也不健康，必须返回独立的致命错误，保留 socket、状态、备份和两个 release 供人工处置。
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
+- `rollback --previous` 表达的是取得维护锁时刻的上一健康版本，wrapper不得先在锁外解析成 SHA。该意图必须原样传入主锁监督下的控制器，再解析/验证 previous；并发 promote更新 previous 时，要么采用锁内新值，要么因基线变化明确拒绝，不能静默回到陈旧的上上版。显式40位commit语义不变。
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
 - `RemainAfterExit` 的开机 recovery 只能作为本次开机的第一道门，不能代替每次启动门禁。`fireside.service` 每次自动/显式启动和 `fireside-backup.service` 每次 timer/人工启动都必须先执行 root-owned transaction gate：有 journal 且发布锁空闲表示控制器已成为 orphan，必须在 Node 或 backup runner 执行前恢复；有 journal且锁被当前受控 promote 持有时，只允许与已校验 journal 阶段、current 指针和目标完全一致的那次受控服务重启，不能让普通并发启动猜测放行。
@@ -222,6 +223,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 45. 让 controller 的 sync 等子进程在父进程被杀后持续存活，逐一检查其 `/proc/<pid>/fd` 不含主锁/gate锁；watchdog立即取得同一inode恢复。backup CLI尝试unlink/replace lock、selector与permit均EPERM，且并发controller直到runner共享锁释放后才能进入。
 46. 分别把 transaction、release-active、writes-enabled、healthy marker预置为目录或链接；原子发布必须失败且不把temp移入目标、不清journal、不输出成功，原异常类型保留。恢复证据缺失时Node/backup继续失败关闭而不是误报健康。
 47. 两个同 SHA install 在第一次“目标 absent”后用 barrier交错；最终仅一个成功，另一个拒绝或锁冲突，既有 release 的字节、manifest和子项集合完全不变，无嵌套publish目录，失败者不得输出installed成功。
+48. 让`rollback --previous`在旧previous可见时与一个完成更新previous的promote交错；回滚取得锁后必须采用当时的新previous或明确拒绝，不能成功落到锁外解析的旧commit。
 
 ### 7.2 生产
 
@@ -306,3 +308,5 @@ backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护�
 固定文件原子替换复审确认 `mv -f temp fixedPath` 遇到目录会把 temp 移入并返回成功，可能清 journal却让写许可永久失效。transaction、healthy、active和permit统一先拒绝异常类型并使用`mv -Tf`；四类目标目录/链接回归必须保留证据且无假成功。该高价值P2使成熟度计数保持0。
 
 候选安装并发复审确认 release目标 absent检查在取锁前、最终`mv`又会把stage移入已有目录；同SHA双install可污染immutable tree并误报成功。目标检查移入锁内并在发布前复核，最终使用`mv -T`/no-replace语义；并发barrier证明既有release零变化。该P1使成熟度计数保持0。
+
+`rollback --previous`复审确认wrapper在锁外解析previous会与并发promote交错并静默选择上上版。`--previous`意图必须原样进入主锁后再解析；并发测试只允许采用锁时刻值或明确拒绝。该合理P2使成熟度计数保持0。

@@ -240,3 +240,4 @@
 - backup运行态写权阻断 AC：UID0 runner曾可写整个`/run`并替换维护锁/selector/permit。root gate预建严格锁，runner只读open同inode取得共享flock，sandbox内`/run`只读；候选CLI破坏尝试EPERM且controller严格等待共享锁释放。
 - 固定文件替换阻断 AD：`mv -f temp fixedPath` 遇目标目录会把temp移入并返回0，可能清journal后留下永久503。transaction/healthy/release-active/writes-enabled统一拒绝异常类型并使用`mv -Tf`；目录/链接夹具验证不误报、不清证据、不把temp移入。
 - 同SHA安装竞态阻断 AE：release absent检查在取锁前且最终`mv`会嵌入已存在目录，两个install可污染immutable tree并误报。锁内检查并在发布前复核，最终`mv -T`或no-replace；并发barrier验证失败者不改变既有文件/manifest/子项集合。
+- previous回滚意图阻断 AF：wrapper锁外解析`--previous`可与并发promote交错并静默回到上上版。原样传入主锁监督下的promote再解析；锁时值变化时只允许采用新previous或明确拒绝。
