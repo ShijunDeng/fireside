@@ -79,6 +79,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 ### FR-OPS-010 候选门禁、原子提升与失败回滚
 
 - 生产发布唯一入口是预装到 `/usr/local/sbin` 与 `/usr/local/libexec` 的 `root:root`、开发用户不可写控制器；禁止通过 `sudo` 直接执行可写 Git 工作树中的脚本。生产路径固定，不接受调用者用环境变量覆盖 release、状态、备份、仓库或服务名。
+- 预装控制器及其任一子脚本必须在解析测试模式、降权用户、路径或 hook 之前识别生产控制器身份；只要调用环境包含 `FIRESIDE_RELEASE_*` 或其他已定义的测试路径/用户覆盖变量，就必须以退出码 2 拒绝，不能仅忽略。该边界也必须由随生产标记复制到隔离目录的控制器夹具验证，不能只测试工作树入口。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
@@ -136,6 +137,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 8. 备份故障注入覆盖 file sync、首次 directory sync、prune 与末次 directory sync；未持久化新份时不删除旧份。模拟上次崩溃的旧孤儿会被清除，新鲜/非匹配/非 root/符号链接目标不会被触碰。
 9. commit 不属于授权远端 main、root 控制器可写、manifest 外新增文件、构建残留进程、旧版本不能读取候选迁移副本均在切换前拒绝；测试/预检证明无外网且不能读取生产 state/env/backup 原件。
 10. 对 journal、current 切换、restart、health 和 previous 更新逐点模拟 SIGKILL；`recover` 与开机 recovery 均恢复调用前两个指针，不采用故障候选、不恢复数据库，重复执行幂等。
+11. 把完整控制器复制为带生产模式标记的隔离夹具，分别从 dispatcher 和子脚本注入测试模式、路径、build/preflight/restart/health/sync hook；所有调用必须在 hook 执行、路径访问或 root 写入之前以 2 拒绝。无测试变量时仍固定使用真实生产路径，不能回退到夹具相对路径。
 
 ### 7.2 生产
 
@@ -162,3 +164,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 首次生产迁移证明非 root 运行、权限分离、socket 连续性和一致备份主体成立，但独立审计发现两个 P1：ignored `server-build/` 可被旧产物冒充当前 commit，且 root 执行依赖 lifecycle；旧安装脚本还会在任何候选健康检查前直接切换 `current`，没有可执行的 previous 指针或自动回退。另发现备份 rename / prune 缺少 file 与 directory fsync，崩溃残留不会在后续运行回收。
 
 这些发现使本规格保持 `Implementing`，成熟度连续通过计数归零。FR-OPS-006、010 和 FR-OPS-008 的新增门禁必须在 Iteration 023 完成后重新执行发布失败注入、备份崩溃恢复、全量自动化和生产验证，才能验收 SPEC-010。
+
+实现复审又确认一个生产控制器信任边界 P1：测试模式和测试 hook 原本由调用环境决定；如果预装入口或其子脚本接受这些变量，具备受限 sudo/SETENV 权限的调用者即可让 root 使用调用者路径或执行 hook。修复必须让预装路径及带生产标记的等价夹具在读取任何覆盖值之前拒绝全部发布测试变量，并用“恶意 hook 会留下哨兵文件”的红测证明 hook 从未执行。该发现再次把成熟度连续计数归零。
