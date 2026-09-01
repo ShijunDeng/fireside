@@ -61,7 +61,8 @@ install -o root -g root -m 0644 "${source_root}/package-lock.json" "${staging}/p
 npm --prefix "${staging}" ci --omit=dev
 
 chown -R root:root "${staging}"
-chmod -R go-w "${staging}"
+find "${staging}" -type d -exec chmod 0755 {} +
+find "${staging}" -type f -exec chmod u+rw,go+r,go-w {} +
 mv -- "${staging}" "${release_path}"
 staging=
 
