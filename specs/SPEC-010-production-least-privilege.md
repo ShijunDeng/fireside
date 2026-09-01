@@ -111,7 +111,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - runtime tree 可读校验必须覆盖完整绝对路径的每一级父目录，而不只 commit目录内部。生产 `/opt`、`/opt/fireside`、`releases` 与commit目录均须真实目录、root所有、非group/world writable且other可遍历；任一级0700、错误owner、链接或异常类型都在发布selector/permit前失败关闭。测试根使用等价可注入路径检查。
 - 主发布锁忙时 service gate 的许可消费也必须与 watchdog 原子互斥：使用第二个 root:root 0600、普通单链接 gate mutex，service gate 在 owner校验→消费journal→selector 固化全程持有；watchdog 取得主锁后再按统一锁序取得 gate mutex 才恢复。正常 controller 不持 gate mutex。恢复者持主锁和 mutex 写好 `reverting + pending recovery permit` 后，必须临时释放 mutex 让本次 service gate 消费，随后重新取得 mutex，并在仍持主锁下复核相同 txid/generation 已 consumed 与 MainPID/cwd/health后继续，不能持 mutex 同步等待 restart 形成自锁。owner 校验后 controller 死亡时，watchdog要么先阻断旧 gate，要么等待它完成后恢复，旧 gate 不能在 journal 清理后复活 target 事务。
 - 控制器在主锁内先持久化仅含 `prepared`、尚未改指针/数据/写许可的 owner journal，再启动独立 root-owned watchdog。这使监督锁在两步之间丢失时，任一gate/recover都能从journal识别并终止孤儿worker；不得出现watchdog先因“无journal”退出、旧worker再无锁继续的窗口。watchdog 就绪前禁止 active marker、revoke、数据或指针副作用；启动失败时须在仍持锁下安全清理该 prepared journal，清理失败则返回4保留证据。
-- “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、已存在且匹配的 prepared journal、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能继续 active/revoke。exec 后立即退出、坏参数/锁/journal、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
+- “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、已存在且匹配的 prepared journal、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能继续 active/revoke。READY 必须归属 transient unit 的 main PID：若由短生命周期 `systemd-notify` helper 发送，必须使用 `--pid=parent` 显式绑定父脚本 PID，不能让 `NotifyAccess=main` 丢弃 helper 自身 PID 的通知并与主锁形成握手死锁，也不能依赖可能被 `systemd-run` 参数展开改写的 shell PID 字面量。exec 后立即退出、坏参数/锁/journal、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
 - watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
 - fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
 - 主维护锁优先由 `flock --close` 监督进程持有，controller 本身及其全部后代从未拥有该 fd；不能只在已知 systemctl/curl 调用点关闭，因为 sync/stat/hash 等任一存活子进程都可能继承。测试让持久化子进程在父 controller 被杀后继续存活，watchdog必须立即取得同一 inode。
@@ -252,6 +252,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 61. 同一 commit 先以可信 root 工作区执行完整 controller 47 项故障注入并通过，再以 `fireside-build` 和生产构建 sandbox 执行 `npm run check`；应用/API/备份/日历等非特权测试必须通过，controller 套件明确报告因 root fixture ownership 被 skip，候选仍完成 typecheck 与双端 build。生产 install 不得因测试夹具尝试 chown root 失败，也不得改为 root 执行候选 lifecycle/test。
 62. 构造顶层与至少两层嵌套 `node_modules/<pkg>/node_modules/.bin/<link>`；候选固化后所有 `.bin` 目录均不存在且必需运行时模块仍可加载。另在 `.bin` 外放置内部或越界 symlink，两者都必须拒绝候选，不能创建 immutable release 或改变 current。
 63. 用缺少全部 release identity 文件、仅在顶层/嵌套 `.bin` 含链接的真实 legacy current 执行 promote；规范化后路径不变、全部 `.bin` 消失、旧 MainPID 在受控 restart 前不受影响，随后兼容预检与提升成功。若存在 `.bin` 外链接、`.bin` 本身为链接、任一 identity 文件或异常类型，必须在删除任何 `.bin` 前退出 2，current/previous/journal与全部旧树字节不变。
+64. 用真实 systemd transient `Type=notify` watchdog，在 controller 持有主锁时执行 prepared→READY 握手；`systemd-notify --pid=parent` 的归属 PID 必须等于 unit main 脚本 PID，启动命令在有界秒数内返回且 unit 保持 active/waiting。随后杀 controller supervisor，watchdog立即取得锁并恢复 prepared journal；不得出现 systemd-run等待unit退出、watchdog等待主锁的双向死锁。
 
 ### 7.2 生产
 
@@ -350,3 +351,5 @@ AR 修复后的首次隔离构建又新增阻断 AS：controller 故障注入夹
 AS 修复后的真实 `npm prune` 新增阻断 AT：Fastify 与 node-abi 的嵌套依赖各自带有合法 `.bin/semver`，原固化逻辑只删除顶层 `.bin`，随后把嵌套命令链接误判为不支持的依赖链接。固化必须递归删除全部真实 `.bin` 目录后继续零链接门禁；该生产安装可执行性 P1 使成熟度计数继续为 0。
 
 候选安装完成后的首次 promote 新增阻断 AU：线上 legacy current 本身仍保留 npm 顶层与嵌套 `.bin` 命令链接，严格 runtime tree 门禁因此在事务前拒绝。控制器需对“无任何 identity 文件且链接全集只在真实 `.bin` 内”的显式 legacy 提供一次受限、先完整验证后删除并 fsync 的规范化；其他链接或 manifested tree 一律不修改。该可升级性 P1 使成熟度计数继续为 0。
+
+AU 修复后的真实 promote 新增阻断 AV：dispatcher 确实在取主锁前调用 `systemd-notify --ready`，但通知来自短生命周期 helper，`NotifyAccess=main` 未把它归属为 unit main PID；systemd-run 因此持续等待 READY，而 watchdog 已 exec 到 flock 等待 controller 的主锁，形成确定性双向死锁。通知必须显式 `--pid=parent` 归属父脚本，并以真实 systemd 持锁握手验证；shell PID 字面量还可能在 transient 参数边界被提前展开，不能作为协议。该恢复可用性 P1 使成熟度计数继续为 0。

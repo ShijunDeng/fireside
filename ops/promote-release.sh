@@ -956,7 +956,7 @@ if [[ ${main_lock_state} == unwrapped ]]; then
     transaction_owner_context_is_valid \
       || { release_die 'release watchdog owner context is invalid'; exit 4; }
     if [[ ${test_mode} != 1 ]]; then
-      /usr/bin/systemd-notify --ready --status="waiting for Fireside transaction ${watchdog_transaction}" \
+      /usr/bin/systemd-notify --pid=parent --ready --status="waiting for Fireside transaction ${watchdog_transaction}" \
         || { release_die 'cannot signal release watchdog readiness'; exit 4; }
     fi
     exec flock -x -w 900 --close "${lock_file}" /usr/bin/setsid "${script_path}" --main-lock-held "$@"

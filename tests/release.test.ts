@@ -1559,5 +1559,6 @@ server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address()
     assert.doesNotMatch(backupGate, /^EnvironmentFile=/m);
     assert.match(backup, /^ReadOnlyPaths=\/run$/m);
     assert.doesNotMatch(backup, /^ReadWritePaths=\/run$/m);
+    assert.match(await readFile(promoteScript, 'utf8'), /systemd-notify --pid=parent --ready/);
   });
 });
