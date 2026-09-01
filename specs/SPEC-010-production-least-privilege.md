@@ -132,7 +132,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - SQLite 边车必须完整覆盖 `-wal`、`-shm` 和 rollback `-journal`。无主库而任一同名边车以普通文件、链接、目录或其他类型存在时，bootstrap 在触碰指针/数据库前拒绝并原样保留证据；不能把 hot journal 当作无关文件。workload 已停止后的安装/恢复须安全清理三类旧边车并同步目录，再原子替换主库并再次同步；原本无库的失败恢复不遗留本次任何主库或边车。
 - 已有主库但没有 current 时，bootstrap 必须先停止 socket/service、防止新写入，再用目标 release 的崩溃安全 backup runner 创建并持久化一致备份，在副本上迁移和校验 `businessDataSha256`，最后才安装迁移后的独立副本。失败或中断必须从记录的原始备份恢复主库，保留该 root-only 备份，不得把空库或半迁移库当成成功状态。
 - bootstrap 数据库临时文件在原子 rename 前始终保持 root:root 0600；不能提前降权给未来应用 UID。使用单一固定父目录内的 pending 名，recovery 只在验证它是 root 所有、0600、普通单链接文件后删除并同步目录；rename 后才给最终主库设置 `fireside:fireside 0600` 并再次同步。任意 SIGKILL/失败恢复后都不能残留 `.bootstrap.*` 或应用用户可读的完整业务副本。
-- bootstrap 在首次数据库替换和 `current` 切换前写入可 fsync 的 root-only 事务日志，记录目标 commit、原主库是 absent 还是对应的严格备份文件，以及阶段。开机/手动 recovery 对 bootstrap 的确定性结果是：停止服务、移除首次 current/previous、恢复原主库或删除本次新建主库及边车，然后清日志；恢复任一步失败返回 4 并保留证据。
+- bootstrap 在首次数据库替换和 `current` 切换前写入可 fsync 的 root-only 事务日志，记录目标 commit、原主库是 absent 还是对应的严格备份文件，并绑定备份 SHA-256 与字节数，以及阶段。恢复在触碰 current/主库前重新验证固定目录、root:root 0600、普通单链接文件及精确大小/hash；任何不符都返回 4并保留 journal与现有主库。复制到 root-only pending 后再次校验、file fsync再原子rename。开机/手动 recovery 对可信 bootstrap 的确定性结果是：停止服务、移除首次 current/previous、恢复原主库或删除本次新建主库及边车，然后清日志；恢复任一步失败返回 4并保留证据。
 - 首次 current 切换后必须启动 socket/service并通过与 promote 相同的双 unit、稳定 PID、UID、cwd 和连续 HTTP 健康门禁；成功后写健康标记、持久化并清事务，`previous` 保持不存在。健康失败应完整回到“未 bootstrap”状态并返回 3；恢复失败返回 4。
 - bootstrap 或其他发布事务开始切换前必须关闭 root-owned 运行时写许可。候选可以在公网 80 完成只读 live health，但从首次启动到所有可回退步骤持久化完成之间，创建、编辑、删除、排序、认领、排期、报名、归档等业务写必须稳定返回 `503 RELEASE_IN_PROGRESS` 且没有数据库副作用；页面保留草稿并提示稍后重试。认证换取短期会话和公开读取不修改业务数据，可以继续。
 - 写许可必须绑定当前 release commit，不能使用可被旧版本/旧事务重放的固定布尔文件。只有健康 marker、previous 语义、业务指纹和事务“向前提交”状态均已 fsync 后，控制器才原子发布目标 commit 的写许可。一旦许可发布，任何后续清理失败或控制器退出都不得恢复启动前数据库或让已返回 2xx 的业务写丢失；recovery 必须识别 committed 阶段并向前完成 current/marker/清理。
@@ -211,6 +211,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 39. target 已启动后杀死 controller，并强制 backup gate 先于 watchdog 取得锁；恢复后必须是 origin MainPID/cwd/current/selector/permit全一致，target runner 未执行、无备份/prune副作用。若 backup gate选择交给 watchdog，则本次任务明确失败且 journal 保留到 watchdog 完整恢复。
 40. 从 `/proc/<pid>/environ` 和测试哨兵证明 service/backup gate、recovery、watchdog及其子进程均不含业务写口令或会话密钥；应用 Node 仍可完成合法认证。unit 不得因应用 `EnvironmentFile` 把密钥传给 root gate。
 41. 分别在 bootstrap 临时数据库 copy、file sync、rename、最终 chown 后杀死 controller；recovery 后原业务指纹不变（原本无库则仍无库），状态目录无 `.bootstrap.*`，失败状态下 `fireside`/`nobody` 均不能读取任何孤儿副本。错误类型、链接或非 root pending 文件必须拒绝自动删除并保留人工证据。
+42. 在 bootstrap 的 switched/healthy 阶段分别截断、翻转备份一字节，或改变其 mode/owner/link/type；recovery 必须返回4，主库 hash 不变、current 与 journal 证据保留，不能先删指针或覆盖数据库。只有 filename+size+SHA-256与严格元数据全部匹配的备份才能恢复并清 journal。
 
 ### 7.2 生产
 
@@ -281,3 +282,5 @@ watchdog 就绪复审确认异步 `systemd-run` 只证明 dispatcher 被 exec，
 易失运行态与 gate 竞态复审确认两条 P1：无 journal 冷启动会丢失 selector/permit；target 已启动后的 orphan 若由 backup gate 用 no-restart 语义恢复，会留下 MainPID 与 current/permit 裂脑。无事务 gate 改为从健康 current 重建运行态；backup orphan 必须完整 restart+health 或失败交给 watchdog。写许可 revoke 还必须后移到 journal/active marker 持久化之后，消除无日志永久 503。成熟度连续计数保持 0。
 
 bootstrap 敏感副本复审发现原子 rename 前已把完整迁移库 chown 给应用 UID，SIGKILL 会遗留不受备份策略管理的 `.bootstrap.<pid>`。临时库改为 root-only 固定 pending 名并纳入严格恢复清理，最终 rename 后才降权；该高价值 P2 继续使成熟度计数为 0。
+
+bootstrap 恢复完整性复审确认事务只记录备份文件名时，截断或位腐坏的备份会覆盖最后一份有效迁移主库并在清 journal 后误报恢复成功。事务必须绑定备份大小/hash，恢复在任何主库或指针变更前校验内容与严格元数据，复制后再次校验再 rename；该数据毁损 P1 使成熟度计数保持 0。
