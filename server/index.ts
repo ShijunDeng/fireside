@@ -1,6 +1,7 @@
 import { buildApp } from './app.js';
 import { requireProductionWriteKey } from './access.js';
 import { installGracefulShutdown, resolveListenTarget } from './runtime.js';
+import { readReleaseCommit, releaseWritePermitMatches } from './write-permit.js';
 import type { FastifyListenOptions } from 'fastify';
 
 const writeKey = requireProductionWriteKey(process.env.NODE_ENV, process.env.FIRESIDE_WRITE_KEY);
@@ -10,7 +11,19 @@ const testRateLimit = process.env.NODE_ENV === 'test' ? {
   globalLimit: Number(process.env.FIRESIDE_AUTH_GLOBAL_LIMIT ?? 200),
 } : undefined;
 const listenTarget = resolveListenTarget(process.env, process.pid);
-const app = buildApp({ logger: true, writeKey, authRateLimit: testRateLimit });
+const writePermitPath = process.env.NODE_ENV === 'production'
+  ? '/run/fireside-runtime/writes-enabled'
+  : process.env.FIRESIDE_WRITE_PERMIT_PATH;
+const releaseCommit = writePermitPath ? readReleaseCommit(process.cwd()) : undefined;
+const app = buildApp({
+  logger: true,
+  writeKey,
+  ...(releaseCommit ? { releaseCommit } : {}),
+  authRateLimit: testRateLimit,
+  ...(writePermitPath && releaseCommit
+    ? { businessWritesAllowed: () => releaseWritePermitMatches(writePermitPath, releaseCommit) }
+    : {}),
+});
 
 try {
   // Fastify forwards listen options to Node's server. Its public type omits the

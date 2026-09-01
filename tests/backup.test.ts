@@ -3,13 +3,19 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
   chmod,
+  chown,
   copyFile,
+  link,
+  lstat,
+  lutimes,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   rm,
   stat,
+  symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import os from 'node:os';
@@ -17,9 +23,12 @@ import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import Database from 'better-sqlite3';
 import {
+  BACKUP_MUTEX_FILENAME,
+  BACKUP_ORPHAN_MINIMUM_AGE_MS,
   createSqliteBackup,
   isBackupFilename,
   readDatabaseFingerprint,
+  type BackupFaultPoint,
 } from '../server/backup.js';
 
 const temporaryDirectories: string[] = [];
@@ -139,7 +148,61 @@ async function sha256(filename: string) {
   return createHash('sha256').update(await readFile(filename)).digest('hex');
 }
 
+async function entriesWithoutMutex(directory: string) {
+  return (await readdir(directory)).filter((name) => name !== BACKUP_MUTEX_FILENAME);
+}
+
+async function exists(filename: string) {
+  try {
+    await lstat(filename);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 describe('SQLite 一致备份', () => {
+  it('业务值指纹允许纯 schema 扩展，并捕获不递增 revision 的内容篡改', async () => {
+    const directory = await temporaryDirectory();
+    const sourcePath = path.join(directory, 'fireside.db');
+    const database = new Database(sourcePath);
+    createBackupSchema(database);
+    insertSensitiveFixture(database);
+    database.close();
+
+    const before = readDatabaseFingerprint(sourcePath);
+
+    const schemaMigration = new Database(sourcePath);
+    schemaMigration.exec(`
+      ALTER TABLE topics ADD COLUMN migration_note TEXT NOT NULL DEFAULT 'new';
+      CREATE INDEX idx_topics_migration_note ON topics(migration_note);
+    `);
+    schemaMigration.close();
+
+    const afterSchemaOnly = readDatabaseFingerprint(sourcePath);
+    assert.equal(afterSchemaOnly.businessDataSha256, before.businessDataSha256);
+    assert.notEqual(afterSchemaOnly.contentSha256, before.contentSha256);
+
+    const maliciousMigration = new Database(sourcePath);
+    maliciousMigration.prepare(`
+      UPDATE topics
+      SET title = '被静默改写的标题',
+          summary = '被静默改写的简介',
+          meeting_url = 'https://different.example.test/join?pwd=also-secret'
+      WHERE id = 1
+    `).run();
+    maliciousMigration.close();
+
+    const afterContentChange = readDatabaseFingerprint(sourcePath);
+    assert.equal(afterContentChange.topicCount, afterSchemaOnly.topicCount);
+    assert.equal(afterContentChange.participantCount, afterSchemaOnly.participantCount);
+    assert.equal(afterContentChange.orderVersion, afterSchemaOnly.orderVersion);
+    assert.equal(afterContentChange.revisionsSha256, afterSchemaOnly.revisionsSha256);
+    assert.equal(afterContentChange.sensitivePresenceSha256, afterSchemaOnly.sensitivePresenceSha256);
+    assert.notEqual(afterContentChange.businessDataSha256, afterSchemaOnly.businessDataSha256);
+  });
+
   it('在 WAL 未 checkpoint 时生成 0600 完整快照，可隔离恢复并保持内容指纹', async () => {
     const directory = await temporaryDirectory();
     const sourcePath = path.join(directory, 'fireside.db');
@@ -182,11 +245,11 @@ describe('SQLite 一致备份', () => {
       assert.equal(metadata.bytes, (await stat(backupPath)).size);
       assert.equal(metadata.sha256, await sha256(backupPath));
       assert.deepEqual(readDatabaseFingerprint(backupPath), sourceFingerprint);
-      assert.deepEqual(await readdir(backupDirectory), [metadata.filename]);
+      assert.deepEqual(await entriesWithoutMutex(backupDirectory), [metadata.filename]);
       const standalone = new Database(backupPath, { readonly: true, fileMustExist: true });
       assert.equal(standalone.pragma('journal_mode', { simple: true }), 'delete');
       standalone.close();
-      assert.deepEqual(await readdir(backupDirectory), [metadata.filename]);
+      assert.deepEqual(await entriesWithoutMutex(backupDirectory), [metadata.filename]);
 
       const serializedMetadata = JSON.stringify(metadata);
       for (const secret of [
@@ -293,6 +356,231 @@ describe('SQLite 一致备份', () => {
     );
   });
 
+  it('按 file sync → rename → directory sync → prune → directory sync 建立故障边界', async () => {
+    const cases: {
+      failure: BackupFaultPoint;
+      rejects: boolean;
+      finalExists: boolean;
+      oldExists: boolean;
+      expectedPoints: BackupFaultPoint[];
+    }[] = [
+      {
+        failure: 'temporary-file-sync',
+        rejects: true,
+        finalExists: false,
+        oldExists: true,
+        expectedPoints: ['temporary-file-sync'],
+      },
+      {
+        failure: 'published-directory-sync',
+        rejects: true,
+        finalExists: true,
+        oldExists: true,
+        expectedPoints: ['temporary-file-sync', 'published-directory-sync'],
+      },
+      {
+        failure: 'prune',
+        rejects: false,
+        finalExists: true,
+        oldExists: true,
+        expectedPoints: ['temporary-file-sync', 'published-directory-sync', 'prune', 'pruned-directory-sync'],
+      },
+      {
+        failure: 'pruned-directory-sync',
+        rejects: true,
+        finalExists: true,
+        oldExists: false,
+        expectedPoints: ['temporary-file-sync', 'published-directory-sync', 'prune', 'pruned-directory-sync'],
+      },
+    ];
+
+    for (const scenario of cases) {
+      const directory = await temporaryDirectory();
+      const sourcePath = path.join(directory, 'fireside.db');
+      const backupDirectory = path.join(directory, 'backups');
+      await mkdir(backupDirectory, { mode: 0o700 });
+      const db = new Database(sourcePath);
+      createBackupSchema(db);
+      insertSensitiveFixture(db);
+      db.close();
+
+      const oldName = 'fireside-backup-20260901T000000000Z-1111111111111111.sqlite3';
+      const finalName = 'fireside-backup-20260902T040506007Z-2222222222222222.sqlite3';
+      const oldPath = path.join(backupDirectory, oldName);
+      const finalPath = path.join(backupDirectory, finalName);
+      await writeFile(oldPath, 'older validated backup', { mode: 0o600 });
+      const points: BackupFaultPoint[] = [];
+      const injected = new Error(`injected ${scenario.failure}`);
+      const operation = createSqliteBackup({
+        sourcePath,
+        backupDirectory,
+        retention: 1,
+        now: () => new Date('2026-09-02T04:05:06.007Z'),
+        randomBytes: () => new Uint8Array(8).fill(0x22),
+        faultInjector: (point) => {
+          points.push(point);
+          if (point === scenario.failure) throw injected;
+        },
+      });
+
+      let metadata;
+      if (scenario.rejects) {
+        await assert.rejects(operation, injected);
+      } else {
+        metadata = await operation;
+      }
+      assert.deepEqual(points, scenario.expectedPoints, scenario.failure);
+      assert.equal(await exists(finalPath), scenario.finalExists, `${scenario.failure} final`);
+      assert.equal(await exists(oldPath), scenario.oldExists, `${scenario.failure} old`);
+      assert.equal(
+        (await readdir(backupDirectory)).some((name) => name.includes('.tmp')),
+        false,
+        `${scenario.failure} must not leave caught-failure temporaries`,
+      );
+      if (scenario.failure === 'prune') {
+        assert.equal(metadata?.retentionErrors, 1);
+        assert.equal(metadata?.prunedBackups, 0);
+        assert.equal(metadata?.retainedBackups, 2);
+      }
+      if (scenario.failure === 'temporary-file-sync' || scenario.failure === 'published-directory-sync') {
+        assert.equal(points.includes('prune'), false, 'an undurable new backup must never prune an old backup');
+      }
+    }
+  });
+
+  it('同目录任务互斥，持锁任务完成后无需清理陈旧 lock 即可继续', async () => {
+    const directory = await temporaryDirectory();
+    const sourcePath = path.join(directory, 'fireside.db');
+    const backupDirectory = path.join(directory, 'backups');
+    await mkdir(backupDirectory, { mode: 0o700 });
+    const db = new Database(sourcePath);
+    createBackupSchema(db);
+    insertSensitiveFixture(db);
+    db.close();
+
+    let reachedSync!: () => void;
+    let releaseSync!: () => void;
+    const atSync = new Promise<void>((resolve) => { reachedSync = resolve; });
+    const syncBarrier = new Promise<void>((resolve) => { releaseSync = resolve; });
+    const first = createSqliteBackup({
+      sourcePath,
+      backupDirectory,
+      now: () => new Date('2026-09-02T04:05:06.007Z'),
+      randomBytes: () => new Uint8Array(8).fill(1),
+      faultInjector: async (point) => {
+        if (point !== 'temporary-file-sync') return;
+        reachedSync();
+        await syncBarrier;
+      },
+    });
+    await atSync;
+
+    try {
+      await assert.rejects(createSqliteBackup({
+        sourcePath,
+        backupDirectory,
+        now: () => new Date('2026-09-02T04:06:06.007Z'),
+        randomBytes: () => new Uint8Array(8).fill(2),
+      }), /already in progress/);
+    } finally {
+      releaseSync();
+    }
+    await first;
+
+    const next = await createSqliteBackup({
+      sourcePath,
+      backupDirectory,
+      now: () => new Date('2026-09-02T04:07:06.007Z'),
+      randomBytes: () => new Uint8Array(8).fill(3),
+    });
+    assert.equal(await exists(path.join(backupDirectory, next.filename)), true);
+    assert.equal((await stat(path.join(backupDirectory, BACKUP_MUTEX_FILENAME))).mode & 0o777, 0o600);
+  });
+
+  it('下一轮只回收过期、指定所有者、单链接普通孤儿，保留新鲜/非匹配/链接/目录/非 root 项', async () => {
+    const directory = await temporaryDirectory();
+    const sourcePath = path.join(directory, 'fireside.db');
+    const backupDirectory = path.join(directory, 'backups');
+    await mkdir(backupDirectory, { mode: 0o700 });
+    const db = new Database(sourcePath);
+    createBackupSchema(db);
+    insertSensitiveFixture(db);
+    db.close();
+
+    const currentUid = process.getuid?.() ?? 0;
+    const oldAt = new Date('2026-09-01T00:00:00.000Z');
+    const freshAt = new Date('2026-09-10T00:00:00.001Z');
+    const finalStem = 'fireside-backup-20260830T000000000Z-aaaaaaaaaaaaaaaa.sqlite3';
+    const oldMain = `.${finalStem}.7001.tmp`;
+    const oldOrphans = [oldMain, `${oldMain}-wal`, `${oldMain}-shm`, `${oldMain}-journal`];
+    for (const name of oldOrphans) {
+      const filename = path.join(backupDirectory, name);
+      await writeFile(filename, name, { mode: 0o600 });
+      await utimes(filename, oldAt, oldAt);
+    }
+
+    const fresh = '.fireside-backup-20260909T120000001Z-bbbbbbbbbbbbbbbb.sqlite3.7002.tmp';
+    await writeFile(path.join(backupDirectory, fresh), 'fresh in-flight candidate', { mode: 0o600 });
+    await utimes(path.join(backupDirectory, fresh), freshAt, freshAt);
+
+    const nonMatching = '.fireside-backup-stale.tmp';
+    await writeFile(path.join(backupDirectory, nonMatching), 'operator file', { mode: 0o600 });
+    await utimes(path.join(backupDirectory, nonMatching), oldAt, oldAt);
+
+    const symlinkTarget = path.join(backupDirectory, 'symlink-target.txt');
+    const symlinkName = '.fireside-backup-20260830T000000000Z-cccccccccccccccc.sqlite3.7003.tmp';
+    await writeFile(symlinkTarget, 'must remain', { mode: 0o600 });
+    await symlink(symlinkTarget, path.join(backupDirectory, symlinkName));
+    await lutimes(path.join(backupDirectory, symlinkName), oldAt, oldAt);
+
+    const directoryName = '.fireside-backup-20260830T000000000Z-dddddddddddddddd.sqlite3.7004.tmp';
+    await mkdir(path.join(backupDirectory, directoryName));
+    await utimes(path.join(backupDirectory, directoryName), oldAt, oldAt);
+
+    const hardlinkTarget = path.join(backupDirectory, 'hardlink-target.txt');
+    const hardlinkName = '.fireside-backup-20260830T000000000Z-eeeeeeeeeeeeeeee.sqlite3.7005.tmp';
+    await writeFile(hardlinkTarget, 'linked operator data', { mode: 0o600 });
+    await link(hardlinkTarget, path.join(backupDirectory, hardlinkName));
+    await utimes(path.join(backupDirectory, hardlinkName), oldAt, oldAt);
+
+    const nonRootName = '.fireside-backup-20260830T000000000Z-ffffffffffffffff.sqlite3.7006.tmp';
+    const nonRootPath = path.join(backupDirectory, nonRootName);
+    await writeFile(nonRootPath, 'different owner', { mode: 0o600 });
+    await utimes(nonRootPath, oldAt, oldAt);
+    if (currentUid === 0) await chown(nonRootPath, 65_534, 65_534);
+
+    assert.ok(new Date('2026-09-10T12:00:00.001Z').getTime() - freshAt.getTime() < BACKUP_ORPHAN_MINIMUM_AGE_MS);
+    await createSqliteBackup({
+      sourcePath,
+      backupDirectory,
+      now: () => new Date('2026-09-10T12:00:00.001Z'),
+      randomBytes: () => new Uint8Array(8).fill(4),
+      orphanOwnerUid: currentUid,
+    });
+
+    for (const name of oldOrphans) assert.equal(await exists(path.join(backupDirectory, name)), false, name);
+    for (const name of [fresh, nonMatching, symlinkName, directoryName, hardlinkName]) {
+      assert.equal(await exists(path.join(backupDirectory, name)), true, name);
+    }
+    assert.equal((await lstat(path.join(backupDirectory, symlinkName))).isSymbolicLink(), true);
+    assert.equal((await stat(path.join(backupDirectory, hardlinkName))).nlink, 2);
+    if (currentUid === 0) {
+      assert.equal((await lstat(nonRootPath)).uid, 65_534);
+      assert.equal(await exists(nonRootPath), true);
+    } else {
+      await writeFile(nonRootPath, 'non-root crash residue', { mode: 0o600 });
+      await utimes(nonRootPath, oldAt, oldAt);
+      await createSqliteBackup({
+        sourcePath,
+        backupDirectory,
+        now: () => new Date('2026-09-10T12:01:00.001Z'),
+        randomBytes: () => new Uint8Array(8).fill(5),
+      });
+      assert.notEqual((await lstat(nonRootPath)).uid, 0);
+      assert.equal(await exists(nonRootPath), true);
+    }
+  });
+
   it('校验失败不发布最终文件、不留临时文件且不触碰旧备份', async () => {
     const directory = await temporaryDirectory();
     const sourcePath = path.join(directory, 'incomplete.db');
@@ -307,7 +595,7 @@ describe('SQLite 一致备份', () => {
     const unrelated = 'operator-notes.txt';
     await writeFile(path.join(backupDirectory, oldBackup), 'existing backup must remain', { mode: 0o600 });
     await writeFile(path.join(backupDirectory, unrelated), 'notes must remain', { mode: 0o600 });
-    const before = (await readdir(backupDirectory)).sort();
+    const before = (await entriesWithoutMutex(backupDirectory)).sort();
 
     await assert.rejects(createSqliteBackup({
       sourcePath,
@@ -316,7 +604,7 @@ describe('SQLite 一致备份', () => {
       now: () => new Date('2026-09-02T04:05:06.007Z'),
       randomBytes: () => new Uint8Array(8).fill(2),
     }));
-    assert.deepEqual((await readdir(backupDirectory)).sort(), before);
+    assert.deepEqual((await entriesWithoutMutex(backupDirectory)).sort(), before);
   });
 
   it('CLI 仅从环境变量取得路径，成功输出非敏感 JSON，失败只输出稳定错误码', async () => {

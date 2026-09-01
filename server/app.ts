@@ -90,6 +90,8 @@ type AppOptions = {
   };
   beforeTopicUpdate?: () => Promise<void>;
   afterTopicRowsRead?: () => Promise<void>;
+  businessWritesAllowed?: () => boolean;
+  releaseCommit?: string;
 };
 
 function validationMessage(error: z.ZodError) {
@@ -148,6 +150,18 @@ export function buildApp(options: AppOptions = {}) {
     validatedSessions.set(request, { expiresAt: validation.expiresAt });
   });
 
+  app.addHook('onRequest', async (request, reply) => {
+    const routePattern = request.routeOptions.url;
+    const isVerify = request.method === 'POST' && routePattern === '/api/access/verify';
+    const businessWrite = ['POST', 'PATCH', 'DELETE'].includes(request.method) && !isVerify;
+    if (!businessWrite || !options.businessWritesAllowed || options.businessWritesAllowed()) return;
+    reply.header('Retry-After', '3');
+    return reply.code(503).send({
+      code: 'RELEASE_IN_PROGRESS',
+      message: '炉火正在安全换班，请保留内容并稍后重试',
+    });
+  });
+
   app.addHook('preHandler', async (request, reply) => {
     const pathOnly = request.url.split('?')[0];
     const directMutation = ['PATCH', 'DELETE'].includes(request.method) && /^\/api\/topics\/\d+$/.test(pathOnly);
@@ -192,7 +206,12 @@ export function buildApp(options: AppOptions = {}) {
     })
   );
 
-  app.get('/api/health', async () => ({ ok: true, service: 'fireside', time: new Date().toISOString() }));
+  app.get('/api/health', async () => ({
+    ok: true,
+    service: 'fireside',
+    time: new Date().toISOString(),
+    ...(options.releaseCommit ? { releaseCommit: options.releaseCommit } : {}),
+  }));
   app.get('/api/access', async () => ({ enabled: Boolean(writeKey) }));
   app.post('/api/access/verify', async (request, reply) => {
     reply.header('Cache-Control', 'no-store');

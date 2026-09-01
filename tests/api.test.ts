@@ -53,9 +53,14 @@ describe('围炉夜话 API', () => {
   });
 
   it('返回健康状态', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/health' });
+    const releaseCommit = 'a'.repeat(40);
+    const healthApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, releaseCommit });
+    await healthApp.ready();
+    const response = await healthApp.inject({ method: 'GET', url: '/api/health' });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().ok, true);
+    assert.equal(response.json().releaseCommit, releaseCommit);
+    await healthApp.close();
   });
 
   it('只用短期会话保护全部写操作、名单和真实会议入口', async () => {
@@ -208,6 +213,62 @@ describe('围炉夜话 API', () => {
       method: 'POST', url: '/api/topics', payload: { title: '本地开放', summary: '无认证测试模式。', proposer: '测试', tags: [] },
     })).statusCode, 201);
     await openApp.close();
+  });
+
+  it('发布写许可关闭时全部业务 mutation 返回 503 且零副作用，公开读取和认证仍可用', async () => {
+    const writeKey = 'release-barrier-test-write-key';
+    let writesAllowed = false;
+    const guardedApp = buildApp({
+      databasePath: ':memory:',
+      seed: false,
+      serveStatic: false,
+      writeKey,
+      businessWritesAllowed: () => writesAllowed,
+    });
+    await guardedApp.ready();
+    const issued = await issueSession(guardedApp, writeKey);
+    const sessionHeaders = { 'x-fireside-session': issued.sessionToken };
+    assert.equal((await guardedApp.inject({ method: 'GET', url: '/api/health' })).statusCode, 200);
+    assert.equal((await guardedApp.inject({ method: 'GET', url: '/api/topics' })).statusCode, 200);
+
+    const rejectedWithoutSession = await guardedApp.inject({
+      method: 'POST',
+      url: '/api/topics',
+      payload: { title: '不能写入', summary: '鉴权必须先于发布状态。', proposer: '测试', tags: [] },
+    });
+    assert.equal(rejectedWithoutSession.statusCode, 401);
+
+    const mutations = [
+      { method: 'POST', url: '/api/topics' },
+      { method: 'PATCH', url: '/api/topics/1' },
+      { method: 'DELETE', url: '/api/topics/1' },
+      { method: 'POST', url: '/api/topics/reorder' },
+      { method: 'POST', url: '/api/topics/1/claim' },
+      { method: 'POST', url: '/api/topics/1/release' },
+      { method: 'POST', url: '/api/topics/1/schedule' },
+      { method: 'POST', url: '/api/topics/1/unschedule' },
+      { method: 'POST', url: '/api/topics/1/archive' },
+      { method: 'POST', url: '/api/topics/1/unarchive' },
+      { method: 'POST', url: '/api/topics/1/participants' },
+      { method: 'DELETE', url: '/api/topics/1/participants/1' },
+    ] as const;
+    for (const mutation of mutations) {
+      const response = await guardedApp.inject({ ...mutation, headers: sessionHeaders });
+      assert.equal(response.statusCode, 503, `${mutation.method} ${mutation.url}`);
+      assert.equal(response.json().code, 'RELEASE_IN_PROGRESS');
+      assert.equal(response.headers['retry-after'], '3');
+    }
+    assert.deepEqual((await guardedApp.inject({ method: 'GET', url: '/api/topics' })).json(), []);
+
+    writesAllowed = true;
+    const created = await guardedApp.inject({
+      method: 'POST',
+      url: '/api/topics',
+      headers: sessionHeaders,
+      payload: { title: '许可后重试', summary: '同一份草稿可以显式重试。', proposer: '测试', tags: [] },
+    });
+    assert.equal(created.statusCode, 201);
+    await guardedApp.close();
   });
 
   it('按 TCP 来源和全局滑动窗口限制口令验证且忽略转发头', async () => {

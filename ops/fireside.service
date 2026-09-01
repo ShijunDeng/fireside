@@ -1,19 +1,19 @@
 [Unit]
 Description=Fireside Topic Platform
 Documentation=https://github.com/ShijunDeng/fireside
-Requires=fireside.socket
-After=network.target fireside.socket
-RequiresMountsFor=/opt/fireside/current /var/lib/fireside
+Requires=fireside.socket fireside-release-recover.service fireside-runtime-gate.service
+After=network.target fireside.socket fireside-release-recover.service fireside-runtime-gate.service
+RequiresMountsFor=/opt/fireside /var/lib/fireside /var/lib/fireside-release
 
 [Service]
 Type=exec
 User=fireside
 Group=fireside
-WorkingDirectory=/opt/fireside/current
+WorkingDirectory=-/run/fireside-runtime/current
 Environment=NODE_ENV=production
 Environment=DATABASE_PATH=/var/lib/fireside/fireside.db
 EnvironmentFile=/etc/fireside.env
-ExecStart=/usr/bin/node /opt/fireside/current/server-build/server/index.js
+ExecStart=/usr/bin/node /run/fireside-runtime/current/server-build/server/index.js
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=30s
@@ -23,6 +23,7 @@ UMask=0077
 StateDirectory=fireside
 StateDirectoryMode=0700
 ReadWritePaths=/var/lib/fireside
+ReadOnlyPaths=/run/fireside-runtime
 InaccessiblePaths=/etc/fireside.env
 
 NoNewPrivileges=true

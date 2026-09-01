@@ -1,0 +1,39 @@
+[Unit]
+Description=Recover and validate Fireside before backup
+Documentation=https://github.com/ShijunDeng/fireside
+Requires=fireside-release-recover.service
+After=fireside-release-recover.service
+Before=fireside-backup.service
+RequiresMountsFor=/opt/fireside /var/lib/fireside /var/lib/fireside-release /var/backups/fireside
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/fireside-release gate backup
+TimeoutStartSec=150s
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/fireside /var/lib/fireside-release /var/lib/fireside /run
+ReadOnlyPaths=/var/backups/fireside
+InaccessiblePaths=/etc/fireside.env
+

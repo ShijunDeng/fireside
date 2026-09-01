@@ -1,0 +1,39 @@
+[Unit]
+Description=Recover interrupted Fireside release transaction
+Documentation=https://github.com/ShijunDeng/fireside
+Before=fireside.service
+RequiresMountsFor=/opt/fireside /var/lib/fireside-release /var/lib/fireside /var/backups/fireside
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+ExecStart=/usr/local/sbin/fireside-release recover --boot
+TimeoutStartSec=150s
+UMask=0077
+
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/opt/fireside /var/lib/fireside-release /var/lib/fireside /run
+ReadOnlyPaths=/var/backups/fireside
+InaccessiblePaths=/etc/fireside.env

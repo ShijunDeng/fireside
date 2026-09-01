@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { constants as fsConstants, createReadStream } from 'node:fs';
 import {
   chmod,
   lstat,
@@ -14,6 +14,16 @@ import path from 'node:path';
 
 const DEFAULT_RETENTION = 14;
 const BACKUP_NAME = /^fireside-backup-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z-([a-f0-9]{16})\.sqlite3$/;
+const TEMPORARY_BACKUP_NAME = /^\.(fireside-backup-\d{8}T\d{9}Z-[a-f0-9]{16}\.sqlite3)\.([1-9]\d*)\.tmp(?:-(?:wal|shm|journal))?$/;
+
+export const BACKUP_MUTEX_FILENAME = '.fireside-backup.mutex.sqlite3';
+export const BACKUP_ORPHAN_MINIMUM_AGE_MS = 24 * 60 * 60 * 1_000;
+
+export type BackupFaultPoint =
+  | 'temporary-file-sync'
+  | 'published-directory-sync'
+  | 'prune'
+  | 'pruned-directory-sync';
 
 export type DatabaseFingerprint = {
   integrityCheck: 'ok';
@@ -22,6 +32,7 @@ export type DatabaseFingerprint = {
   orderVersion: number;
   revisionsSha256: string;
   sensitivePresenceSha256: string;
+  businessDataSha256: string;
   contentSha256: string;
 };
 
@@ -44,6 +55,8 @@ export type CreateBackupOptions = {
   retention?: number;
   now?: () => Date;
   randomBytes?: (size: number) => Uint8Array;
+  faultInjector?: (point: BackupFaultPoint) => void | Promise<void>;
+  orphanOwnerUid?: number;
 };
 
 type SqliteValue = null | number | bigint | string | Buffer;
@@ -96,6 +109,39 @@ function contentFingerprint(db: Database.Database) {
   return hash.digest('hex');
 }
 
+const BUSINESS_TABLES = [
+  {
+    name: 'topics',
+    columns: [
+      'id', 'position', 'revision', 'title', 'summary', 'proposer', 'presenter', 'tags', 'status',
+      'scheduled_at', 'duration', 'room', 'meeting_url', 'takeaway', 'material_url', 'created_at',
+      'updated_at', 'archived_at',
+    ],
+  },
+  {
+    name: 'topic_participants',
+    columns: ['id', 'topic_id', 'name', 'normalized_name', 'created_at'],
+  },
+  {
+    name: 'topic_order_state',
+    columns: ['id', 'version'],
+  },
+] as const;
+
+function businessDataFingerprint(db: Database.Database) {
+  const hash = createHash('sha256');
+  for (const table of BUSINESS_TABLES) {
+    hash.update(JSON.stringify({ table: table.name, columns: table.columns }));
+    hash.update('\n');
+    const selected = table.columns.map(quoteIdentifier).join(', ');
+    const statement = db.prepare(`SELECT ${selected} FROM ${quoteIdentifier(table.name)} ORDER BY ${quoteIdentifier('id')} ASC`);
+    for (const row of statement.iterate() as IterableIterator<SqliteRow>) {
+      updateRowHash(hash, [...table.columns], row);
+    }
+  }
+  return hash.digest('hex');
+}
+
 function inspectOpenDatabase(db: Database.Database): DatabaseFingerprint {
   db.pragma('query_only = ON');
   const integrity = db.pragma('integrity_check') as { integrity_check: string }[];
@@ -138,6 +184,7 @@ function inspectOpenDatabase(db: Database.Database): DatabaseFingerprint {
     orderVersion,
     revisionsSha256: revisions.digest('hex'),
     sensitivePresenceSha256: sensitivePresence.digest('hex'),
+    businessDataSha256: businessDataFingerprint(db),
     contentSha256: contentFingerprint(db),
   };
 }
@@ -192,6 +239,61 @@ async function requireBackupDirectory(directory: string) {
   if (!info.isDirectory() || info.isSymbolicLink()) throw new TypeError('Backup destination must be a real directory');
 }
 
+async function acquireBackupMutex(directory: string) {
+  const mutexPath = path.join(directory, BACKUP_MUTEX_FILENAME);
+  const mutexHandle = await open(
+    mutexPath,
+    fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    const info = await mutexHandle.stat();
+    const currentUid = process.getuid?.();
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || (currentUid !== undefined && info.uid !== currentUid)) {
+      throw new Error('Backup mutex must be an owned regular file');
+    }
+    await mutexHandle.chmod(0o600);
+  } finally {
+    await mutexHandle.close();
+  }
+
+  const mutex = new Database(mutexPath, { fileMustExist: true, timeout: 0 });
+  try {
+    mutex.exec('BEGIN EXCLUSIVE');
+    return mutex;
+  } catch (error) {
+    mutex.close();
+    if ((error as { code?: string }).code === 'SQLITE_BUSY' || (error as { code?: string }).code === 'SQLITE_LOCKED') {
+      throw new Error('A backup is already in progress for this directory');
+    }
+    throw error;
+  }
+}
+
+async function syncFile(filename: string, options: CreateBackupOptions) {
+  const handle = await open(filename, 'r+');
+  try {
+    await options.faultInjector?.('temporary-file-sync');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(
+  directory: string,
+  options?: CreateBackupOptions,
+  faultPoint?: Extract<BackupFaultPoint, 'published-directory-sync' | 'pruned-directory-sync'>,
+) {
+  const handle = await open(directory, 'r');
+  try {
+    if (faultPoint) await options?.faultInjector?.(faultPoint);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 async function requireAbsent(filename: string) {
   try {
     await lstat(filename);
@@ -203,16 +305,62 @@ async function requireAbsent(filename: string) {
 }
 
 async function removeFilesIfPresent(filenames: string[]) {
+  let removed = 0;
   for (const filename of filenames) {
     try {
       await unlink(filename);
+      removed += 1;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
+  return removed;
 }
 
-async function pruneBackups(directory: string, retention: number, publishedFilename: string) {
+function isTemporaryBackupName(filename: string) {
+  const match = TEMPORARY_BACKUP_NAME.exec(filename);
+  return Boolean(match && backupNameTimestamp(match[1]) !== null);
+}
+
+async function cleanupStaleBackupOrphans(
+  directory: string,
+  now: Date,
+  ownerUid: number,
+) {
+  const cutoff = now.getTime() - BACKUP_ORPHAN_MINIMUM_AGE_MS;
+  let removed = 0;
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (!isTemporaryBackupName(entry.name)) continue;
+    const filename = path.join(directory, entry.name);
+    let info;
+    try {
+      info = await lstat(filename);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!info.isFile()
+      || info.isSymbolicLink()
+      || info.nlink !== 1
+      || info.uid !== ownerUid
+      || !Number.isFinite(info.mtimeMs)
+      || info.mtimeMs >= cutoff) continue;
+    try {
+      await unlink(filename);
+      removed += 1;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  if (removed > 0) await syncDirectory(directory);
+}
+
+async function pruneBackups(
+  directory: string,
+  retention: number,
+  publishedFilename: string,
+  options: CreateBackupOptions,
+) {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
@@ -230,6 +378,15 @@ async function pruneBackups(directory: string, retention: number, publishedFilen
       .slice(0, retention - 1)
       .map(({ name }) => name),
   ]);
+  try {
+    await options.faultInjector?.('prune');
+  } catch {
+    return {
+      retainedBackups: matching.length,
+      prunedBackups: 0,
+      retentionErrors: 1,
+    };
+  }
   let prunedBackups = 0;
   let retentionErrors = 0;
   for (const entry of matching.filter(({ name }) => !retainedNames.has(name))) {
@@ -253,61 +410,71 @@ export async function createSqliteBackup(options: CreateBackupOptions): Promise<
   if (!Number.isSafeInteger(retention) || retention < 1) throw new TypeError('Backup retention must be a positive safe integer');
   if (!options.sourcePath) throw new TypeError('Backup source path is required');
   if (!options.backupDirectory) throw new TypeError('Backup destination directory is required');
+  const orphanOwnerUid = options.orphanOwnerUid ?? 0;
+  if (!Number.isSafeInteger(orphanOwnerUid) || orphanOwnerUid < 0) throw new TypeError('Backup orphan owner must be a non-negative safe integer');
 
   await requireBackupDirectory(options.backupDirectory);
-  const createdAt = (options.now ?? (() => new Date()))();
-  const timestamp = formatTimestamp(createdAt);
-  const nonceBytes = (options.randomBytes ?? cryptoRandomBytes)(8);
-  if (!(nonceBytes instanceof Uint8Array) || nonceBytes.byteLength !== 8) {
-    throw new TypeError('Backup random source must return exactly 8 bytes');
-  }
-  const nonce = Buffer.from(nonceBytes).toString('hex');
-  const filename = `fireside-backup-${timestamp}-${nonce}.sqlite3`;
-  if (!isBackupFilename(filename)) throw new Error('Generated backup filename is invalid');
-  const finalPath = path.join(options.backupDirectory, filename);
-  const temporaryPath = path.join(options.backupDirectory, `.${filename}.${process.pid}.tmp`);
-  const temporarySidecars = [`${temporaryPath}-wal`, `${temporaryPath}-shm`];
-  await requireAbsent(finalPath);
-
-  let source: Database.Database | null = null;
-  let temporaryCreated = false;
-  let published = false;
+  const mutex = await acquireBackupMutex(options.backupDirectory);
   try {
-    source = new Database(options.sourcePath, { readonly: true, fileMustExist: true });
-    source.pragma('query_only = ON');
-    const temporary = await open(temporaryPath, 'wx', 0o600);
-    temporaryCreated = true;
-    await temporary.close();
-    await source.backup(temporaryPath);
-    source.close();
-    source = null;
-
-    await chmod(temporaryPath, 0o600);
-    const fingerprint = inspectStandaloneBackup(temporaryPath);
-    await removeFilesIfPresent(temporarySidecars);
-    const fileInfo = await stat(temporaryPath);
-    const sha256 = await sha256File(temporaryPath);
-    await rename(temporaryPath, finalPath);
-    temporaryCreated = false;
-    published = true;
-
-    const retentionResult = await pruneBackups(options.backupDirectory, retention, filename);
-    return {
-      createdAt: createdAt.toISOString(),
-      filename,
-      bytes: fileInfo.size,
-      sha256,
-      topicCount: fingerprint.topicCount,
-      participantCount: fingerprint.participantCount,
-      orderVersion: fingerprint.orderVersion,
-      ...retentionResult,
-    };
-  } catch (error) {
-    if (!published && temporaryCreated) {
-      await removeFilesIfPresent([temporaryPath, ...temporarySidecars]).catch(() => undefined);
+    const createdAt = (options.now ?? (() => new Date()))();
+    const timestamp = formatTimestamp(createdAt);
+    await cleanupStaleBackupOrphans(options.backupDirectory, createdAt, orphanOwnerUid);
+    const nonceBytes = (options.randomBytes ?? cryptoRandomBytes)(8);
+    if (!(nonceBytes instanceof Uint8Array) || nonceBytes.byteLength !== 8) {
+      throw new TypeError('Backup random source must return exactly 8 bytes');
     }
-    throw error;
+    const nonce = Buffer.from(nonceBytes).toString('hex');
+    const filename = `fireside-backup-${timestamp}-${nonce}.sqlite3`;
+    if (!isBackupFilename(filename)) throw new Error('Generated backup filename is invalid');
+    const finalPath = path.join(options.backupDirectory, filename);
+    const temporaryPath = path.join(options.backupDirectory, `.${filename}.${process.pid}.tmp`);
+    const temporarySidecars = [`${temporaryPath}-wal`, `${temporaryPath}-shm`, `${temporaryPath}-journal`];
+    await requireAbsent(finalPath);
+
+    let source: Database.Database | null = null;
+    let temporaryCreated = false;
+    try {
+      source = new Database(options.sourcePath, { readonly: true, fileMustExist: true });
+      source.pragma('query_only = ON');
+      const temporary = await open(temporaryPath, 'wx', 0o600);
+      temporaryCreated = true;
+      await temporary.close();
+      await source.backup(temporaryPath);
+      source.close();
+      source = null;
+
+      await chmod(temporaryPath, 0o600);
+      const fingerprint = inspectStandaloneBackup(temporaryPath);
+      await removeFilesIfPresent(temporarySidecars);
+      const fileInfo = await stat(temporaryPath);
+      const sha256 = await sha256File(temporaryPath);
+      await syncFile(temporaryPath, options);
+      await rename(temporaryPath, finalPath);
+      temporaryCreated = false;
+      await syncDirectory(options.backupDirectory, options, 'published-directory-sync');
+
+      const retentionResult = await pruneBackups(options.backupDirectory, retention, filename, options);
+      await syncDirectory(options.backupDirectory, options, 'pruned-directory-sync');
+      return {
+        createdAt: createdAt.toISOString(),
+        filename,
+        bytes: fileInfo.size,
+        sha256,
+        topicCount: fingerprint.topicCount,
+        participantCount: fingerprint.participantCount,
+        orderVersion: fingerprint.orderVersion,
+        ...retentionResult,
+      };
+    } catch (error) {
+      if (temporaryCreated) {
+        const removed = await removeFilesIfPresent([temporaryPath, ...temporarySidecars]).catch(() => 0);
+        if (removed > 0) await syncDirectory(options.backupDirectory).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (source?.open) source.close();
+    }
   } finally {
-    if (source?.open) source.close();
+    mutex.close();
   }
 }

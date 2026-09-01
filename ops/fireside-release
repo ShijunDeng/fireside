@@ -1,0 +1,55 @@
+#!/bin/bash -p
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+unset CDPATH ENV BASH_ENV NODE_OPTIONS NODE_PATH LD_PRELOAD LD_LIBRARY_PATH
+
+entry_path=$(readlink -f -- "${BASH_SOURCE[0]}")
+entry_dir=$(cd -- "$(dirname -- "${entry_path}")" && pwd)
+if [[ ${entry_dir} == /usr/local/sbin ]]; then
+  controller_root=/usr/local/libexec/fireside-release
+else
+  controller_root=${entry_dir}
+fi
+# shellcheck source=ops/release-lib.sh
+source "${controller_root}/release-lib.sh"
+if release_is_production_controller "${controller_root}"; then
+  release_reject_production_overrides "${controller_root}" || exit 2
+fi
+release_sanitize_environment
+
+action=${1:-}
+if [[ $# -gt 0 ]]; then shift; fi
+case "${action}" in
+  install)
+    exec "${controller_root}/install-release.sh" "$@"
+    ;;
+  promote)
+    exec "${controller_root}/promote-release.sh" "$@"
+    ;;
+  bootstrap)
+    exec "${controller_root}/promote-release.sh" --bootstrap "$@"
+    ;;
+  rollback)
+    exec "${controller_root}/rollback-release.sh" "$@"
+    ;;
+  recover)
+    exec "${controller_root}/promote-release.sh" --recover "$@"
+    ;;
+  gate)
+    case "${1:-}:$#" in
+      service:1) exec "${controller_root}/promote-release.sh" --service-gate ;;
+      backup:1) exec "${controller_root}/promote-release.sh" --backup-gate ;;
+      *) echo 'usage: fireside-release gate {service|backup}' >&2; exit 2 ;;
+    esac
+    ;;
+  watchdog)
+    exec "${controller_root}/promote-release.sh" --watchdog "$@"
+    ;;
+  status)
+    exec "${controller_root}/release-status.sh" "$@"
+    ;;
+  *)
+    echo 'usage: fireside-release {install|bootstrap|promote|rollback|recover|gate|watchdog|status} ...' >&2
+    exit 2
+    ;;
+esac

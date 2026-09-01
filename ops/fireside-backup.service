@@ -1,22 +1,25 @@
 [Unit]
 Description=Fireside SQLite Online Backup
 Documentation=https://github.com/ShijunDeng/fireside
-RequiresMountsFor=/opt/fireside/current /var/lib/fireside /var/backups/fireside
+Requires=fireside-release-recover.service fireside-backup-gate.service
+After=fireside-release-recover.service fireside-backup-gate.service
+RequiresMountsFor=/opt/fireside /var/lib/fireside /var/lib/fireside-release /var/backups/fireside
 
 [Service]
 Type=oneshot
 User=root
 Group=root
-WorkingDirectory=/opt/fireside/current
+WorkingDirectory=-/run/fireside-runtime/current
 Environment=NODE_ENV=production
 Environment=DATABASE_PATH=/var/lib/fireside/fireside.db
 Environment=BACKUP_DIRECTORY=/var/backups/fireside
 Environment=BACKUP_RETENTION=14
-ExecStart=/usr/bin/node /opt/fireside/current/server-build/server/backup-cli.js
+ExecStart=/usr/local/libexec/fireside-release/guarded-backup.sh
 UMask=0077
 
 ReadOnlyPaths=/var/lib/fireside
 ReadWritePaths=/var/backups/fireside
+ReadOnlyPaths=/run
 InaccessiblePaths=/etc/fireside.env
 
 NoNewPrivileges=true

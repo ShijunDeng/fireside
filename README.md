@@ -102,10 +102,13 @@ sudo groupadd --system fireside
 sudo useradd --system --gid fireside --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin fireside
 sudo install -d -o root -g root -m 0755 /opt/fireside/releases
 sudo install -d -o fireside -g fireside -m 0700 /var/lib/fireside
+sudo install -d -o root -g root -m 0700 /var/lib/fireside-release
 sudo install -d -o root -g root -m 0700 /var/backups/fireside
+sudo stat -c '%U:%G:%a %n' \
+  /opt/fireside/releases /var/lib/fireside /var/lib/fireside-release /var/backups/fireside
 ```
 
-如果账户或目录已存在，应先核对而不是删除重建。生产共享口令只写入 `/etc/fireside.env`：
+上述输出必须依次为 `root:root:755`、`fireside:fireside:700`、`root:root:700`、`root:root:700`。如果账户或目录已存在，应先核对而不是删除重建；任一目录缺失或元数据不符都不得继续启动 recovery。生产共享口令只写入 `/etc/fireside.env`：
 
 ```dotenv
 FIRESIDE_WRITE_KEY=<由安全随机源生成的 32 至 256 字符值>
@@ -122,15 +125,40 @@ sudo chmod 0600 /etc/fireside.env
 
 ### 构建并安装版本化 release
 
-在普通构建目录完成依赖安装和质量检查；`npm run build` 会生成前端及预编译服务端到 `server-build/`。提交并推送自测成功的代码后，由安装脚本在临时目录安装生产依赖、固化 root-only release，并原子切换 `current`。不要在 `/opt/fireside/current` 中执行安装或构建。
+生产发布不执行 Git 工作树里的 root 脚本。先创建与 `fireside` 完全分离、无登录 home 和附加组的构建身份，再把已审阅、已提交的控制器文件复制到 root-owned 固定路径。此复制是控制器的显式 bootstrap；日常 `install/promote/rollback/recover` 只从 `/usr/local` 入口执行。
+
+```bash
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin fireside-build
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/fireside-release
+sudo install -o root -g root -m 0755 \
+  ops/install-release.sh ops/promote-release.sh ops/rollback-release.sh \
+  ops/release-status.sh ops/release-lib.sh ops/guarded-backup.sh \
+  /usr/local/libexec/fireside-release/
+sudo install -o root -g root -m 0444 ops/controller-assets/CONTROLLER_PRODUCTION_MODE \
+  /usr/local/libexec/fireside-release/CONTROLLER_PRODUCTION_MODE
+sudo install -o root -g root -m 0644 ops/release-preflight.mjs \
+  /usr/local/libexec/fireside-release/release-preflight.mjs
+sudo install -o root -g root -m 0755 ops/fireside-release /usr/local/sbin/fireside-release
+```
+
+普通用户先完成质量检查、commit 与 SSH push；确认工作树干净且 HEAD 已属于 `origin/main` 后，先完成下方 systemd 单元安装，再安装候选并按主机状态选择 `bootstrap` 或 `promote`：
 
 ```bash
 npm ci
 npm run check
+npm run test:e2e -- --retries=0
 git commit
-git push
-sudo ops/install-release.sh "$(git rev-parse HEAD)"
+GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' git push ssh://git@ssh.github.com:443/ShijunDeng/fireside.git main
+GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' git fetch ssh://git@ssh.github.com:443/ShijunDeng/fireside.git refs/heads/main:refs/remotes/origin/main
+commit=$(git rev-parse HEAD)
+test "$(git rev-parse refs/remotes/origin/main)" = "${commit}"
+git diff --exit-code
+sudo /usr/local/sbin/fireside-release install "${commit}"
 ```
+
+`install` 从该 commit 生成唯一源码归档，不读取 ignored `server-build/`；npm lifecycle 只以 `fireside-build` 运行，测试/构建/数据库预检使用独立 cgroup，含生产备份副本的预检没有外网。root 在构建身份退出后生成包含 commit、Git tree、源码归档 SHA-256、Node/npm 版本和完整文件集合/模式/大小/哈希的 manifest。候选安装完成仍不会改变 `current`。
+
+`promote` 在同一维护锁内确认当前版本健康、创建在线备份、让候选迁移隔离副本，再让旧版本读取同一副本验证回滚兼容。只有全部通过才写入 fsync 事务日志、原子切换、重启，并以 socket/service、稳定 MainPID、UID、实际 cwd 和连续健康请求验收。失败自动恢复调用前版本；回退成功返回 3，回退本身失败返回 4，锁冲突返回 75。
 
 安装后的结构必须类似：
 
@@ -146,7 +174,7 @@ sudo ops/install-release.sh "$(git rev-parse HEAD)"
 └── package-lock.json
 ```
 
-安装脚本拒绝脏工作树、commit 不匹配、缺少构建产物和覆盖已有 release；release 及其中所有文件归 `root:root` 所有，服务账户不可写。脚本只在新目录准备完成后原子更新 `/opt/fireside/current`；运维人员至少保留当前和上一个健康 release。
+控制器拒绝短 SHA、不是固定 GitHub 仓库权威 `main` 头部的 commit、脏工作树、特殊文件、越界链接、manifest 外文件、陈旧/篡改产物和覆盖已有 release。本地 `origin/main` 只用于操作者的前置确认，不能替代控制器对 GitHub 的独立核验。release 归 `root:root` 所有，服务账户只读。`/opt/fireside/previous` 只在新版本稳定健康后指向调用前版本；`/var/lib/fireside-release/transaction` 是 root-only 发布事务日志。
 
 ### 安装 systemd 单元
 
@@ -155,13 +183,29 @@ sudo install -o root -g root -m 0644 ops/fireside.service /etc/systemd/system/fi
 sudo install -o root -g root -m 0644 ops/fireside.socket /etc/systemd/system/fireside.socket
 sudo install -o root -g root -m 0644 ops/fireside-backup.service /etc/systemd/system/fireside-backup.service
 sudo install -o root -g root -m 0644 ops/fireside-backup.timer /etc/systemd/system/fireside-backup.timer
+sudo install -o root -g root -m 0644 ops/fireside-release-recover.service /etc/systemd/system/fireside-release-recover.service
+sudo install -o root -g root -m 0644 ops/fireside-runtime-gate.service /etc/systemd/system/fireside-runtime-gate.service
+sudo install -o root -g root -m 0644 ops/fireside-backup-gate.service /etc/systemd/system/fireside-backup-gate.service
 sudo systemctl daemon-reload
 sudo systemctl disable fireside.service
 sudo systemctl enable fireside.socket fireside-backup.timer
-sudo systemctl start fireside.socket fireside.service fireside-backup.timer
+sudo systemctl start fireside-release-recover.service
 ```
 
-只启用 socket 和 timer；服务由 socket 激活，也可以在发布完成后显式启动。应用没有 `CAP_NET_BIND_SERVICE` 或其他 capability。后续重启时 socket 继续监听 80，连接可以短暂排队。首次从旧 Node 进程直接占用 80 切换到 socket activation 时，单机仍有一次不可完全消除的短切换窗口；要求绝对零丢包时必须先提供外部负载均衡或第二实例。
+干净主机没有 `current` / `previous` 时只执行一次显式自举；已有健康 `current` 的主机执行普通提升，两者不能互换：
+
+```bash
+# 干净主机
+sudo /usr/local/sbin/fireside-release bootstrap "${commit}"
+
+# 已有健康版本
+sudo /usr/local/sbin/fireside-release promote "${commit}"
+
+sudo systemctl start fireside.socket fireside.service fireside-backup.timer
+sudo /usr/local/sbin/fireside-release status
+```
+
+`bootstrap` 会拒绝任何既有/异常 current、previous 或 transaction；有历史主库时先生成并以大小+SHA-256绑定一致备份，失败恢复原业务指纹。`/run` 被清空的冷启动由独立 root gate 从健康 current重建 selector 与按commit绑定的写许可。只启用socket和timer；服务由socket激活，也可以在发布完成后显式启动。应用没有 `CAP_NET_BIND_SERVICE` 或其他 capability。后续重启时socket继续监听80，连接可以短暂排队。
 
 ### 从旧工作树迁移生产数据库
 
@@ -178,20 +222,27 @@ sudo systemctl start fireside.socket fireside.service fireside-backup.timer
 
 ### 日常发布与回滚
 
-发布前先手动生成一次一致备份，并在隔离副本上运行新 release 的启动迁移与完整性检查。不可逆 schema 变化必须采用 expand / migrate / contract 分阶段方式，保证当前与上一个 release 在回滚期都能读取数据库。
+日常发布只使用上述 `install` 与 `promote`。控制器会自动完成新备份、候选迁移、旧版本向后兼容预检、原子切换、稳定健康门禁和失败回退；不要手工改写 `current` / `previous`。不可逆 schema 变化必须采用 expand / migrate / contract 分阶段方式，保证当前与上一个 release 在回滚期都能读取数据库。
 
-确认后原子切换 `current` 链接并重启服务：
+显式回到上一健康版本，或回到指定的已验证 commit：
 
 ```bash
-sudo systemctl start fireside-backup.service
-sudo systemctl restart fireside.service
+sudo /usr/local/sbin/fireside-release rollback --previous
+sudo /usr/local/sbin/fireside-release rollback <40位commit>
 ```
 
-socket 在服务优雅停止和新进程启动期间保持 80 监听。健康检查失败时，把 `current` 链接切回上一 release 并再次重启；不要覆盖状态目录。只有完成兼容迁移且确需恢复数据时，才在服务停止后从已校验备份恢复。
+rollback 使用与 promote 相同的备份、隔离兼容、事务日志、稳定健康和失败恢复门禁；成功后 `previous` 指向调用前版本，便于撤销本次回滚。socket 在服务切换期间持续监听 80。任何代码回退都不自动恢复数据库；只有完成兼容迁移且确需恢复数据时，才在服务停止后从已校验备份人工恢复。
+
+每个变更命令都会先恢复未完成事务；`fireside-release-recover.service` 还会在应用启动前把掉电/SIGKILL 中断的双指针切换恢复到调用前版本。人工检查或恢复：
+
+```bash
+sudo /usr/local/sbin/fireside-release status
+sudo /usr/local/sbin/fireside-release recover
+```
 
 ### 一致备份与恢复演练
 
-`fireside-backup.timer` 每天 03:15 进入计划，并加入最多 15 分钟随机延迟分散系统负载；`Persistent=true` 会在主机错过计划后补跑。备份 CLI 从以下环境读取配置：
+`fireside-backup.timer` 每天 03:15 进入计划，并加入最多 15 分钟随机延迟分散系统负载；`Persistent=true` 会在主机错过计划后补跑。独立 root gate 先恢复孤儿事务并从健康 `current` 重建 `/run` 运行态；随后最小权限 runner 对发布维护锁持共享锁，再次核对 selector、写许可和无事务状态，避免 timer 跨版本或从未验收候选备份。gate、watchdog 与 backup 都不继承应用口令。备份 CLI 从以下环境读取配置：
 
 ```text
 DATABASE_PATH=/var/lib/fireside/fireside.db
@@ -208,7 +259,7 @@ sudo journalctl -u fireside-backup.service -n 20 --no-pager
 sudo systemctl list-timers fireside-backup.timer --no-pager
 ```
 
-成功日志只包含时间、备份文件名、字节数、SHA-256、Topic 数、参与人数和 order version，不得包含标题、姓名、会议链接、口令或 token。只有新备份成功并通过完整性检查后，CLI 才会删除严格匹配命名规则的超额旧备份，默认保留 14 份。
+成功日志只包含时间、备份文件名、字节数、SHA-256、Topic 数、参与人数和 order version，不得包含标题、姓名、会议链接、口令或 token。发布顺序为临时文件 fsync → rename → 目录 fsync → prune → 目录 fsync；只有新备份已持久化才会删除严格匹配命名规则的超额旧备份，默认保留 14 份。同目录 SQLite mutex 防止并发任务；下一轮只清理严格命名、root 所有、单链接普通文件且超过 24 小时的崩溃孤儿。
 
 恢复演练在 root-only 临时目录中复制最新备份，以只读方式执行 `integrity_check`，并比较 Topic 数、全部 revision、order version、参与人数和敏感字段存在性摘要。演练不得监听生产端口、修改生产库或改变 `current`；完成后只删除本次明确创建的临时目录。本机备份不等于主机级灾难恢复，仍需另行提供加密异地备份。
 

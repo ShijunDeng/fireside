@@ -243,3 +243,14 @@
 - previous回滚意图阻断 AF：wrapper锁外解析`--previous`可与并发promote交错并静默回到上上版。原样传入主锁监督下的promote再解析；锁时值变化时只允许采用新previous或明确拒绝。
 - supervisor死亡耦合阻断 AG：仅杀`flock --close`父会释放锁但留下旧mutating worker。worker置于独立session/process group；接管者若见journal owner仍活跃，验证固定身份后终止/reap整组再恢复，无法证明则返回4。故障注入不得复活journal/target。
 - release父链可读阻断 AH：静态检查只覆盖commit子树会漏`/opt/fireside/releases`等父目录0700，root gate误放而应用EACCES循环。完整父链逐级验证真实目录、root owner、非可写、other+x，失败不发布selector/permit。
+- 进程组清空阻断 AI：原实现 TERM 整组后只轮询 journal leader；leader先退出会误报恢复可安全继续，忽略 TERM 的同组后代可迟到复活journal/current。必须按原PGID/session枚举证明整组为空，超时KILL后再证明；只有leader消失不是成功。
+- install恢复优先级阻断 AJ：install拿到主锁后若不先查未完成事务，可用20–40分钟构建阻塞watchdog，让未验target继公网运行且写全部503。锁内第一个状态动作必须fail closed检查transaction/active，在任何fetch/build/stage前让出锁交由恢复者。
+- 独立service gate裂脑阻断 AK：`fireside-runtime-gate.service`可直接启动，不能假定旧MainPID已停。target仍在线时的no-restart恢复会清journal却留下进程target/指针origin裂脑。gate必须先证明MainPID=0，否则做完整restart+health或保留journal失败。
+- 事务证据清理阻断 AL：原`clear_transaction`先删journal再清active；active为目录/异常类型时会丢失唯一事务证据并陷入无journal永久503。清理前同时验证两个固定目标及active txid；任一异常时两者均保留。
+- 新机状态目录阻断 AM：README声称准备四个目录却遗漏`/var/lib/fireside-release`；recovery unit 的`ReadWritePaths`会因目标不存在在ExecStart前以226/NAMESPACE失败。新机流程必须显式创建并stat验证root:root0700，再启动recovery。
+- 最小权限健康身份阻断 AN：backup gate/watchdog无`CAP_SYS_PTRACE`时不能`readlink /proc/MainPID/cwd`，完整恢复会在已restart origin后失败并留下reverting/503。不为此扩权读取Node环境；新版本以受信health commit证明身份，显式legacy才允许无shell/无环境的同UID固定helper只读cwd。
+- watchdog无journal窗口阻断 AO：原顺序先启动watchdog后写prepared；两步间监督锁被杀时，watchdog先见无journal成功退出，孤儿worker可再无锁/无守护切换。顺序改为锁内先持久化无副作用prepared，再启动并确认watchdog；启动失败在active/revoke前安全清理或保留证据。
+- 敏感preflight孤儿阻断 AP：随机`/run/fireside-promote.*`在chown后被SIGKILL会跨命令遗留，下一次同UID且带网的npm lifecycle可扫描并外传生产DB。改为root-only固定父目录+仅当次无网unit绑定暴露；有网build明确隐藏父目录，每次主锁入口先停旧transient再清孤儿。
+- leader先死进程组阻断 AQ：AI首修仍以`transaction_owner_is_active || return 0`开头；worker leader在watchdog进入前被SIGKILL时会跳过同session后代枚举，迟到子进程仍可复活指针/journal。恢复必须在leader缺失时仍按记录PGID/session清空后代。
+
+本轮新增 AI/AJ/AK/AM/AN/AO/AP/AQ 八个 P1 与 AL 高价值 P2，即使基线全量 `check` 已通过，成熟度连续计数仍为 0。只有这些缺口修复、生产验收、页面全部功能与端到端操作逻辑闭环后，再完成连续两轮无新 P0/P1/合理高价值 P2 的独立审计，循环才允许停止。任何新发现都立即归零。
