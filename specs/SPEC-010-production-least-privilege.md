@@ -1,6 +1,6 @@
 # SPEC-010：生产最小权限、私有状态与可恢复发布
 
-- 状态：`Ready`
+- 状态：`Implementing`
 - 创建：2026-09-02
 - 优先级：P1
 - 关联：SPEC-001 部署、SPEC-003 第 14 轮、SPEC-009 生产认证边界
@@ -70,8 +70,20 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 ### FR-OPS-006 预编译服务端
 
 - `npm run build` 同时生成 Vite 客户端和 TypeScript 服务端 JavaScript；生产入口为编译后的 `server/index.js`。
-- 生产依赖安装在 release 内；release 建成、依赖安装和最小自检成功后才允许原子切换 `current`。
+- 发布工具必须从请求的完整 40 位 Git commit 导出干净源码后重新安装依赖、测试和构建，不能复制被 `.gitignore` 隐藏的工作树 `server-build/`；commit、源码树和实际产物必须由 root 生成的 SHA-256 manifest 绑定。
+- npm lifecycle、测试、构建和候选应用代码不得以 root 或 `fireside` 生产身份执行；使用无登录、无生产状态/密钥/备份权限的固定 `fireside-build` 身份。root 只负责导出源码、固化所有权、校验 manifest 和原子维护 release 指针。
+- `server-build/server/index.js`、`backup-cli.js`、预检入口、客户端 `index.html`、`package.json`、`package-lock.json` 与 manifest 必须是 release 内普通文件，不能是符号链接；manifest 校验失败、产物陈旧或被篡改时拒绝安装。
+- 生产依赖安装在 release 内；release 建成、依赖安装和最小自检成功后才允许进入提升阶段。
 - 每个 release 以 Git commit 标识且不可就地修改；至少保留当前与上一健康 release。回滚只切换链接并重启 service，不触碰状态目录。
+
+### FR-OPS-010 候选门禁、原子提升与失败回滚
+
+- 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
+- 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
+- 提升时先解析并保存当前健康 release，再原子切换 `current`、重启服务并在有界时间内检查 HTTP 健康和 MainPID 实际运行目录。两项都成功后才原子更新 `previous` 为原健康 release并报告成功。
+- 新服务启动、健康或运行目录验证失败时，工具必须自动把 `current` 原子切回原健康 release、重启并验证恢复；返回非零且不得自动恢复数据库。若回退服务也不健康，必须返回独立的致命错误，保留 socket、状态、备份和两个 release 供人工处置。
+- 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
+- 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 
 ### FR-OPS-007 数据库迁移兼容
 
@@ -84,7 +96,10 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 ### FR-OPS-008 在线一致备份
 
 - 使用 `better-sqlite3` backup API 从活动 WAL 数据库生成单文件一致备份，禁止 `cp fireside.db` 作为备份实现。
-- 写入同目录 root-only 临时文件；在线 backup 完成后先把独立副本转换为 `DELETE` journal，再执行 `integrity_check`，确保最终发布物是无需 WAL/SHM 的单文件快照。校验通过后原子改名；成功或失败都清理本次明确命名的临时主文件、`-wal` 与 `-shm`，不影响既有备份。
+- 写入同目录 root-only 临时文件；在线 backup 完成后先把独立副本转换为 `DELETE` journal，再执行 `integrity_check`，确保最终发布物是无需 WAL/SHM 的单文件快照。校验通过后依次同步临时主文件、原子改名并同步备份目录；只有目录项持久化后才能报告发布成功或清理旧份。
+- 清理超额旧份后再次同步备份目录，保证“新快照已持久化 → 旧份删除已持久化”的顺序。同步失败必须返回失败且不得继续 prune；不得声称一个只存在于页缓存的目录项已成功备份。
+- 每次运行在创建新临时文件前，扫描并只清理严格匹配本应用临时命名、属于 root、不是符号链接/目录、且早于安全阈值的孤儿主文件与 `-wal/-shm`；新鲜文件视为其他可能在途的备份而保留。发布服务的互斥锁必须阻止同一目录的并发任务。
+- 正常成功或可捕获失败都清理本次明确命名的临时主文件、`-wal` 与 `-shm`，不影响既有备份；SIGKILL/断电残留必须能由下一次运行按上述严格条件恢复，而不能无限累积。
 - 成功记录时间、文件名、字节数、SHA-256、Topic 数、参与人数与 order version；不得记录标题、姓名、会议链接、口令或 token。
 - systemd timer 每日运行并支持错过后补跑；默认保留最近 14 份。只有新备份成功且校验通过后，才删除严格匹配命名规则的超额旧备份。
 - 备份服务可为读取 0600 源库拥有唯一必要的只读 DAC 能力，但不得拥有写生产状态、网络或其他 capability；应用服务自身永远不能访问备份目录。
@@ -110,6 +125,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 3. 在线 backup 覆盖 WAL 中未 checkpoint 数据；备份 `journal_mode=delete`、`integrity_check=ok`，Topic/revision/order/参与人数一致，目录中没有本次 `.tmp`、`.tmp-wal`、`.tmp-shm` 或最终同名边车。
 4. 备份失败不留下最终文件；保留策略不删除非匹配文件，且仅在成功后保留最新 14 份。
 5. TypeScript、全部单元/API、生产构建、依赖审计和桌面/Pixel 7 E2E 回归。
+6. 发布测试从提交导出而非复制 ignored build；陈旧/篡改 manifest、必需文件符号链接、非完整 commit 和 root lifecycle 均被拒绝。
+7. 候选语法/依赖/隔离数据库预检任一失败时 `current` 不变；提升后健康失败自动恢复原链接和服务；`previous` 只记录已确认健康版本；显式回滚具有同样门禁。
+8. 备份故障注入覆盖 file sync、首次 directory sync、prune 与末次 directory sync；未持久化新份时不删除旧份。模拟上次崩溃的旧孤儿会被清除，新鲜/非匹配/非 root/符号链接目标不会被触碰。
 
 ### 7.2 生产
 
@@ -120,10 +138,18 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 5. 连续重启期间从本机并发探测 80：socket 始终 LISTEN，无 connection refused；重启后健康页、首页、公开 API、有效协作会话与业务数据正常。
 6. 手动触发一次在线备份并完成隔离恢复演练；生产业务指纹不变，备份日志无敏感字段。
 7. `systemd-analyze security` 不再报告 root、完整 capability、开放 home、共享 tmp 或可写系统目录；记录最终 exposure 分数但以真实功能/权限验证为准。
+8. 用故意无法启动的隔离候选执行生产等价提升测试，验证自动回退后公网 socket、本机健康、原 MainPID release 和业务指纹恢复；测试不得把故障候选留作 `previous`。
 
 ## 8. 完成条件
 
 - 应用以非 root、零 capability、预编译 Node 在 socket activation 下提供 80 服务。
 - 生产状态私有且只有应用可写，密钥和备份对应用不可读写，普通用户不能读取任何数据库工件。
 - 一致备份、完整性检查、保留和隔离恢复演练成立；版本化 release 可回到上一版本且不覆盖数据。
+- 构建产物可追溯到唯一 Git commit，root 不执行仓库 lifecycle；候选在切换前通过隔离门禁，切换失败能自动回到调用前健康版本。
 - 全量自动化、生产迁移、重启连续性、权限矩阵、日志脱敏与独立发布审计通过后，状态方可改为 `Accepted`。
+
+## 9. 发布审计补充（2026-09-02）
+
+首次生产迁移证明非 root 运行、权限分离、socket 连续性和一致备份主体成立，但独立审计发现两个 P1：ignored `server-build/` 可被旧产物冒充当前 commit，且 root 执行依赖 lifecycle；旧安装脚本还会在任何候选健康检查前直接切换 `current`，没有可执行的 previous 指针或自动回退。另发现备份 rename / prune 缺少 file 与 directory fsync，崩溃残留不会在后续运行回收。
+
+这些发现使本规格保持 `Implementing`，成熟度连续通过计数归零。FR-OPS-006、010 和 FR-OPS-008 的新增门禁必须在 Iteration 023 完成后重新执行发布失败注入、备份崩溃恢复、全量自动化和生产验证，才能验收 SPEC-010。

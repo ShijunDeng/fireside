@@ -191,3 +191,15 @@
 - 状态：Ready；生产迁移、回滚副本、权限矩阵、socket 重启连续性与备份恢复未完成前禁止验收。
 - 首次沙箱启动发现：Fastify 监听日志通过 `os.networkInterfaces()` 读取接口，需要 `AF_NETLINK`；原三地址族白名单导致 `uv_interface_addresses` errno 97 并退出。PID 1 socket 始终持有 80、数据未损坏；SPEC-010 已先记录最小放宽，修正后必须重跑真实权限矩阵。
 - 首次真实备份检查发现：`better-sqlite3` 在线 backup 本身成功且内容指纹一致，但对 WAL 模式临时副本做只读完整性检查会留下 `.tmp-wal/.tmp-shm`；直接在备份目录读取旧快照也会创建最终同名边车。该残留不对普通用户可读，但会逐日累积且破坏单文件备份契约；SPEC-010 已先补充 DELETE journal 与边车清理验收，修复前禁止验收。
+
+## Iteration 023：发布产物身份、候选门禁与崩溃安全备份（Implementing）
+
+- 规格：SPEC-010 FR-OPS-006、FR-OPS-010、FR-OPS-008，SPEC-003 第 15 轮。
+- 独立审计发现：`server-build/` 被 Git 忽略，旧安装脚本仅核对 HEAD/dirty/文件存在后直接复制，因此旧或篡改产物可冒充新 commit；脚本还以 root 执行依赖 lifecycle。优先级 P1。
+- 独立审计发现：旧安装脚本在候选语法、依赖、隔离迁移和健康检查前切换 `current`，没有 previous 指针、显式回滚工具或启动失败自动回退；已存在权限不正确的历史 release 证明“目录存在”不能充当健康标记。优先级 P1。
+- 备份审计发现：临时文件到最终文件的 rename、目录项和 prune 没有 fsync 持久化顺序；SIGKILL/断电可能留下随机孤儿且后续任务不回收。优先级高价值 P2，与同一生产可恢复性边界一并修复。
+- 方案：从完整 commit 导出源码，以隔离的 `fireside-build` 用户安装、测试、构建和预检；root 生成 commit + SHA-256 manifest、固化只读 release。候选在最新一致备份副本上通过应用预检后才可原子提升；提升失败自动恢复原版本，维护已确认健康的 `previous`，并提供同门禁显式回滚。
+- 备份顺序：临时主文件 sync → rename → 目录 sync → prune → 目录 sync；发布服务互斥，下一轮只回收严格匹配、root 所有、非链接且超过安全年龄的孤儿。
+- 验收：发布/回滚故障注入、manifest 篡改/陈旧/链接拒绝、root lifecycle 禁止、备份逐阶段故障与孤儿恢复；全量 check、无重试桌面/Pixel E2E、依赖审计、生产备份/恢复、真实自动回退、权限矩阵和 80 端口连续性。
+- 状态：Implementing。任一验收未完成不得接受 SPEC-010；成熟度连续无发现计数为 0。
+- 紧随项：页面承诺的周/月历参与闭环和 Pixel 当前日期定位；请求解析稳定 400/413/415。两者均已由独立证据确认，Iteration 023 完成后继续，不能停止循环。

@@ -35,6 +35,6 @@
 | [SPEC-007](./SPEC-007-activity-phase.md) | Accepted | 活动 UPCOMING / LIVE / ENDED 派生阶段与权威动作准入 |
 | [SPEC-008](./SPEC-008-dialog-stack.md) | Accepted | 叠层弹窗唯一所有权、草稿保护、焦点与共享滚动锁 |
 | [SPEC-009](./SPEC-009-auth-rate-limit.md) | Accepted | 口令抗猜测、短期协作令牌、生产密钥强度与失败关闭 |
-| [SPEC-010](./SPEC-010-production-least-privilege.md) | Ready | 非 root 服务、socket activation、私有状态、一致备份与可回滚发布 |
+| [SPEC-010](./SPEC-010-production-least-privilege.md) | Implementing | 非 root 服务、socket activation、私有状态、崩溃安全备份与门禁回滚发布 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。
