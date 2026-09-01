@@ -80,6 +80,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 
 - 生产发布唯一入口是预装到 `/usr/local/sbin` 与 `/usr/local/libexec` 的 `root:root`、开发用户不可写控制器；禁止通过 `sudo` 直接执行可写 Git 工作树中的脚本。生产路径固定，不接受调用者用环境变量覆盖 release、状态、备份、仓库或服务名。
 - 预装控制器及其任一子脚本必须在解析测试模式、降权用户、路径或 hook 之前识别生产控制器身份；只要调用环境包含 `FIRESIDE_RELEASE_*` 或其他已定义的测试路径/用户覆盖变量，就必须以退出码 2 拒绝，不能仅忽略。该边界也必须由随生产标记复制到隔离目录的控制器夹具验证，不能只测试工作树入口。
+- 控制器不得让 root Git 继承调用者的 `HOME`、XDG、全局/系统配置、`core.fsmonitor`、hooks 或其他可执行配置。所有 Git 读取都必须使用固定 PATH、空的 global/system config，并在命令行禁用 repository-local fsmonitor 与 hooks；隔离生产夹具须注入恶意 HOME/XDG 与仓库本地 fsmonitor 哨兵，证明 status/archive/授权检查前后均不会执行。
+- root 工具的临时目录、代理和 systemd/DBus 目标同样不能由调用者决定：控制器固定 root-only `TMPDIR`，清除大小写代理、`NO_PROXY`、DBus/SYSTEMD 变量；健康 curl 还必须显式 `--noproxy '*'`。manifest 校验不得在调用者目录创建随后按路径重新打开的 root 临时文件，systemctl/systemd-run 只能连接本机系统 manager。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
@@ -91,6 +93,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
 - 健康门禁不是单次 200：socket 与 service active，MainPID UID 为 `fireside`、cwd 精确指向目标 release，PID 在稳定观察窗不变化，且多个新连接健康请求连续成功。previous 更新或其持久化失败也视为提升失败并恢复原版本。
+- socket 与 service 的 active 状态必须分别检查并同时成立；禁止依赖 `systemctl is-active unitA unitB` 的“任一 active 即成功”聚合退出语义。任一 inactive/failed/not-found 都必须拒绝健康版本或触发自动恢复。
 
 ### FR-OPS-007 数据库迁移兼容
 
@@ -138,6 +141,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 9. commit 不属于授权远端 main、root 控制器可写、manifest 外新增文件、构建残留进程、旧版本不能读取候选迁移副本均在切换前拒绝；测试/预检证明无外网且不能读取生产 state/env/backup 原件。
 10. 对 journal、current 切换、restart、health 和 previous 更新逐点模拟 SIGKILL；`recover` 与开机 recovery 均恢复调用前两个指针，不采用故障候选、不恢复数据库，重复执行幂等。
 11. 把完整控制器复制为带生产模式标记的隔离夹具，分别从 dispatcher 和子脚本注入测试模式、路径、build/preflight/restart/health/sync hook；所有调用必须在 hook 执行、路径访问或 root 写入之前以 2 拒绝。无测试变量时仍固定使用真实生产路径，不能回退到夹具相对路径。
+12. 为 install 的 Git fixture 分别在恶意 `HOME/.gitconfig`、`XDG_CONFIG_HOME/git/config` 与仓库 `.git/config` 配置 `core.fsmonitor` 外部程序；控制器必须继续给出预期业务结果且所有哨兵均不存在。调用环境中的 Git config/exec/SSH 变量不得改变 commit、授权 ref、归档或 dirty 判定。
+13. 注入攻击者 `TMPDIR`、`GIT_CONFIG_PARAMETERS`、`GIT_EXEC_PATH`、`GIT_TRACE*`、大小写代理与 `DBUS_SYSTEM_BUS_ADDRESS`/SYSTEMD 变量；manifest 比较只能使用 root 私有临时对象，本机健康请求不得到达假代理，systemd 操作不得连接调用者总线。真实候选 health 失败时仍须回退，不能被代理的伪造 200 判健康。
+14. 生产等价 health hook 分别返回“socket inactive + service active”“socket active + service inactive”，两种都必须失败；只有两者各自 active 才继续 PID/cwd/UID、稳定窗和 HTTP 校验。
 
 ### 7.2 生产
 
@@ -166,3 +172,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 这些发现使本规格保持 `Implementing`，成熟度连续通过计数归零。FR-OPS-006、010 和 FR-OPS-008 的新增门禁必须在 Iteration 023 完成后重新执行发布失败注入、备份崩溃恢复、全量自动化和生产验证，才能验收 SPEC-010。
 
 实现复审又确认一个生产控制器信任边界 P1：测试模式和测试 hook 原本由调用环境决定；如果预装入口或其子脚本接受这些变量，具备受限 sudo/SETENV 权限的调用者即可让 root 使用调用者路径或执行 hook。修复必须让预装路径及带生产标记的等价夹具在读取任何覆盖值之前拒绝全部发布测试变量，并用“恶意 hook 会留下哨兵文件”的红测证明 hook 从未执行。该发现再次把成熟度连续计数归零。
+
+同一复审进一步发现 root Git 的配置面仍继承调用者 HOME/XDG，而工作仓库自己的 `.git/config` 也由开发用户控制；`git status` 可由 `core.fsmonitor` 执行任意外部程序。生产发布必须使用完全隔离的 Git 配置环境并显式关闭 repository-local fsmonitor/hooks，测试以三种配置来源的恶意哨兵验证。修复和部署后仍须重新开始独立审查，不能把本次修复计为“无新增有效轮次”。
+
+环境复审还确认 `TMPDIR` 可把 root manifest 临时文件引到攻击者父目录，代理可劫持回环 health，DBus/SYSTEMD 环境可改写 systemctl 目标。上述变量必须由统一净化层清除，生产临时目录必须 root-only，curl 还需主动禁用代理；故障回归须证明假代理无请求且候选真实 health 失败仍自动回退。
+
+健康门禁复审还复现：单条 `systemctl is-active fireside.socket fireside.service` 在任一单元 active 时即可返回 0，不能证明两者同时 active。实现必须拆成两个独立断言，并覆盖两种单边 active 组合；该 P1 继续使成熟度计数为 0。
