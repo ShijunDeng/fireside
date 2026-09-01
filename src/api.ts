@@ -29,7 +29,7 @@ export const api = {
     };
   },
   stats: () => request<Stats>('/api/stats'),
-  create: (data: { title: string; summary: string; proposer: string; tags: string[] }) =>
+  create: (data: { title: string; summary: string; proposer: string; presenter?: string; tags: string[] }) =>
     request<Topic>('/api/topics', { method: 'POST', body: JSON.stringify(data) }),
   update: (id: number, data: Partial<Pick<Topic, 'title' | 'summary' | 'proposer' | 'presenter' | 'tags' | 'scheduledAt' | 'duration' | 'room' | 'takeaway' | 'materialUrl'>>) =>
     request<Topic>(`/api/topics/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
@@ -45,8 +45,11 @@ export const api = {
   },
   claim: (id: number, presenter: string) =>
     request<Topic>(`/api/topics/${id}/claim`, { method: 'POST', body: JSON.stringify({ presenter }) }),
+  release: (id: number) => request<Topic>(`/api/topics/${id}/release`, { method: 'POST', body: JSON.stringify({}) }),
   schedule: (id: number, data: { scheduledAt: string; duration: number; room: string }) =>
     request<Topic>(`/api/topics/${id}/schedule`, { method: 'POST', body: JSON.stringify(data) }),
+  unschedule: (id: number) => request<Topic>(`/api/topics/${id}/unschedule`, { method: 'POST', body: JSON.stringify({}) }),
   archive: (id: number, data: { takeaway: string; materialUrl: string }) =>
     request<Topic>(`/api/topics/${id}/archive`, { method: 'POST', body: JSON.stringify(data) }),
+  unarchive: (id: number) => request<Topic>(`/api/topics/${id}/unarchive`, { method: 'POST', body: JSON.stringify({}) }),
 };

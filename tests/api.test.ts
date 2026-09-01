@@ -95,6 +95,65 @@ describe('围炉夜话 API', () => {
     assert.equal(invalidSchedule.statusCode, 409);
   });
 
+  it('支持自荐发布与生命周期纠错路径', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/topics',
+      payload: {
+        title: '自荐与纠错议题',
+        summary: '验证发起人直接分享以及每个阶段的撤销动作。',
+        proposer: '自荐者',
+        presenter: '自荐者',
+        tags: ['流程'],
+      },
+    });
+    assert.equal(created.statusCode, 201);
+    assert.equal(created.json().status, 'CLAIMED');
+    assert.equal(created.json().presenter, '自荐者');
+    const id = created.json().id as number;
+
+    const released = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} });
+    assert.equal(released.statusCode, 200);
+    assert.equal(released.json().status, 'OPEN');
+    assert.equal(released.json().presenter, null);
+    const duplicateRelease = await app.inject({ method: 'POST', url: `/api/topics/${id}/release`, payload: {} });
+    assert.equal(duplicateRelease.statusCode, 409);
+
+    await app.inject({ method: 'POST', url: `/api/topics/${id}/claim`, payload: { presenter: '接力者' } });
+    const scheduledAt = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const scheduled = await app.inject({
+      method: 'POST',
+      url: `/api/topics/${id}/schedule`,
+      payload: { scheduledAt, duration: 50, room: '纠错会议室' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/topics/${id}/archive`,
+      payload: { takeaway: '这段内容将在撤销归档时清空。', materialUrl: 'https://example.com/flow' },
+    });
+    assert.equal(archived.statusCode, 200);
+
+    const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, payload: {} });
+    assert.equal(unarchived.statusCode, 200);
+    assert.equal(unarchived.json().status, 'SCHEDULED');
+    assert.equal(unarchived.json().scheduledAt, scheduledAt);
+    assert.equal(unarchived.json().presenter, '接力者');
+    assert.equal(unarchived.json().takeaway, null);
+    assert.equal(unarchived.json().materialUrl, null);
+    assert.equal(unarchived.json().archivedAt, null);
+
+    const unscheduled = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    assert.equal(unscheduled.statusCode, 200);
+    assert.equal(unscheduled.json().status, 'CLAIMED');
+    assert.equal(unscheduled.json().presenter, '接力者');
+    assert.equal(unscheduled.json().scheduledAt, null);
+    assert.equal(unscheduled.json().duration, null);
+    assert.equal(unscheduled.json().room, null);
+    const duplicateUnschedule = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, payload: {} });
+    assert.equal(duplicateUnschedule.statusCode, 409);
+  });
+
   it('拒绝缺少关键信息的议题', async () => {
     const response = await app.inject({ method: 'POST', url: '/api/topics', payload: { title: '', summary: '', proposer: '' } });
     assert.equal(response.statusCode, 400);

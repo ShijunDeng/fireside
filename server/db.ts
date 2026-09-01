@@ -142,6 +142,15 @@ export function createDatabase(databasePath: string, seed = true) {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS topic_participants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      normalized_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(topic_id, normalized_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_topic_participants_topic_id ON topic_participants(topic_id);
   `);
   const columns = db.prepare('PRAGMA table_info(topics)').all() as { name: string }[];
   if (!columns.some((column) => column.name === 'position')) {

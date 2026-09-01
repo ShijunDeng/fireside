@@ -14,6 +14,7 @@ const createTopicSchema = z.object({
   title: nonEmptyText('议题标题', 80),
   summary: nonEmptyText('议题简介', 500),
   proposer: nonEmptyText('发起人', 30),
+  presenter: nonEmptyText('分享人', 30).optional(),
   tags: z.array(z.string().trim().min(1).max(20)).max(5).default([]),
 });
 const claimSchema = z.object({ presenter: nonEmptyText('认领人', 30) });
@@ -128,10 +129,11 @@ export function buildApp(options: AppOptions = {}) {
     const now = new Date().toISOString();
     const topic = db.transaction(() => {
       const { nextPosition } = db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS nextPosition FROM topics').get() as { nextPosition: number };
+      const status = parsed.data.presenter ? 'CLAIMED' : 'OPEN';
       const result = db.prepare(`
-        INSERT INTO topics (position, title, summary, proposer, tags, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
-      `).run(nextPosition, parsed.data.title, parsed.data.summary, parsed.data.proposer, JSON.stringify(parsed.data.tags), now, now);
+        INSERT INTO topics (position, title, summary, proposer, presenter, tags, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(nextPosition, parsed.data.title, parsed.data.summary, parsed.data.proposer, parsed.data.presenter ?? null, JSON.stringify(parsed.data.tags), status, now, now);
       bumpOrderVersion();
       return db.prepare('SELECT * FROM topics WHERE id = ?').get(result.lastInsertRowid);
     }).immediate();
@@ -229,6 +231,20 @@ export function buildApp(options: AppOptions = {}) {
     return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
+  app.post('/api/topics/:id/release', async (request, reply) => {
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const result = db.prepare("UPDATE topics SET presenter = NULL, status = 'OPEN', updated_at = ? WHERE id = ? AND status = 'CLAIMED'")
+      .run(new Date().toISOString(), params.data.id);
+    if (result.changes === 0) {
+      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
+      return exists
+        ? reply.code(409).send({ message: '只有准备中的议题可以重新开放认领' })
+        : reply.code(404).send({ message: '没有找到这个议题' });
+    }
+    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+  });
+
   app.post('/api/topics/:id/schedule', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     const body = scheduleSchema.safeParse(request.body);
@@ -239,6 +255,28 @@ export function buildApp(options: AppOptions = {}) {
       const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
       return exists
         ? reply.code(409).send({ message: '议题需要先被认领，才能安排分享' })
+        : reply.code(404).send({ message: '没有找到这个议题' });
+    }
+    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+  });
+
+  app.post('/api/topics/:id/unschedule', async (request, reply) => {
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const outcome = db.transaction(() => {
+      const result = db.prepare(`
+        UPDATE topics
+        SET scheduled_at = NULL, duration = NULL, room = NULL, status = 'CLAIMED', updated_at = ?
+        WHERE id = ? AND status = 'SCHEDULED'
+      `).run(new Date().toISOString(), params.data.id);
+      if (result.changes === 0) return false;
+      db.prepare('DELETE FROM topic_participants WHERE topic_id = ?').run(params.data.id);
+      return true;
+    }).immediate();
+    if (!outcome) {
+      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
+      return exists
+        ? reply.code(409).send({ message: '只有已排期的议题可以取消排期' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
     return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
@@ -255,6 +293,23 @@ export function buildApp(options: AppOptions = {}) {
       const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
       return exists
         ? reply.code(409).send({ message: '只有已排期的议题可以归档' })
+        : reply.code(404).send({ message: '没有找到这个议题' });
+    }
+    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+  });
+
+  app.post('/api/topics/:id/unarchive', async (request, reply) => {
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const result = db.prepare(`
+      UPDATE topics
+      SET takeaway = NULL, material_url = NULL, archived_at = NULL, status = 'SCHEDULED', updated_at = ?
+      WHERE id = ? AND status = 'ARCHIVED'
+    `).run(new Date().toISOString(), params.data.id);
+    if (result.changes === 0) {
+      const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
+      return exists
+        ? reply.code(409).send({ message: '只有已归档的议题可以撤销归档' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
     return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);

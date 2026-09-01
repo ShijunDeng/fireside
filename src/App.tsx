@@ -8,6 +8,7 @@ import {
   Calendar,
   CalendarDays,
   CalendarRange,
+  CalendarX2,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -21,6 +22,7 @@ import {
   MapPin,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   Sparkles,
   Trash2,
@@ -34,7 +36,7 @@ import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWee
 import type { Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
-type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete';
+type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete' | 'release' | 'unschedule' | 'unarchive';
 type ViewMode = 'list' | 'month' | 'week';
 
 const tabs: { key: Tab; label: string }[] = [
@@ -146,10 +148,21 @@ function TopicCard({ topic, onAction, draggable, reordering, index, total, onDra
           <span><UserRound size={14} /> 发起 · {topic.proposer}</span>
           {topic.presenter && <span><Flame size={14} /> 分享 · {topic.presenter}</span>}
         </div>
-        {topic.status === 'OPEN' && <button className="card-action warm" onClick={() => onAction('claim', topic)}>认领议题 <ArrowRight size={15} /></button>}
-        {topic.status === 'CLAIMED' && <button className="card-action cyan" onClick={() => onAction('schedule', topic)}>安排分享 <CalendarDays size={15} /></button>}
-        {topic.status === 'SCHEDULED' && <button className="card-action" onClick={() => onAction('archive', topic)}>完成归档 <Archive size={15} /></button>}
-        {topic.status === 'ARCHIVED' && topic.materialUrl && <a className="card-action" href={topic.materialUrl} target="_blank" rel="noreferrer">查看资料 <LinkIcon size={15} /></a>}
+        <div className="card-action-group">
+          {topic.status === 'OPEN' && <button className="card-action warm" onClick={() => onAction('claim', topic)}>认领议题 <ArrowRight size={15} /></button>}
+          {topic.status === 'CLAIMED' && <>
+            <button className="card-action subtle" onClick={() => onAction('release', topic)}>重新开放 <RotateCcw size={14} /></button>
+            <button className="card-action cyan" onClick={() => onAction('schedule', topic)}>安排分享 <CalendarDays size={15} /></button>
+          </>}
+          {topic.status === 'SCHEDULED' && <>
+            <button className="card-action subtle" onClick={() => onAction('unschedule', topic)}>取消排期 <CalendarX2 size={14} /></button>
+            <button className="card-action" onClick={() => onAction('archive', topic)}>完成归档 <Archive size={15} /></button>
+          </>}
+          {topic.status === 'ARCHIVED' && <>
+            <button className="card-action subtle" onClick={() => onAction('unarchive', topic)}>撤销归档 <RotateCcw size={14} /></button>
+            {topic.materialUrl && <a className="card-action" href={topic.materialUrl} target="_blank" rel="noreferrer">查看资料 <LinkIcon size={15} /></a>}
+          </>}
+        </div>
       </div>
     </article>
   );
@@ -246,11 +259,12 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
   );
 }
 
-function Modal({ kind, topic, onClose, onComplete }: {
+function Modal({ kind, topic, onClose, onComplete, onConflict }: {
   kind: ModalKind;
   topic: Topic | null;
   onClose: () => void;
   onComplete: (message: string) => void;
+  onConflict?: (message: string) => void;
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -259,6 +273,9 @@ function Modal({ kind, topic, onClose, onComplete }: {
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
     schedule: { eyebrow: 'SAVE THE DATE', title: '安排炉边分享', intro: '选一个大家方便靠近炉火的时间。' },
     archive: { eyebrow: 'KEEP THE EMBERS', title: '沉淀本期收获', intro: '留下一点余温，让后来的人也能顺着线索继续探索。' },
+    release: { eyebrow: 'PASS THE TORCH', title: '重新开放认领？', intro: '分享人退出后，这个议题会重新等待伙伴接过火炬。' },
+    unschedule: { eyebrow: 'CHANGE OF PLAN', title: '取消这次排期？', intro: '议题会回到准备中，可以稍后重新安排时间。' },
+    unarchive: { eyebrow: 'RESTORE THE FIRE', title: '撤销这次归档？', intro: '议题会恢复为已排期，原排期保留，归档内容将被清空。' },
     edit: { eyebrow: 'TEND THE FIRE', title: '编辑议题', intro: '更新议题信息，让每一位围炉伙伴看到准确的线索。' },
     delete: { eyebrow: 'REMOVE A SPARK', title: '删除这个议题？', intro: '删除后，相关的认领、排期与归档信息也会永久消失。' },
   }[kind];
@@ -270,13 +287,16 @@ function Modal({ kind, topic, onClose, onComplete }: {
     const data = new FormData(event.currentTarget);
     try {
       if (kind === 'create') {
+        const proposer = String(data.get('proposer'));
+        const selfPresent = data.get('publishIntent') === 'self';
         await api.create({
           title: String(data.get('title')),
           summary: String(data.get('summary')),
-          proposer: String(data.get('proposer')),
+          proposer,
+          ...(selfPresent ? { presenter: proposer } : {}),
           tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 5),
         });
-        onComplete('新火种已放到炉边，等待同伴认领');
+        onComplete(selfPresent ? '议题已发布并由你分享，接下来可以安排时间' : '新火种已放到炉边，等待同伴认领');
       } else if (kind === 'claim' && topic) {
         await api.claim(topic.id, String(data.get('presenter')));
         onComplete('认领成功，期待你把好奇变成一次分享');
@@ -293,6 +313,15 @@ function Modal({ kind, topic, onClose, onComplete }: {
           materialUrl: String(data.get('materialUrl')),
         });
         onComplete('议题已归档，这簇火光被好好保存了');
+      } else if (kind === 'release' && topic) {
+        await api.release(topic.id);
+        onComplete('议题已重新开放认领');
+      } else if (kind === 'unschedule' && topic) {
+        await api.unschedule(topic.id);
+        onComplete('排期已取消，议题回到准备中');
+      } else if (kind === 'unarchive' && topic) {
+        await api.unarchive(topic.id);
+        onComplete('归档已撤销，议题恢复为已排期');
       } else if (kind === 'edit' && topic) {
         const payload: Parameters<typeof api.update>[1] = {
           title: String(data.get('title')),
@@ -313,6 +342,10 @@ function Modal({ kind, topic, onClose, onComplete }: {
         onComplete('议题已删除');
       }
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409 && onConflict) {
+        onConflict(err.message);
+        return;
+      }
       setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
       setSubmitting(false);
     }
@@ -335,6 +368,11 @@ function Modal({ kind, topic, onClose, onComplete }: {
               <label>你的名字<input name="proposer" required maxLength={30} placeholder="怎么称呼你" /></label>
               <label>标签<input name="tags" maxLength={100} placeholder="AI, 产品, Demo" /></label>
             </div>
+            <fieldset className="intent-options">
+              <legend>发布后由谁分享？</legend>
+              <label><input type="radio" name="publishIntent" value="open" defaultChecked /><span><b>征集分享人</b><small>先发布问题，邀请伙伴接过火炬</small></span></label>
+              <label><input type="radio" name="publishIntent" value="self" /><span><b>我来分享</b><small>发布后直接进入准备中，不再重复认领</small></span></label>
+            </fieldset>
           </>}
           {kind === 'claim' && <label>认领人<input name="presenter" required maxLength={30} placeholder="你的名字" autoFocus /></label>}
           {kind === 'schedule' && <>
@@ -369,9 +407,12 @@ function Modal({ kind, topic, onClose, onComplete }: {
             </>}
           </>}
           {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>此操作不可撤销，请确认是否继续。</span></p></div>}
+          {kind === 'release' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>分享人署名会被清空，议题内容继续保留。</span></p></div>}
+          {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>日历事件与现有报名会被移除，分享人和议题内容继续保留。</span></p></div>}
+          {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
           {error && <div className="form-error">{error}</div>}
           <button className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
-            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'edit' ? '保存修改' : '确认删除'}
+            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? '保存修改' : '确认删除'}
             {!submitting && <ChevronRight size={17} />}
           </button>
         </form>
@@ -457,6 +498,11 @@ export default function App() {
   async function complete(message: string) {
     setModal(null);
     setToast(message);
+    await load();
+  }
+  async function resolveConflict(message: string) {
+    setModal(null);
+    setToast(`${message}，已同步最新状态`);
     await load();
   }
   function scrollToTopics() { document.querySelector('#topics')?.scrollIntoView({ behavior: 'smooth' }); }
@@ -649,7 +695,7 @@ export default function App() {
 
     <footer className="shell"><div className="brand muted"><span className="brand-mark"><Flame size={16} /></span><span>围炉夜话</span></div><p>Curiosity is the spark. Sharing keeps it alive.</p><a href="https://github.com/ShijunDeng/fireside" target="_blank" rel="noreferrer"><Github size={16} /> GitHub Repository</a></footer>
 
-    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} />}
+    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}
   </>;
 }

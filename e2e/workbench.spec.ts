@@ -53,6 +53,44 @@ test.describe('议题管理工作台', () => {
     await expect(updatedCard).toHaveCount(0);
   });
 
+  test('自荐发布并可逐步撤销归档、排期和认领', async ({ page }, testInfo) => {
+    const title = `自荐发布浏览器验收-${testInfo.project.name}-${Date.now()}`;
+    await page.goto('/');
+    await page.getByRole('button', { name: /发起议题/ }).first().click();
+    await page.getByLabel('议题标题').fill(title);
+    await page.getByLabel('一句话简介').fill('从自荐发布走到排期归档，再逐步撤销以验证纠错路径。');
+    await page.getByLabel('你的名字').fill('自荐分享者');
+    await page.getByLabel('我来分享').check();
+    await page.getByRole('button', { name: '发布议题' }).click();
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await expect(card).toContainText('已被认领');
+    await expect(card).toContainText('分享 · 自荐分享者');
+
+    await card.getByRole('button', { name: /安排分享/ }).click();
+    await page.getByRole('button', { name: '确认排期' }).click();
+    await expect(card).toContainText('即将开讲');
+
+    await card.getByRole('button', { name: /完成归档/ }).click();
+    await page.getByLabel('本期最值得留下的收获').fill('浏览器完整纠错链路已验证。');
+    await page.getByRole('dialog').getByRole('button', { name: '完成归档' }).click();
+    await expect(card).toContainText('已经归档');
+
+    await card.getByRole('button', { name: /撤销归档/ }).click();
+    await page.getByRole('button', { name: '确认撤销归档' }).click();
+    await expect(card).toContainText('即将开讲');
+
+    await card.getByRole('button', { name: /取消排期/ }).click();
+    await page.getByRole('button', { name: '确认取消排期' }).click();
+    await expect(card).toContainText('已被认领');
+
+    await card.getByRole('button', { name: /重新开放/ }).click();
+    await page.getByRole('button', { name: '重新开放认领' }).click();
+    await expect(card).toContainText('等待添柴');
+    await card.getByRole('button', { name: /删除/ }).click();
+    await page.getByRole('button', { name: '确认删除' }).click();
+    await expect(card).toHaveCount(0);
+  });
+
   test('上移按钮保存手动顺序，刷新后保持', async ({ page }) => {
     await page.goto('/');
     const targetCard = page.getByRole('article').nth(1);
