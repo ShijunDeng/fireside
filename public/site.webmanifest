@@ -1,0 +1,17 @@
+{
+  "name": "围炉夜话",
+  "short_name": "围炉夜话",
+  "description": "发现、认领、排期与沉淀每一个值得分享的议题。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090b0e",
+  "theme_color": "#090b0e",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

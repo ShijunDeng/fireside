@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="围炉夜话">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="5" x2="56" y2="60" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#24201c"/>
+      <stop offset="1" stop-color="#101216"/>
+    </linearGradient>
+    <linearGradient id="fire" x1="24" y1="13" x2="45" y2="46" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD58B"/>
+      <stop offset=".48" stop-color="#FFAA5C"/>
+      <stop offset="1" stop-color="#FF704B"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="18" fill="url(#bg)"/>
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="17.25" fill="none" stroke="#FFB061" stroke-opacity=".36" stroke-width="1.5"/>
+  <path d="M32 10c2.1 8.2-4.8 10.7-6.2 17.2-1.2-2-1.5-4.5-.8-7.3-5.5 5-9 10.4-8.3 17.1.8 8 7.3 13.8 15.3 13.8S46.5 45 47.3 37c.7-7.2-3.7-13.8-10-20.4.3 4.6-1.3 7.8-3.6 9.8.5-6.4.6-11.4-1.7-16.4Z" fill="url(#fire)"/>
+  <path d="M32.1 29.2c1 4-2.7 5.5-3.2 8.5-.7-1.1-.9-2.3-.7-3.7-2.2 2.3-3.4 4.9-3 7.7.5 3.6 3.4 6.2 7 6.2 3.7 0 6.6-2.7 6.9-6.3.3-3.3-1.5-6.1-4.2-9.3.1 2.3-.7 3.9-1.8 4.9.2-3.1.2-5.7-1-8Z" fill="#FFF2B7"/>
+  <path d="m15 48 34 8M49 48l-34 8" stroke="#7A4B37" stroke-width="5" stroke-linecap="round"/>
+</svg>
