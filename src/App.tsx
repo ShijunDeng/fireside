@@ -36,7 +36,14 @@ import {
   UnlockKeyhole,
   X,
 } from 'lucide-react';
-import { api, ApiError, clearWriteKey, getWriteKey, onUnauthorized, saveWriteKey } from './api';
+import {
+  api,
+  ApiError,
+  clearCollaborationSession,
+  getCollaborationSession,
+  onUnauthorized,
+  saveCollaborationSession,
+} from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
 import { createDialogToken, dialogStack } from './dialog-stack';
 import { buildPosterModel, isPosterEligible, posterToBlob, renderTopicPoster } from './poster';
@@ -679,28 +686,74 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
   </div>;
 }
 
-function AccessModal({ message, onClose, onUnlocked }: { message: string; onClose: () => void; onUnlocked: () => void }) {
+function AccessModal({ message, rateLimitedUntil, onClose, onRateLimited, onUnlocked }: {
+  message: string;
+  rateLimitedUntil: number;
+  onClose: () => void;
+  onRateLimited: (until: number) => void;
+  onUnlocked: () => void;
+}) {
   const { dialogRef, isTop } = useDialogA11y(onClose, 'access');
   const errorRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const activeRef = useRef(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [clock, setClock] = useState(() => Date.now());
+  const [observedRateLimit, setObservedRateLimit] = useState(() => rateLimitedUntil > Date.now());
+  const remainingSeconds = Math.max(0, Math.ceil((rateLimitedUntil - clock) / 1000));
 
   useEffect(() => {
-    if (!error || !isTop) return;
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (rateLimitedUntil <= Date.now()) return;
+    setObservedRateLimit(true);
+    setClock(Date.now());
+    const timer = window.setInterval(() => {
+      const nextClock = Date.now();
+      setClock(nextClock);
+      if (nextClock >= rateLimitedUntil) window.clearInterval(timer);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [rateLimitedUntil]);
+
+  const previousRemaining = useRef(remainingSeconds);
+  useEffect(() => {
+    if (previousRemaining.current > 0 && remainingSeconds === 0 && isTop) {
+      setError('');
+      inputRef.current?.focus();
+    }
+    previousRemaining.current = remainingSeconds;
+  }, [isTop, remainingSeconds]);
+
+  useEffect(() => {
+    if ((!error && remainingSeconds === 0) || !isTop) return;
     const frame = window.requestAnimationFrame(() => errorRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [error, isTop]);
+  }, [error, isTop, rateLimitedUntil]);
 
   async function unlock(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const key = String(new FormData(event.currentTarget).get('writeKey')).trim();
+    const key = inputRef.current?.value.trim() ?? '';
+    if (inputRef.current) inputRef.current.value = '';
     setSubmitting(true);
     setError('');
     try {
-      await api.verifyAccess(key);
-      saveWriteKey(key);
+      const { sessionToken } = await api.verifyAccess(key);
+      if (!activeRef.current) return;
+      saveCollaborationSession(sessionToken);
+      onRateLimited(0);
       onUnlocked();
     } catch (err) {
+      if (!activeRef.current) return;
+      if (err instanceof ApiError && err.status === 429 && err.code === 'ACCESS_RATE_LIMITED') {
+        const until = Date.now() + (err.retryAfter ?? 60) * 1000;
+        onRateLimited(Math.max(rateLimitedUntil, until));
+        setObservedRateLimit(true);
+      }
       setError(err instanceof Error ? err.message : '口令验证失败，请重试');
       setSubmitting(false);
     }
@@ -712,11 +765,17 @@ function AccessModal({ message, onClose, onUnlocked }: { message: string; onClos
       <span className="modal-eyebrow"><LockKeyhole size={14} /> TRUSTED COLLABORATORS</span>
       <h2 id="access-title">解锁围炉协作</h2>
       <p className="modal-intro">{message}</p>
-      <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>口令只保存在当前浏览器会话，不会写入网址或 Git。</span></p></div>
+      <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>口令只用于本次验证；当前标签页只保存 8 小时临时协作凭证。</span></p></div>
       <form onSubmit={unlock}>
-        <label>围炉口令<input name="writeKey" type="password" required autoComplete="current-password" autoFocus data-initial-focus placeholder="输入团队共享口令" /></label>
-        {error && <div ref={errorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
-        <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在验证…' : '解锁协作'}{!submitting && <UnlockKeyhole size={16} />}</button>
+        <label>围炉口令<input ref={inputRef} name="writeKey" type="password" required autoComplete="current-password" autoFocus data-initial-focus placeholder="输入团队共享口令" /></label>
+        {(error || remainingSeconds > 0) && <div ref={errorRef} className="form-error" role="alert" tabIndex={-1}>
+          {remainingSeconds > 0 ? `${error || '尝试过于频繁，请稍后再试'}；请等待 ${remainingSeconds} 秒后重新验证。` : error}
+        </div>}
+        {observedRateLimit && remainingSeconds === 0 && <div className="form-error" role="status">等待时间已结束，现在可以重新验证；系统不会自动提交。</div>}
+        <button className="submit-btn" disabled={submitting || remainingSeconds > 0} type="submit">
+          {submitting ? '正在验证…' : remainingSeconds > 0 ? `请等待 ${remainingSeconds} 秒` : '解锁协作'}
+          {!submitting && remainingSeconds === 0 && <UnlockKeyhole size={16} />}
+        </button>
       </form>
     </div>
   </div>;
@@ -1064,11 +1123,13 @@ export default function App() {
   const [meetingTopic, setMeetingTopic] = useState<Topic | null>(null);
   const [accessReady, setAccessReady] = useState(false);
   const [accessEnabled, setAccessEnabled] = useState(true);
-  const [accessUnlocked, setAccessUnlocked] = useState(() => Boolean(getWriteKey()));
+  const [accessUnlocked, setAccessUnlocked] = useState(false);
   const [accessModalOpen, setAccessModalOpen] = useState(false);
   const [accessMessage, setAccessMessage] = useState('输入团队共享口令后，即可创建、认领、排期与维护议题。');
+  const [accessRateLimitedUntil, setAccessRateLimitedUntil] = useState(0);
   const [unlockVersion, setUnlockVersion] = useState(0);
   const pendingAccessAction = useRef<(() => void | Promise<void>) | null>(null);
+  const accessEpoch = useRef(0);
   const [toast, setToast] = useState('');
 
   const loadTopics = useCallback(async (requestedSort: TopicSort) => {
@@ -1115,24 +1176,42 @@ export default function App() {
         if (!active) return;
         setAccessEnabled(status.enabled);
         if (!status.enabled) {
+          clearCollaborationSession();
           setAccessUnlocked(true);
-        } else if (getWriteKey()) {
+        } else if (getCollaborationSession()) {
           try {
-            await api.verifyAccess(getWriteKey());
-            if (active) setAccessUnlocked(true);
+            await api.accessSession();
+            if (active) {
+              accessEpoch.current += 1;
+              setAccessUnlocked(true);
+            }
           } catch {
-            clearWriteKey();
+            clearCollaborationSession();
+            if (active) {
+              accessEpoch.current += 1;
+              setAccessUnlocked(false);
+            }
           }
+        } else {
+          setAccessUnlocked(false);
+        }
+      } catch {
+        clearCollaborationSession();
+        if (active) {
+          accessEpoch.current += 1;
+          setAccessEnabled(true);
+          setAccessUnlocked(false);
         }
       } finally {
         if (active) setAccessReady(true);
       }
     })();
     onUnauthorized(() => {
+      accessEpoch.current += 1;
       pendingAccessAction.current = null;
       setAccessEnabled(true);
       setAccessUnlocked(false);
-      setAccessMessage('围炉口令已失效。你刚才的操作没有自动重放，请解锁后确认内容并重新提交。');
+      setAccessMessage('协作会话已失效。你刚才的操作没有自动重放，请解锁后确认内容并重新提交。');
       setAccessModalOpen(true);
     });
     return () => {
@@ -1172,14 +1251,19 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [now, visibleTopics]);
 
-  const canCollaborate = !accessEnabled || accessUnlocked;
+  const canCollaborate = accessReady && (!accessEnabled || accessUnlocked);
   function requireAccess(action: () => void | Promise<void>, message = '输入团队共享口令后，即可参与并维护围炉议题。') {
     if (canCollaborate) return void action();
+    if (!accessReady) {
+      setToast('正在确认协作状态，请稍候再试');
+      return;
+    }
     pendingAccessAction.current = action;
     setAccessMessage(message);
     setAccessModalOpen(true);
   }
   function finishUnlock() {
+    accessEpoch.current += 1;
     setAccessUnlocked(true);
     setAccessReady(true);
     setAccessModalOpen(false);
@@ -1193,9 +1277,20 @@ export default function App() {
     setAccessModalOpen(false);
   }
   function openAccess() {
+    if (!accessReady) {
+      setToast('正在确认协作状态，请稍候再试');
+      return;
+    }
     if (canCollaborate && accessEnabled) {
-      clearWriteKey();
+      accessEpoch.current += 1;
+      clearCollaborationSession();
+      pendingAccessAction.current = null;
       setAccessUnlocked(false);
+      setAccessModalOpen(false);
+      setModal(null);
+      setParticipantsTopic(null);
+      setMeetingTopic(null);
+      setUnlockVersion((value) => value + 1);
       setToast('当前浏览器会话已退出协作模式');
       return;
     }
@@ -1205,13 +1300,16 @@ export default function App() {
   }
   function openAction(kind: ModalKind, topic: Topic | null = null) {
     requireAccess(async () => {
+      const requestEpoch = accessEpoch.current;
       let editableTopic = topic;
       const phase = topic ? topicPhase(topic, now) : null;
       if (kind === 'edit' && topic?.hasMeetingUrl && canAttendPhase(phase)) {
         try {
           const { meetingUrl } = await api.meetingAccess(topic.id);
+          if (requestEpoch !== accessEpoch.current) return;
           editableTopic = { ...topic, meetingUrl };
         } catch (error) {
+          if (requestEpoch !== accessEpoch.current) return;
           if (error instanceof ApiError && error.code === 'ACTIVITY_TIME_CONFLICT') {
             setToast(`${error.message}；仍可修改议题内容和参与说明`);
             setModal({ kind, topic });
@@ -1222,6 +1320,7 @@ export default function App() {
           return;
         }
       }
+      if (requestEpoch !== accessEpoch.current) return;
       setModal({ kind, topic: editableTopic });
     });
   }
@@ -1330,7 +1429,7 @@ export default function App() {
       <nav>
         <button onClick={scrollToTopics}>议题广场</button>
         <button onClick={() => showTopicView('SCHEDULED', 'week')}>本周排期</button>
-        <button className={`access-button ${canCollaborate ? 'unlocked' : ''}`} onClick={openAccess} title={canCollaborate && accessEnabled ? '退出当前协作会话' : undefined}>{canCollaborate ? <UnlockKeyhole size={14} /> : <LockKeyhole size={14} />}{canCollaborate ? '协作已解锁' : '解锁协作'}</button>
+        <button className={`access-button ${canCollaborate ? 'unlocked' : ''}`} disabled={!accessReady} onClick={openAccess} title={canCollaborate && accessEnabled ? '退出当前协作会话' : undefined}>{canCollaborate ? <UnlockKeyhole size={14} /> : <LockKeyhole size={14} />}{!accessReady ? '确认协作…' : canCollaborate ? '协作已解锁' : '解锁协作'}</button>
         <button className="nav-cta" onClick={() => openAction('create')}><Plus size={16} /> 发起议题</button>
       </nav>
     </header>
@@ -1462,7 +1561,13 @@ export default function App() {
     {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} now={now} />}
     {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} onSync={() => void load()} />}
     {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} onConflict={(message) => void resolveMeetingConflict(message)} unlockVersion={unlockVersion} now={now} />}
-    {accessModalOpen && <AccessModal message={accessMessage} onClose={closeAccess} onUnlocked={finishUnlock} />}
+    {accessModalOpen && <AccessModal
+      message={accessMessage}
+      rateLimitedUntil={accessRateLimitedUntil}
+      onClose={closeAccess}
+      onRateLimited={(until) => setAccessRateLimitedUntil((current) => until === 0 ? 0 : Math.max(current, until))}
+      onUnlocked={finishUnlock}
+    />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}
   </>;
 }

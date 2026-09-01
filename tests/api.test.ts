@@ -15,6 +15,28 @@ const readTopic = async (instance: FastifyInstance, id: number) => {
   return response.json() as { id: number; revision: number; [key: string]: unknown };
 };
 
+const issueSession = async (instance: FastifyInstance, writeKey: string, remoteAddress = '127.0.0.1') => {
+  const response = await instance.inject({
+    method: 'POST',
+    url: '/api/access/verify',
+    headers: { 'x-fireside-write-key': writeKey },
+    remoteAddress,
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.headers['cache-control'], 'no-store');
+  const body = response.json() as { sessionToken: string; expiresAt: string };
+  assert.match(body.sessionToken, /^v1\./);
+  assert.equal(Number.isNaN(Date.parse(body.expiresAt)), false);
+  return body;
+};
+
+const tamperSessionToken = (sessionToken: string) => {
+  const segments = sessionToken.split('.');
+  const mac = segments[4];
+  segments[4] = `${mac.startsWith('A') ? 'B' : 'A'}${mac.slice(1)}`;
+  return segments.join('.');
+};
+
 describe('围炉夜话 API', () => {
   let app: FastifyInstance;
   let appNow: Date | null = null;
@@ -36,15 +58,24 @@ describe('围炉夜话 API', () => {
     assert.equal(response.json().ok, true);
   });
 
-  it('以共享口令保护全部写操作、名单和真实会议入口', async () => {
-    const protectedApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey: 'correct-horse-battery-staple' });
+  it('只用短期会话保护全部写操作、名单和真实会议入口', async () => {
+    const writeKey = 'correct-horse-battery-staple';
+    const protectedApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey });
     await protectedApp.ready();
     const publicAccess = await protectedApp.inject({ method: 'GET', url: '/api/access' });
     assert.deepEqual(publicAccess.json(), { enabled: true });
     assert.equal((await protectedApp.inject({ method: 'GET', url: '/api/topics' })).statusCode, 200);
     assert.equal((await protectedApp.inject({ method: 'GET', url: '/api/stats' })).statusCode, 200);
-    assert.equal((await protectedApp.inject({ method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': 'wrong' } })).statusCode, 401);
-    assert.equal((await protectedApp.inject({ method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': 'correct-horse-battery-staple' } })).statusCode, 204);
+    const wrong = await protectedApp.inject({ method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': 'wrong' } });
+    assert.equal(wrong.statusCode, 401);
+    assert.equal(wrong.json().code, 'ACCESS_REQUIRED');
+    assert.equal(wrong.headers['cache-control'], 'no-store');
+    const issued = await issueSession(protectedApp, writeKey);
+    const headers = { 'x-fireside-session': issued.sessionToken };
+    const session = await protectedApp.inject({ method: 'GET', url: '/api/access/session', headers });
+    assert.equal(session.statusCode, 200);
+    assert.deepEqual(session.json(), { valid: true, expiresAt: issued.expiresAt });
+    assert.equal(session.headers['cache-control'], 'no-store');
 
     const protectedRoutes = [
       { method: 'POST', url: '/api/topics' },
@@ -61,19 +92,42 @@ describe('围炉夜话 API', () => {
       { method: 'POST', url: '/api/topics/1/participants' },
       { method: 'DELETE', url: '/api/topics/1/participants/1' },
       { method: 'GET', url: '/api/topics/1/meeting-access' },
+      { method: 'GET', url: '/api/access/session' },
     ] as const;
     for (const route of protectedRoutes) {
       const response = await protectedApp.inject({ ...route, payload: ['POST', 'PATCH'].includes(route.method) ? {} : undefined });
       assert.equal(response.statusCode, 401, `${route.method} ${route.url} 必须先鉴权`);
-      assert.equal(response.json().code, 'ACCESS_REQUIRED');
+      assert.equal(response.json().code, 'ACCESS_SESSION_REQUIRED');
+      assert.equal(response.headers['cache-control'], 'no-store');
+    }
+    for (const route of protectedRoutes) {
+      const response = await protectedApp.inject({
+        ...route,
+        headers,
+        payload: ['POST', 'PATCH'].includes(route.method) ? {} : undefined,
+      });
+      assert.notEqual(response.statusCode, 401, `${route.method} ${route.url} 必须接受有效会话`);
     }
 
-    const headers = { 'x-fireside-write-key': 'correct-horse-battery-staple' };
+    const oldClient = await protectedApp.inject({
+      method: 'POST', url: '/api/topics', headers: { 'x-fireside-write-key': writeKey },
+      payload: { title: '旧客户端不能写入', summary: '原始口令不再被业务路由读取。', proposer: '旧客户端', tags: [] },
+    });
+    assert.equal(oldClient.statusCode, 401);
+    assert.equal(oldClient.json().code, 'ACCESS_SESSION_REQUIRED');
+
+    const malformedBeforeAuth = await protectedApp.inject({
+      method: 'POST', url: '/api/topics', headers: { 'content-type': 'application/json' }, payload: '{',
+    });
+    assert.equal(malformedBeforeAuth.statusCode, 401);
+    assert.equal(malformedBeforeAuth.json().code, 'ACCESS_SESSION_REQUIRED');
+
     const created = await protectedApp.inject({
       method: 'POST', url: '/api/topics', headers,
       payload: { title: '受保护的线上议题', summary: '匿名响应不能泄露会议 secret。', proposer: '组织者', presenter: '组织者', tags: [] },
     });
     assert.equal(created.statusCode, 201);
+    assert.equal(created.headers['cache-control'], 'no-store');
     const id = created.json().id as number;
     const createdRevision = created.json().revision as number;
     const missingRevision = await protectedApp.inject({
@@ -92,13 +146,39 @@ describe('围炉夜话 API', () => {
     const joined = await protectedApp.inject({ method: 'POST', url: `/api/topics/${id}/participants`, headers, payload: { name: '隐私参与者' } });
     assert.equal(joined.statusCode, 201);
 
+    const idText = String(id);
+    const encodedId = `%${idText.charCodeAt(0).toString(16)}${idText.slice(1)}`;
+    const guardedReadVariants = [
+      { method: 'GET', url: `/api/topics/${encodedId}/meeting-access` },
+      { method: 'GET', url: `/api/topics/${id}/%70articipants` },
+      { method: 'HEAD', url: `/api/topics/${id}/participants` },
+      { method: 'HEAD', url: `/api/topics/${encodedId}/meeting-access` },
+      { method: 'HEAD', url: '/api/access/session' },
+    ] as const;
+    for (const route of guardedReadVariants) {
+      const rejected = await protectedApp.inject(route);
+      assert.equal(rejected.statusCode, 401, `${route.method} ${route.url} 的编码或 HEAD 变体必须先鉴权`);
+      assert.equal(rejected.headers['cache-control'], 'no-store');
+      assert.equal(rejected.body.includes(secretMeeting), false);
+      assert.equal(rejected.body.includes('隐私参与者'), false);
+      if (route.method === 'GET') assert.equal(rejected.json().code, 'ACCESS_SESSION_REQUIRED');
+      else assert.equal(rejected.body, '');
+
+      const accepted = await protectedApp.inject({ ...route, headers });
+      assert.equal(accepted.statusCode, 200, `${route.method} ${route.url} 的编码或 HEAD 变体必须接受有效会话`);
+      assert.equal(accepted.headers['cache-control'], 'no-store');
+      if (route.method === 'HEAD') assert.equal(accepted.body, '');
+    }
+
     const publicTopics = await protectedApp.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(publicTopics.body.includes('top-secret'), false);
     assert.equal(publicTopics.body.includes('隐私参与者'), false);
     const participants = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers });
     assert.deepEqual((participants.json() as { name: string }[]).map(({ name }) => name), ['隐私参与者']);
+    assert.equal(participants.headers['cache-control'], 'no-store');
     const meeting = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access`, headers });
     assert.equal(meeting.json().meetingUrl, secretMeeting);
+    assert.equal(meeting.headers['cache-control'], 'no-store');
 
     const sensitiveTopic = await protectedApp.inject({
       method: 'POST', url: '/api/topics', headers,
@@ -113,6 +193,273 @@ describe('围炉夜话 API', () => {
     assert.equal(sensitiveRoom.json().code, 'SENSITIVE_ROOM_CONTENT');
 
     await protectedApp.close();
+  });
+
+  it('认证关闭时验证与会话校验保持 204 且业务开放', async () => {
+    const openApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false });
+    await openApp.ready();
+    const verify = await openApp.inject({ method: 'POST', url: '/api/access/verify' });
+    const session = await openApp.inject({ method: 'GET', url: '/api/access/session' });
+    assert.equal(verify.statusCode, 204);
+    assert.equal(session.statusCode, 204);
+    assert.equal(verify.headers['cache-control'], 'no-store');
+    assert.equal(session.headers['cache-control'], 'no-store');
+    assert.equal((await openApp.inject({
+      method: 'POST', url: '/api/topics', payload: { title: '本地开放', summary: '无认证测试模式。', proposer: '测试', tags: [] },
+    })).statusCode, 201);
+    await openApp.close();
+  });
+
+  it('按 TCP 来源和全局滑动窗口限制口令验证且忽略转发头', async () => {
+    let nowMs = Date.parse('2026-09-02T10:00:00.000Z');
+    const writeKey = 'rate-limit-test-write-key';
+    const limitedApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs),
+      authRateLimit: { windowMs: 60_000, perSourceLimit: 3, globalLimit: 20 },
+    });
+    await limitedApp.ready();
+    const source = '203.0.113.10';
+    const preissued = await issueSession(limitedApp, writeKey, source);
+    const wrongCandidates: Array<string | undefined> = [undefined, '', 'wrong'];
+    for (let index = 0; index < wrongCandidates.length; index += 1) {
+      const candidate = wrongCandidates[index];
+      const failed = await limitedApp.inject({
+        method: 'POST', url: '/api/access/verify', remoteAddress: source,
+        headers: {
+          ...(candidate === undefined ? {} : { 'x-fireside-write-key': candidate }),
+          'x-forwarded-for': `198.51.100.${index + 1}`,
+          forwarded: `for=192.0.2.${index + 1}`,
+          'x-real-ip': `192.0.2.${index + 10}`,
+        },
+      });
+      assert.equal(failed.statusCode, 401);
+    }
+    const blocked = await limitedApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { 'x-fireside-write-key': writeKey, 'x-forwarded-for': '198.51.100.250' },
+    });
+    assert.equal(blocked.statusCode, 429);
+    assert.equal(blocked.json().code, 'ACCESS_RATE_LIMITED');
+    assert.equal(blocked.headers['retry-after'], '60');
+    assert.equal(blocked.headers['cache-control'], 'no-store');
+    const businessDuringBlock = await limitedApp.inject({
+      method: 'POST', url: '/api/topics', remoteAddress: source,
+      headers: { 'x-fireside-session': preissued.sessionToken },
+      payload: { title: '已解锁会话不受猜测限流影响', summary: '限流只约束新会话签发。', proposer: '测试', tags: [] },
+    });
+    assert.equal(businessDuringBlock.statusCode, 201);
+
+    const isolated = await limitedApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '203.0.113.11',
+      headers: { 'x-fireside-write-key': 'wrong-isolated' },
+    });
+    assert.equal(isolated.statusCode, 401);
+    nowMs += 59_000;
+    const almostRecovered = await limitedApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { 'x-fireside-write-key': writeKey },
+    });
+    assert.equal(almostRecovered.statusCode, 429);
+    assert.equal(almostRecovered.headers['retry-after'], '1');
+    nowMs += 1_000;
+    assert.equal((await limitedApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { 'x-fireside-write-key': writeKey },
+    })).statusCode, 200);
+    await limitedApp.close();
+
+    const concurrentApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs), authRateLimit: { perSourceLimit: 10, globalLimit: 200 },
+    });
+    await concurrentApp.ready();
+    const concurrent = await Promise.all(Array.from({ length: 12 }, (_, index) => concurrentApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '::ffff:203.0.113.20',
+      headers: { 'x-fireside-write-key': `parallel-wrong-${index}` },
+    })));
+    assert.equal(concurrent.filter(({ statusCode }) => statusCode === 401).length, 10);
+    assert.equal(concurrent.filter(({ statusCode }) => statusCode === 429).length, 2);
+    assert.equal((await concurrentApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '203.0.113.20',
+      headers: { 'x-fireside-write-key': writeKey },
+    })).statusCode, 429, 'IPv4-mapped IPv6 与 IPv4 必须共用来源桶');
+    await concurrentApp.close();
+
+    const globalApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs), authRateLimit: { perSourceLimit: 10, globalLimit: 3 },
+    });
+    await globalApp.ready();
+    for (let index = 0; index < 3; index += 1) {
+      assert.equal((await globalApp.inject({
+        method: 'POST', url: '/api/access/verify', remoteAddress: `198.51.100.${index + 1}`,
+        headers: { 'x-fireside-write-key': 'wrong-global' },
+      })).statusCode, 401);
+    }
+    const globalBlocked = await globalApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '198.51.100.99',
+      headers: { 'x-fireside-write-key': writeKey },
+    });
+    assert.equal(globalBlocked.statusCode, 429);
+    assert.equal(globalBlocked.headers['retry-after'], '60');
+    await globalApp.close();
+
+    const resetOptions = {
+      databasePath: ':memory:' as const, seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs), authRateLimit: { perSourceLimit: 1, globalLimit: 20 },
+    };
+    const beforeRestart = buildApp(resetOptions);
+    await beforeRestart.ready();
+    assert.equal((await beforeRestart.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '192.0.2.80',
+      headers: { 'x-fireside-write-key': 'wrong-before-restart' },
+    })).statusCode, 401);
+    assert.equal((await beforeRestart.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '192.0.2.80',
+      headers: { 'x-fireside-write-key': writeKey },
+    })).statusCode, 429);
+    await beforeRestart.close();
+    const afterRestart = buildApp(resetOptions);
+    await afterRestart.ready();
+    assert.equal((await afterRestart.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '192.0.2.80',
+      headers: { 'x-fireside-write-key': writeKey },
+    })).statusCode, 200, '进程内限流桶必须随应用重启清空');
+    await afterRestart.close();
+  });
+
+  it('会话令牌到期、篡改或畸形时统一拒绝且认证先于业务校验', async () => {
+    let nowMs = Date.parse('2026-09-02T10:15:20.777Z');
+    const writeKey = 'session-expiry-test-write-key';
+    const sessionApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs),
+    });
+    await sessionApp.ready();
+    const issued = await issueSession(sessionApp, writeKey);
+    assert.equal(issued.expiresAt, '2026-09-02T18:15:20.000Z');
+
+    const tamperedToken = tamperSessionToken(issued.sessionToken);
+    const invalidTokens = [undefined, '', 'not-a-session', tamperedToken];
+    for (const token of invalidTokens) {
+      const response = await sessionApp.inject({
+        method: 'PATCH', url: '/api/topics/999999',
+        headers: {
+          ...(token === undefined ? {} : { 'x-fireside-session': token }),
+          'if-match': 'not-a-revision',
+          'content-type': 'application/json',
+        },
+        payload: '{',
+      });
+      assert.equal(response.statusCode, 401);
+      assert.equal(response.json().code, 'ACCESS_SESSION_REQUIRED');
+      assert.equal(response.headers['cache-control'], 'no-store');
+    }
+
+    const validBusinessError = await sessionApp.inject({
+      method: 'PATCH', url: '/api/topics/999999',
+      headers: { 'x-fireside-session': issued.sessionToken, 'if-match': 'not-a-revision' }, payload: { title: '不会写入' },
+    });
+    assert.equal(validBusinessError.statusCode, 400);
+    assert.equal(validBusinessError.json().code, 'INVALID_TOPIC_REVISION');
+
+    nowMs = Date.parse(issued.expiresAt);
+    const expired = await sessionApp.inject({
+      method: 'GET', url: '/api/access/session', headers: { 'x-fireside-session': issued.sessionToken },
+    });
+    assert.equal(expired.statusCode, 401);
+    assert.equal(expired.json().code, 'ACCESS_SESSION_REQUIRED');
+    await sessionApp.close();
+  });
+
+  it('认证拒绝与限流不改变议题、排序或名单且响应和日志不泄密', async () => {
+    const writeKey = 'never-log-this-write-key';
+    const meetingUrl = 'https://meet.example.test/private?pwd=never-log-meeting';
+    const participantName = '永不出现在拒绝响应的参与者';
+    let logs = '';
+    const protectedApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date('2026-09-02T10:00:00.000Z'),
+      authRateLimit: { perSourceLimit: 2, globalLimit: 20 },
+      logger: true,
+      loggerStream: { write: (message) => { logs += message; } },
+    });
+    await protectedApp.ready();
+    const issued = await issueSession(protectedApp, writeKey);
+    const headers = { 'x-fireside-session': issued.sessionToken };
+    const created = await protectedApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '认证不变式', summary: '拒绝路径不能改变业务数据。', proposer: '安全测试', presenter: '安全测试', tags: [] },
+    });
+    assert.equal(created.statusCode, 201);
+    const id = created.json().id as number;
+    const scheduled = await protectedApp.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: { ...headers, ...ifMatch(created.json().revision) },
+      payload: { scheduledAt: '2026-09-02T11:00:00.000Z', duration: 60, room: '保密会议室', meetingUrl },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    const joined = await protectedApp.inject({
+      method: 'POST', url: `/api/topics/${id}/participants`, headers, payload: { name: participantName },
+    });
+    assert.equal(joined.statusCode, 201);
+
+    const beforeTopics = await protectedApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeParticipants = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers });
+    const beforeTopicBody = beforeTopics.body;
+    const beforeOrderVersion = beforeTopics.headers['x-order-version'];
+    const beforeParticipantBody = beforeParticipants.body;
+    const invalidSession = tamperSessionToken(issued.sessionToken);
+    const rejected = [
+      await protectedApp.inject({
+        method: 'POST', url: '/api/topics', remoteAddress: '203.0.113.77', headers: { 'x-fireside-write-key': writeKey },
+        payload: { title: '不能创建', summary: '旧头无效。', proposer: '旧客户端', tags: [] },
+      }),
+      await protectedApp.inject({
+        method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-session': invalidSession, ...ifMatch(scheduled.json().revision) },
+        payload: { title: '不能编辑' },
+      }),
+      await protectedApp.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: { 'x-fireside-session': invalidSession, ...ifMatch(scheduled.json().revision) } }),
+      await protectedApp.inject({ method: 'POST', url: '/api/topics/reorder', headers: { 'x-fireside-session': invalidSession }, payload: { orderedIds: [id], baseVersion: Number(beforeOrderVersion) } }),
+      await protectedApp.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: { 'x-fireside-session': invalidSession, ...ifMatch(scheduled.json().revision) } }),
+      await protectedApp.inject({ method: 'POST', url: `/api/topics/${id}/participants`, headers: { 'x-fireside-session': invalidSession }, payload: { name: '不能报名' } }),
+      await protectedApp.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${joined.json().id}`, headers: { 'x-fireside-session': invalidSession } }),
+      await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers: { 'x-fireside-session': invalidSession } }),
+      await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access`, headers: { 'x-fireside-session': invalidSession } }),
+    ];
+    for (const response of rejected) {
+      assert.equal(response.statusCode, 401);
+      assert.equal(response.json().code, 'ACCESS_SESSION_REQUIRED');
+      assert.equal(response.body.includes(writeKey), false);
+      assert.equal(response.body.includes(issued.sessionToken), false);
+      assert.equal(response.body.includes(meetingUrl), false);
+      assert.equal(response.body.includes(participantName), false);
+    }
+
+    for (let index = 0; index < 2; index += 1) {
+      assert.equal((await protectedApp.inject({
+        method: 'POST', url: '/api/access/verify', remoteAddress: '203.0.113.77',
+        headers: { 'x-fireside-write-key': `wrong-after-old-business-${index}` },
+      })).statusCode, 401, '旧业务头拒绝不得消耗 verify 来源桶');
+    }
+    const rateLimited = await protectedApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: '203.0.113.77',
+      headers: { 'x-fireside-write-key': writeKey },
+    });
+    assert.equal(rateLimited.statusCode, 429);
+    assert.equal(rateLimited.body.includes(writeKey), false);
+    assert.equal(rateLimited.body.includes(issued.sessionToken), false);
+
+    const afterTopics = await protectedApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const afterParticipants = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers });
+    assert.equal(afterTopics.body, beforeTopicBody);
+    assert.equal(afterTopics.headers['x-order-version'], beforeOrderVersion);
+    assert.equal(afterParticipants.body, beforeParticipantBody);
+    await protectedApp.close();
+    assert.equal(logs.includes(writeKey), false);
+    assert.equal(logs.includes(issued.sessionToken), false);
+    assert.equal(logs.includes(meetingUrl), false);
+    assert.equal(logs.includes(participantName), false);
   });
 
   it('完成创建、认领、排期和归档的完整流程', async () => {
@@ -759,25 +1106,42 @@ describe('围炉夜话 API', () => {
 });
 
 describe('数据库兼容性与并发', () => {
-  it('口令轮换后旧口令立即失效且数据保持可读', async () => {
+  it('同口令重启保留未到期会话而口令轮换立即使旧会话失效', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-key-rotation-'));
     const databasePath = path.join(directory, 'rotation.db');
-    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'old-key' });
+    const now = () => new Date('2026-09-02T10:00:00.000Z');
+    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'old-key', now });
     await firstApp.ready();
+    const oldSession = await issueSession(firstApp, 'old-key');
     const created = await firstApp.inject({
-      method: 'POST', url: '/api/topics', headers: { 'x-fireside-write-key': 'old-key' },
+      method: 'POST', url: '/api/topics', headers: { 'x-fireside-session': oldSession.sessionToken },
       payload: { title: '口令轮换议题', summary: '轮换口令不能影响业务数据。', proposer: '安全测试', tags: [] },
     });
+    assert.equal(created.statusCode, 201);
     const id = created.json().id as number;
     await firstApp.close();
 
-    const rotatedApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'new-key' });
+    const restartedApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'old-key', now });
+    await restartedApp.ready();
+    const stillValid = await restartedApp.inject({
+      method: 'GET', url: '/api/access/session', headers: { 'x-fireside-session': oldSession.sessionToken },
+    });
+    assert.equal(stillValid.statusCode, 200);
+    await restartedApp.close();
+
+    const rotatedApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'new-key', now });
     await rotatedApp.ready();
     assert.equal((await rotatedApp.inject({ method: 'GET', url: '/api/topics' })).json()[0].title, '口令轮换议题');
-    assert.equal((await rotatedApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-write-key': 'old-key' }, payload: { title: '不应成功' } })).statusCode, 401);
+    const oldTokenRejected = await rotatedApp.inject({
+      method: 'PATCH', url: `/api/topics/${id}`,
+      headers: { 'x-fireside-session': oldSession.sessionToken, ...ifMatch(created.json().revision) }, payload: { title: '不应成功' },
+    });
+    assert.equal(oldTokenRejected.statusCode, 401);
+    assert.equal(oldTokenRejected.json().code, 'ACCESS_SESSION_REQUIRED');
+    const newSession = await issueSession(rotatedApp, 'new-key');
     const updated = await rotatedApp.inject({
       method: 'PATCH', url: `/api/topics/${id}`,
-      headers: { 'x-fireside-write-key': 'new-key', ...ifMatch(created.json().revision) },
+      headers: { 'x-fireside-session': newSession.sessionToken, ...ifMatch(created.json().revision) },
       payload: { title: '新口令生效' },
     });
     assert.equal(updated.statusCode, 200);
@@ -821,7 +1185,8 @@ describe('数据库兼容性与并发', () => {
     const stats = await legacyApp.inject({ method: 'GET', url: '/api/stats' });
     assert.equal(stats.body.includes(mixedSecret), false);
     assert.equal(stats.json().nextTopic.room, '线上会议');
-    const headers = { 'x-fireside-write-key': writeKey };
+    const session = await issueSession(legacyApp, writeKey);
+    const headers = { 'x-fireside-session': session.sessionToken };
     assert.equal((await legacyApp.inject({ method: 'GET', url: `/api/topics/${mixedId}/meeting-access`, headers })).json().meetingUrl, mixedUrl);
     const credentialMeeting = await legacyApp.inject({ method: 'GET', url: `/api/topics/${credentialId}/meeting-access`, headers });
     assert.equal(credentialMeeting.statusCode, 409);

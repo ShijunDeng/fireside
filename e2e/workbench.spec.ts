@@ -1,9 +1,21 @@
-import { expect, test, type APIRequestContext } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
 const writeKey = 'e2e-fireside-write-key';
-const writeHeaders = { 'X-Fireside-Write-Key': writeKey };
-const revisionHeaders = (revision: number) => ({ ...writeHeaders, 'If-Match': `"${revision}"` });
+const legacyWriteKeyStorage = 'fireside-write-key';
+const collaborationSessionStorage = 'fireside-collaboration-session-v1';
+let collaborationSession = '';
+const sessionHeaders = () => ({ 'X-Fireside-Session': collaborationSession });
+const revisionHeaders = (revision: number) => ({ ...sessionHeaders(), 'If-Match': `"${revision}"` });
+
+async function issueSession(request: APIRequestContext, key = writeKey) {
+  const response = await request.post('/api/access/verify', { headers: { 'X-Fireside-Write-Key': key } });
+  expect(response.status()).toBe(200);
+  const body = await response.json() as { sessionToken: string; expiresAt: string };
+  expect(body.sessionToken).toMatch(/^v1\./);
+  expect(Number.isFinite(Date.parse(body.expiresAt))).toBe(true);
+  return body.sessionToken;
+}
 
 async function latestTopic(request: APIRequestContext, id: number) {
   const response = await request.get(`/api/topics/${id}`);
@@ -50,7 +62,7 @@ async function createScheduledPhaseTopic(request: APIRequestContext, data: {
   scheduledAt: string;
   meetingUrl?: string;
 }) {
-  const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+  const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
     title: data.title,
     summary: '活动阶段浏览器验收夹具。',
     proposer: '阶段测试',
@@ -79,10 +91,15 @@ async function cleanupPhaseTopics(request: APIRequestContext, ids: number[]) {
 }
 
 test.describe('议题管理工作台', () => {
+  test.beforeAll(async ({ request }) => {
+    collaborationSession = await issueSession(request);
+  });
+
   test.beforeEach(async ({ page }) => {
-    await page.addInitScript((key) => {
-      if (localStorage.getItem('e2e-force-locked') !== '1') sessionStorage.setItem('fireside-write-key', key);
-    }, writeKey);
+    await page.addInitScript(({ session, legacyKey, sessionKey }) => {
+      sessionStorage.setItem(legacyKey, 'legacy-raw-key-must-be-removed');
+      if (localStorage.getItem('e2e-force-locked') !== '1') sessionStorage.setItem(sessionKey, session);
+    }, { session: collaborationSession, legacyKey: legacyWriteKeyStorage, sessionKey: collaborationSessionStorage });
   });
   test('在月历和周历中展示排期，并可从事件进入编辑', async ({ page }) => {
     await page.goto('/');
@@ -363,7 +380,7 @@ test.describe('议题管理工作台', () => {
       await expect(seedCard.getByRole('button', { name: '报名参加' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
-      const archivedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: writeHeaders });
+      const archivedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: sessionHeaders() });
       expect(archivedMeeting.status()).toBe(409);
       expect(await archivedMeeting.text()).not.toContain('http');
 
@@ -385,7 +402,7 @@ test.describe('议题管理工作台', () => {
       await expect(seedCard.getByRole('button', { name: '加入会议' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '取消排期' })).toHaveCount(0);
-      const endedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: writeHeaders });
+      const endedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: sessionHeaders() });
       expect(endedMeeting.status()).toBe(409);
       expect(await endedMeeting.text()).not.toContain('http');
 
@@ -467,7 +484,7 @@ test.describe('议题管理工作台', () => {
       expect(resetRequestCount).toBe(1);
       await expect(seedCard.locator('.status-pill')).toHaveText('已被认领');
       await expect(seedCard).not.toContainText('人报名');
-      const unchangedRealParticipants = await request.get(`/api/topics/${archivedSeed.id}/participants`, { headers: writeHeaders });
+      const unchangedRealParticipants = await request.get(`/api/topics/${archivedSeed.id}/participants`, { headers: sessionHeaders() });
       expect(unchangedRealParticipants.status()).toBe(200);
       expect(await unchangedRealParticipants.json()).toEqual([]);
       await page.unroute(`**/api/topics/${archivedSeed.id}/unschedule`);
@@ -490,14 +507,14 @@ test.describe('议题管理工作台', () => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const protectedTitle = `公网隐私验收-${marker}`;
     const secretMeeting = `https://meet.example.test/private/${marker}?passcode=never-public`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title: protectedTitle, summary: '公开页面可以看到议题，但不能看到会议凭证和报名姓名。', proposer: '隐私组织者', presenter: '隐私组织者', tags: ['隐私'],
     } });
     const topic = await created.json() as { id: number; revision: number };
     await request.post(`/api/topics/${topic.id}/schedule`, { headers: revisionHeaders(topic.revision), data: {
       scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(), duration: 40, room: '三楼围炉会议室', meetingUrl: secretMeeting,
     } });
-    await request.post(`/api/topics/${topic.id}/participants`, { headers: writeHeaders, data: { name: '不公开的报名人' } });
+    await request.post(`/api/topics/${topic.id}/participants`, { headers: sessionHeaders(), data: { name: '不公开的报名人' } });
 
     const publicTopics = await request.get('/api/topics');
     expect(publicTopics.status()).toBe(200);
@@ -510,10 +527,12 @@ test.describe('议题管理工作台', () => {
     await page.goto('/');
     await page.evaluate(() => {
       localStorage.setItem('e2e-force-locked', '1');
-      sessionStorage.removeItem('fireside-write-key');
+      sessionStorage.setItem('fireside-write-key', 'legacy-raw-key-must-not-migrate');
+      sessionStorage.removeItem('fireside-collaboration-session-v1');
     });
     await page.reload();
     await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('fireside-write-key'))).toBeNull();
     await expect(page.locator('body')).not.toContainText('never-public');
     await expect(page.locator('body')).not.toContainText('不公开的报名人');
     const protectedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: protectedTitle, exact: true }) });
@@ -523,6 +542,7 @@ test.describe('议题管理工作台', () => {
     await accessDialog.getByLabel('围炉口令').fill('wrong-key');
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
     await expect(accessDialog.getByText('围炉口令不正确')).toBeVisible();
+    await expect(accessDialog.getByLabel('围炉口令')).toHaveValue('');
     await accessDialog.getByLabel('围炉口令').fill(writeKey);
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
     const meetingDialog = page.getByRole('dialog');
@@ -540,7 +560,7 @@ test.describe('议题管理工作台', () => {
     await page.getByLabel('议题标题').fill(retainedTitle);
     await page.getByLabel('一句话简介').fill('第一次提交因口令失效而失败，重新解锁后由用户再次确认。');
     await page.getByLabel('你的名字').fill('协作测试者');
-    await page.evaluate(() => sessionStorage.setItem('fireside-write-key', 'expired-key'));
+    await page.evaluate(() => sessionStorage.setItem('fireside-collaboration-session-v1', 'expired-session'));
     await page.getByRole('button', { name: '发布议题' }).click();
     accessDialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '解锁围炉协作' }) });
     await expect(accessDialog).toBeVisible();
@@ -556,6 +576,262 @@ test.describe('议题管理工作台', () => {
       .filter((item) => item.title === protectedTitle || item.title === retainedTitle)
       .map(({ id }) => id);
     await Promise.all(cleanupIds.map((id) => deleteLatestTopic(request, id)));
+  });
+
+  test('旧口令不迁移，刷新校验临时会话且退出清理敏感弹窗', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `会话退出验收-${marker}`;
+    const secretMeeting = `https://meet.example.test/session/${marker}?pwd=must-disappear`;
+    const pageErrors: string[] = [];
+    page.on('pageerror', (error) => pageErrors.push(error.message));
+    const topic = await createScheduledPhaseTopic(request, {
+      title,
+      scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(),
+      meetingUrl: secretMeeting,
+    });
+    let releaseSessionValidation = () => {};
+    const sessionValidationGate = new Promise<void>((resolve) => { releaseSessionValidation = resolve; });
+    await page.route('**/api/access/session', async (route) => {
+      await sessionValidationGate;
+      await route.continue();
+    });
+
+    try {
+      const sessionChecked = page.waitForResponse((response) => response.url().endsWith('/api/access/session') && response.status() === 200);
+      await page.goto('/');
+      const confirmingButton = page.getByRole('button', { name: '确认协作…' });
+      await expect(confirmingButton).toBeVisible();
+      await expect(confirmingButton).toBeDisabled();
+      await expect(page.getByRole('button', { name: '协作已解锁' })).toHaveCount(0);
+      releaseSessionValidation();
+      const sessionResponse = await sessionChecked;
+      const headers = sessionResponse.request().headers();
+      expect(headers['x-fireside-session']).toBe(collaborationSession);
+      expect(headers['x-fireside-write-key']).toBeUndefined();
+      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await page.unroute('**/api/access/session');
+      expect(await page.evaluate(({ legacyKey, sessionKey }) => ({
+        legacy: sessionStorage.getItem(legacyKey),
+        session: sessionStorage.getItem(sessionKey),
+      }), { legacyKey: legacyWriteKeyStorage, sessionKey: collaborationSessionStorage })).toEqual({
+        legacy: null,
+        session: collaborationSession,
+      });
+
+      await page.route(/\/api\/access$/, async (route) => route.abort('failed'));
+      await page.reload();
+      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      expect(await page.evaluate((sessionKey) => sessionStorage.getItem(sessionKey), collaborationSessionStorage)).toBeNull();
+      await page.unroute(/\/api\/access$/);
+
+      await page.evaluate(({ sessionKey, session }) => sessionStorage.setItem(sessionKey, session), {
+        sessionKey: collaborationSessionStorage,
+        session: collaborationSession,
+      });
+      const refreshedSessionChecked = page.waitForResponse((response) => response.url().endsWith('/api/access/session') && response.status() === 200);
+      await page.reload();
+      const refreshedSessionResponse = await refreshedSessionChecked;
+      expect(refreshedSessionResponse.request().headers()['x-fireside-session']).toBe(collaborationSession);
+      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+
+      const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+      await card.getByRole('button', { name: '加入会议' }).click();
+      const meetingDialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '进入线上围炉' }) });
+      await expect(meetingDialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', secretMeeting);
+
+      await page.locator('button.access-button').evaluate((button: HTMLButtonElement) => button.click());
+      await expect(meetingDialog).toHaveCount(0);
+      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      await expect(page.locator('body')).not.toContainText(secretMeeting);
+      expect(await page.evaluate((sessionKey) => sessionStorage.getItem(sessionKey), collaborationSessionStorage)).toBeNull();
+      expect(pageErrors).toEqual([]);
+    } finally {
+      releaseSessionValidation();
+      await page.unroute('**/api/access/session').catch(() => undefined);
+      await page.unroute(/\/api\/access$/).catch(() => undefined);
+      await deleteLatestTopic(request, topic.id);
+    }
+  });
+
+  test('退出协作会丢弃迟到的真实会议响应', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `迟到会议响应验收-${marker}`;
+    const secretMeeting = `https://meet.example.test/late/${marker}?pwd=never-return`;
+    const topic = await createScheduledPhaseTopic(request, {
+      title,
+      scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(),
+      meetingUrl: secretMeeting,
+    });
+    let releaseMeeting = () => {};
+    let markMeetingCaptured = () => {};
+    const meetingGate = new Promise<void>((resolve) => { releaseMeeting = resolve; });
+    const meetingCaptured = new Promise<void>((resolve) => { markMeetingCaptured = resolve; });
+    await page.route(`**/api/topics/${topic.id}/meeting-access`, async (route) => {
+      const response = await route.fetch();
+      markMeetingCaptured();
+      await meetingGate;
+      await route.fulfill({ response });
+    });
+
+    try {
+      await page.goto('/');
+      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+      const delivered = page.waitForResponse((response) => response.url().endsWith(`/api/topics/${topic.id}/meeting-access`));
+      await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+      await meetingCaptured;
+      await page.getByRole('button', { name: '协作已解锁' }).click();
+      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      releaseMeeting();
+      await delivered;
+      await expect(page.getByRole('heading', { name: '编辑议题' })).toHaveCount(0);
+      await expect(page.locator('input[name="meetingUrl"]')).toHaveCount(0);
+      await expect(page.locator('body')).not.toContainText('never-return');
+      expect(await page.evaluate((sessionKey) => sessionStorage.getItem(sessionKey), collaborationSessionStorage)).toBeNull();
+    } finally {
+      releaseMeeting();
+      await page.unroute(`**/api/topics/${topic.id}/meeting-access`).catch(() => undefined);
+      await deleteLatestTopic(request, topic.id);
+    }
+  });
+
+  test('429 倒计时关闭重开仍有效，不自动重放且已有会话继续业务', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const draftTitle = `限流后显式提交-${marker}`;
+    const existingSessionTitle = `限流不影响已有会话-${marker}`;
+    const createdIds: number[] = [];
+    let verifyRequests = 0;
+    const createRequests: string[] = [];
+    let existingSessionPage: Page | null = null;
+
+    page.on('request', (outgoing) => {
+      if (outgoing.method() === 'POST' && outgoing.url().endsWith('/api/topics')) createRequests.push(outgoing.url());
+    });
+
+    try {
+      const existingReadSecret = `https://meet.example.test/rate/${marker}?pwd=existing-session`;
+      const existingReadTopic = await createScheduledPhaseTopic(request, {
+        title: `限流期间敏感读取-${marker}`,
+        scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(),
+        meetingUrl: existingReadSecret,
+      });
+      createdIds.push(existingReadTopic.id);
+      const seededParticipant = await request.post(`/api/topics/${existingReadTopic.id}/participants`, {
+        headers: sessionHeaders(),
+        data: { name: `已有会话参与者-${marker}` },
+      });
+      expect(seededParticipant.status()).toBe(201);
+
+      await page.goto('/');
+      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await page.getByRole('button', { name: /发起议题/ }).first().click();
+      const businessDialog = page.locator('.modal[role="dialog"]:not(.access-modal)');
+      const submitButton = businessDialog.locator('button[type="submit"]');
+      await businessDialog.locator('input[name="title"]').fill(draftTitle);
+      await businessDialog.locator('textarea[name="summary"]').fill('限流只影响新的口令校验，草稿和已有会话不受影响。');
+      await businessDialog.locator('input[name="proposer"]').fill('限流验收者');
+      await page.evaluate((sessionKey) => sessionStorage.setItem(sessionKey, 'expired-session'), collaborationSessionStorage);
+      const rejected = page.waitForResponse((response) => response.url().endsWith('/api/topics')
+        && response.request().method() === 'POST' && response.status() === 401);
+      await submitButton.click();
+      await rejected;
+      expect(createRequests).toHaveLength(1);
+
+      let accessDialog = page.locator('.access-modal[role="dialog"]');
+      for (const candidate of ['wrong-rate-key-1', 'wrong-rate-key-2']) {
+        await accessDialog.getByLabel('围炉口令').fill(candidate);
+        const wrong = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 401);
+        await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+        await wrong;
+        verifyRequests += 1;
+        await expect(accessDialog.getByLabel('围炉口令')).toHaveValue('');
+      }
+      await accessDialog.getByLabel('围炉口令').fill(writeKey);
+      const blocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 429);
+      await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+      const blockedResponse = await blocked;
+      verifyRequests += 1;
+      expect(Number(blockedResponse.headers()['retry-after'])).toBeGreaterThan(0);
+      await expect(accessDialog.getByRole('alert')).toContainText('请等待');
+      await expect(accessDialog.getByRole('alert')).toBeFocused();
+      await expect(accessDialog.getByLabel('围炉口令')).toHaveValue('');
+      await expect(accessDialog.locator('button[type="submit"]')).toBeDisabled();
+      expect(verifyRequests).toBe(3);
+      expect(createRequests).toHaveLength(1);
+
+      existingSessionPage = await page.context().newPage();
+      await existingSessionPage.addInitScript(({ sessionKey, session }) => {
+        sessionStorage.setItem(sessionKey, session);
+      }, {
+        sessionKey: collaborationSessionStorage,
+        session: collaborationSession,
+      });
+      await existingSessionPage.goto('/');
+      await expect(existingSessionPage.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await existingSessionPage.getByRole('button', { name: /发起议题/ }).first().click();
+      const existingBusinessDialog = existingSessionPage.locator('.modal[role="dialog"]:not(.access-modal)');
+      await existingBusinessDialog.locator('input[name="title"]').fill(existingSessionTitle);
+      await existingBusinessDialog.locator('textarea[name="summary"]').fill('另一个已解锁浏览器在新验证被限流时仍可以正常协作。');
+      await existingBusinessDialog.locator('input[name="proposer"]').fill('已有会话');
+      const existingSessionCreate = existingSessionPage.waitForResponse((response) => response.url().endsWith('/api/topics')
+        && response.request().method() === 'POST' && response.status() === 201);
+      await existingBusinessDialog.getByRole('button', { name: '发布议题' }).click();
+      const existingCreatedResponse = await existingSessionCreate;
+      createdIds.push(((await existingCreatedResponse.json()) as { id: number }).id);
+      await expect(existingSessionPage.getByRole('heading', { name: existingSessionTitle, exact: true })).toBeVisible();
+
+      const existingReadCard = existingSessionPage.locator('.topic-card')
+        .filter({ has: existingSessionPage.getByRole('heading', { name: existingReadTopic.title, exact: true }) });
+      await existingReadCard.getByRole('button', { name: '报名参加' }).click();
+      let existingSensitiveDialog = existingSessionPage.locator('.participants-modal[role="dialog"]');
+      await expect(existingSensitiveDialog).toContainText(`已有会话参与者-${marker}`);
+      await existingSensitiveDialog.getByRole('button', { name: '关闭' }).click();
+      await existingReadCard.getByRole('button', { name: '加入会议' }).click();
+      existingSensitiveDialog = existingSessionPage.locator('.meeting-modal[role="dialog"]');
+      await expect(existingSensitiveDialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', existingReadSecret);
+      await existingSensitiveDialog.getByRole('button', { name: '关闭' }).click();
+
+      await accessDialog.getByRole('button', { name: '关闭' }).click();
+      await expect(accessDialog).toHaveCount(0);
+      await expect(businessDialog.locator('input[name="title"]')).toHaveValue(draftTitle);
+
+      const rejectedAgain = page.waitForResponse((response) => response.url().endsWith('/api/topics')
+        && response.request().method() === 'POST' && response.status() === 401);
+      await submitButton.click();
+      await rejectedAgain;
+      expect(createRequests).toHaveLength(2);
+      accessDialog = page.locator('.access-modal[role="dialog"]');
+      await expect(accessDialog.getByRole('alert')).toContainText('请等待');
+      await expect(accessDialog.locator('button[type="submit"]')).toBeDisabled();
+      expect(verifyRequests).toBe(3);
+
+      await expect(accessDialog.getByRole('status')).toContainText('系统不会自动提交', { timeout: 8_000 });
+      await expect(accessDialog.getByLabel('围炉口令')).toBeFocused();
+      await expect(accessDialog.locator('button[type="submit"]')).toBeEnabled();
+      expect(verifyRequests).toBe(3);
+      expect(createRequests).toHaveLength(2);
+
+      await accessDialog.getByLabel('围炉口令').fill(writeKey);
+      const unlocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 200);
+      await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+      await unlocked;
+      verifyRequests += 1;
+      await expect(accessDialog).toHaveCount(0);
+      await expect(businessDialog.locator('input[name="title"]')).toHaveValue(draftTitle);
+      expect(createRequests).toHaveLength(2);
+
+      const created = page.waitForResponse((response) => response.url().endsWith('/api/topics')
+        && response.request().method() === 'POST' && response.status() === 201);
+      await submitButton.click();
+      const createdResponse = await created;
+      createdIds.push(((await createdResponse.json()) as { id: number }).id);
+      expect(createRequests).toHaveLength(3);
+      expect(verifyRequests).toBe(4);
+      await expect(page.getByRole('heading', { name: draftTitle, exact: true })).toBeVisible();
+    } finally {
+      await existingSessionPage?.close();
+      await Promise.all(createdIds.map((id) => deleteLatestTopic(request, id)));
+    }
   });
 
   test('真实 401 叠层中 Esc 只关闭口令层并保留草稿、错误和滚动锁', async ({ page }) => {
@@ -574,7 +850,7 @@ test.describe('议题管理工作台', () => {
     await proposerInput.fill('叠层测试者');
     await tagsInput.fill('弹窗, 焦点, 草稿');
     await businessDialog.getByLabel('我来分享').check();
-    await page.evaluate(() => sessionStorage.setItem('fireside-write-key', 'expired-key'));
+    await page.evaluate(() => sessionStorage.setItem('fireside-collaboration-session-v1', 'expired-session'));
 
     const rejected = page.waitForResponse((response) => response.url().endsWith('/api/topics')
       && response.request().method() === 'POST' && response.status() === 401);
@@ -588,7 +864,7 @@ test.describe('议题管理工作台', () => {
     await expect(businessDialog).toHaveAttribute('inert', '');
     await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe('hidden');
     await expect(accessInput).toBeFocused();
-    await expect(businessDialog.locator('.form-error')).toContainText('需要正确的围炉口令才能继续协作');
+    await expect(businessDialog.locator('.form-error')).toContainText('协作会话已失效');
 
     for (const key of ['Tab', 'Tab', 'Shift+Tab', 'Shift+Tab', 'Tab']) {
       await page.keyboard.press(key);
@@ -606,7 +882,7 @@ test.describe('议题管理工作台', () => {
     await expect(proposerInput).toHaveValue('叠层测试者');
     await expect(tagsInput).toHaveValue('弹窗, 焦点, 草稿');
     await expect(businessDialog.getByLabel('我来分享')).toBeChecked();
-    await expect(businessDialog.locator('.form-error')).toContainText('需要正确的围炉口令才能继续协作');
+    await expect(businessDialog.locator('.form-error')).toContainText('协作会话已失效');
     await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe('hidden');
     await expect(submitButton).toBeFocused();
 
@@ -637,7 +913,7 @@ test.describe('议题管理工作台', () => {
       if (outgoing.method() === 'POST' && outgoing.url().endsWith('/api/topics')) createRequests.push(outgoing.url());
     });
     async function openAccessFromReal401() {
-      await page.evaluate(() => sessionStorage.setItem('fireside-write-key', 'expired-key'));
+      await page.evaluate(() => sessionStorage.setItem('fireside-collaboration-session-v1', 'expired-session'));
       const rejected = page.waitForResponse((response) => response.url().endsWith('/api/topics')
         && response.request().method() === 'POST' && response.status() === 401);
       await submitButton.click();
@@ -654,7 +930,7 @@ test.describe('议题管理工作台', () => {
       await expect(titleInput).toHaveValue(title);
       await expect(summaryInput).toHaveValue('关闭口令层或重新解锁，都不应自动重放已经失败的创建请求。');
       await expect(proposerInput).toHaveValue('显式重试测试者');
-      await expect(businessDialog.locator('.form-error')).toContainText('需要正确的围炉口令才能继续协作');
+      await expect(businessDialog.locator('.form-error')).toContainText('协作会话已失效');
       await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe('hidden');
       await expect(submitButton).toBeFocused();
     }
@@ -684,7 +960,7 @@ test.describe('议题管理工作台', () => {
       accessDialog = await openAccessFromReal401();
       expect(createRequests).toHaveLength(3);
       await accessDialog.getByLabel('围炉口令').fill(writeKey);
-      const unlocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 204);
+      const unlocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 200);
       await accessDialog.getByRole('button', { name: '解锁协作' }).click();
       await unlocked;
       await expectDraftAfterAccessClose();
@@ -738,7 +1014,7 @@ test.describe('议题管理工作台', () => {
 
   test('报名弹窗遇到取消排期会关闭并同步权威结果', async ({ page, request }, testInfo) => {
     const title = `报名冲突验收-${testInfo.project.name}-${Date.now()}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '打开报名后由另一位协调者取消排期。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -764,7 +1040,7 @@ test.describe('议题管理工作台', () => {
 
   test('陈旧编辑遇到取消排期会关闭并同步权威状态', async ({ page, request }, testInfo) => {
     const title = `编辑冲突验收-${testInfo.project.name}-${Date.now()}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '编辑排期时由另一位协调者取消排期。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -795,7 +1071,7 @@ test.describe('议题管理工作台', () => {
     const title = `内容版本冲突验收-${marker}`;
     const remoteTitle = `另一位协作者更新的标题-${marker}`;
     const localSummary = `仍需保留的本地草稿-${marker}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '双方从同一份议题快照开始编辑。', proposer: '版本测试', tags: ['并发'],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -832,7 +1108,7 @@ test.describe('议题管理工作台', () => {
     const remoteTitle = `远端权威标题-${marker}`;
     const originalSummary = '关闭冲突弹窗时，本地草稿不能写入服务端。';
     const localDraft = `应被放弃的本地简介-${marker}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: originalSummary, proposer: '冲突恢复测试', tags: ['并发'],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -866,7 +1142,7 @@ test.describe('议题管理工作台', () => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const title = `陈旧删除报名保护-${marker}`;
     const participantName = `新报名伙伴-${marker}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '删除确认期间的新报名必须被完整保留。', proposer: '删除测试', presenter: '删除测试', tags: ['报名'],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -881,7 +1157,7 @@ test.describe('议题管理工作台', () => {
     await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
     await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
     const joined = await request.post(`/api/topics/${topic.id}/participants`, {
-      headers: writeHeaders,
+      headers: sessionHeaders(),
       data: { name: participantName },
     });
     expect(joined.status()).toBe(201);
@@ -933,7 +1209,7 @@ test.describe('议题管理工作台', () => {
     });
     const future = new Date(Date.now() + 3 * 86_400_000);
     future.setHours(19, 30, 0, 0);
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title,
       summary: '验证最大合法布局与分段凭证。会议号：123 456 789，入会密码（括号密语），后续普通简介仍可安全绘制。',
       proposer: '海报发起人',
@@ -1050,7 +1326,7 @@ test.describe('议题管理工作台', () => {
     const expectedTime = new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(latestTime);
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '列表快照过期时必须重新确认排期。', proposer: '海报测试', presenter: '海报测试', tags: ['改期'],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -1107,7 +1383,7 @@ test.describe('议题管理工作台', () => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const future = new Date(Date.now() + 2 * 86_400_000).toISOString();
     const createScheduled = async (title: string) => {
-      const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
         title, summary: '状态改变后不能继续生成旧海报。', proposer: '海报测试', presenter: '海报测试', tags: [],
       } });
       const topic = await created.json() as { id: number; revision: number };
@@ -1157,7 +1433,7 @@ test.describe('议题管理工作台', () => {
   test('海报读取失败可显式重试且关闭后忽略迟到响应', async ({ page, request }, testInfo) => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const title = `海报读取重试-${marker}`;
-    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
       title, summary: '读取失败时不能降级到列表旧快照。', proposer: '海报测试', presenter: '海报测试', tags: [],
     } });
     const topic = await created.json() as { id: number; revision: number };
@@ -1243,7 +1519,7 @@ test.describe('议题管理工作台', () => {
         const title = `${titlePrefix}-${index}`;
         titles.push(title);
         const created = await request.post('/api/topics', {
-          headers: writeHeaders,
+          headers: sessionHeaders(),
           data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
         });
         const topic = await created.json() as { id: number; revision: number };

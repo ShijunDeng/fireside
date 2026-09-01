@@ -3,7 +3,13 @@ import fastifyStatic from '@fastify/static';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { writeKeyMatches } from './access.js';
+import {
+  createAuthRateLimiter,
+  issueCollaborationSession,
+  normalizeClientIp,
+  validateCollaborationSession,
+  writeKeyMatches,
+} from './access.js';
 import { createDatabase, rowToTopic } from './db.js';
 import { analyzeMeetingRoom } from './meeting.js';
 import { activityPhase, type ActivityPhase } from '../shared/activity.js';
@@ -70,9 +76,18 @@ type AppOptions = {
   databasePath?: string;
   seed?: boolean;
   logger?: boolean;
+  loggerStream?: { write(message: string): void };
   writeKey?: string;
   serveStatic?: boolean;
   now?: () => Date;
+  authRateLimit?: {
+    windowMs?: number;
+    perSourceLimit?: number;
+    globalLimit?: number;
+    maxSources?: number;
+    cleanupInterval?: number;
+    cleanupBatchSize?: number;
+  };
   beforeTopicUpdate?: () => Promise<void>;
   afterTopicRowsRead?: () => Promise<void>;
 };
@@ -83,7 +98,11 @@ function validationMessage(error: z.ZodError) {
 
 export function buildApp(options: AppOptions = {}) {
   const app = Fastify({
-    logger: options.logger ? { redact: ['req.headers.x-fireside-write-key'] } : false,
+    trustProxy: false,
+    logger: options.logger ? {
+      redact: ['req.headers.x-fireside-write-key', 'req.headers.x-fireside-session'],
+      ...(options.loggerStream ? { stream: options.loggerStream } : {}),
+    } : false,
   });
   const writeKey = options.writeKey ?? process.env.FIRESIDE_WRITE_KEY ?? '';
   const databasePath = options.databasePath ?? process.env.DATABASE_PATH ?? path.join(projectRoot, 'data', 'fireside.db');
@@ -92,7 +111,10 @@ export function buildApp(options: AppOptions = {}) {
     const value = options.now?.() ?? new Date();
     return new Date(value.getTime());
   };
+  const authNow = () => captureNow().getTime();
+  const authRateLimiter = createAuthRateLimiter({ now: authNow, ...options.authRateLimit });
   const expectedRevisions = new WeakMap<FastifyRequest, number>();
+  const validatedSessions = new WeakMap<FastifyRequest, { expiresAt: string }>();
   const readOrderVersion = () => (db.prepare('SELECT version FROM topic_order_state WHERE id = 1').get() as { version: number }).version;
   const bumpOrderVersion = () => db.prepare('UPDATE topic_order_state SET version = version + 1 WHERE id = 1').run();
   const setPositions = (orderedIds: number[]) => {
@@ -105,16 +127,25 @@ export function buildApp(options: AppOptions = {}) {
 
   app.addHook('onRequest', async (request, reply) => {
     if (!writeKey) return;
-    const pathOnly = request.url.split('?')[0];
-    const sensitiveRead = request.method === 'GET' && /^\/api\/topics\/\d+\/(?:participants|meeting-access)$/.test(pathOnly);
+    const routePattern = request.routeOptions.url;
+    const sensitiveRead = ['GET', 'HEAD'].includes(request.method) && (
+      routePattern === '/api/access/session'
+      || routePattern === '/api/topics/:id/participants'
+      || routePattern === '/api/topics/:id/meeting-access'
+    );
+    const isVerify = request.method === 'POST' && routePattern === '/api/access/verify';
     const businessWrite = ['POST', 'PATCH', 'DELETE'].includes(request.method)
-      && pathOnly !== '/api/access/verify';
+      && !isVerify;
     if (!sensitiveRead && !businessWrite) return;
-    const header = request.headers['x-fireside-write-key'];
-    const candidate = Array.isArray(header) ? header[0] : header;
-    if (!writeKeyMatches(candidate, writeKey)) {
-      return reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '需要正确的围炉口令才能继续协作' });
+    const header = request.headers['x-fireside-session'];
+    const sessionToken = Array.isArray(header) ? header[0] : header;
+    const validation = validateCollaborationSession(sessionToken, writeKey, { now: authNow });
+    if (!validation.valid) {
+      reply.header('Cache-Control', 'no-store');
+      return reply.code(401).send({ code: 'ACCESS_SESSION_REQUIRED', message: '协作会话已失效，请重新输入围炉口令' });
     }
+    reply.header('Cache-Control', 'no-store');
+    validatedSessions.set(request, { expiresAt: validation.expiresAt });
   });
 
   app.addHook('preHandler', async (request, reply) => {
@@ -164,12 +195,31 @@ export function buildApp(options: AppOptions = {}) {
   app.get('/api/health', async () => ({ ok: true, service: 'fireside', time: new Date().toISOString() }));
   app.get('/api/access', async () => ({ enabled: Boolean(writeKey) }));
   app.post('/api/access/verify', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
     if (!writeKey) return reply.code(204).send();
+    const source = normalizeClientIp(request.ip);
+    const preflight = authRateLimiter.preflight(source);
+    if (preflight.limited) {
+      reply.header('Retry-After', String(preflight.retryAfter));
+      return reply.code(429).send({ code: 'ACCESS_RATE_LIMITED', message: '尝试过于频繁，请稍后再试' });
+    }
     const header = request.headers['x-fireside-write-key'];
     const candidate = Array.isArray(header) ? header[0] : header;
-    return writeKeyMatches(candidate, writeKey)
-      ? reply.code(204).send()
-      : reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '围炉口令不正确' });
+    if (!writeKeyMatches(candidate, writeKey)) {
+      const recorded = authRateLimiter.recordFailure(source);
+      if (recorded.limited) {
+        reply.header('Retry-After', String(recorded.retryAfter));
+        return reply.code(429).send({ code: 'ACCESS_RATE_LIMITED', message: '尝试过于频繁，请稍后再试' });
+      }
+      return reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '围炉口令不正确' });
+    }
+    authRateLimiter.recordSuccess(source);
+    return reply.code(200).send(issueCollaborationSession(writeKey, { now: authNow }));
+  });
+  app.get('/api/access/session', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    if (!writeKey) return reply.code(204).send();
+    return { valid: true, expiresAt: validatedSessions.get(request)!.expiresAt };
   });
 
   const toPublicTopic = (row: Parameters<typeof rowToTopic>[0]) => {
@@ -499,6 +549,7 @@ export function buildApp(options: AppOptions = {}) {
   });
 
   app.get('/api/topics/:id/meeting-access', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const actionNow = captureNow();
@@ -521,6 +572,7 @@ export function buildApp(options: AppOptions = {}) {
   });
 
   app.get('/api/topics/:id/participants', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);

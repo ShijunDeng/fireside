@@ -1,24 +1,38 @@
 import type { ActivityPhase, Participant, Stats, Topic, TopicSort } from './types';
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number, public code?: string, public phase?: ActivityPhase) {
+  constructor(
+    message: string,
+    public status: number,
+    public code?: string,
+    public phase?: ActivityPhase,
+    public retryAfter?: number,
+  ) {
     super(message);
   }
 }
 
-const writeKeyStorage = 'fireside-write-key';
+const legacyWriteKeyStorage = 'fireside-write-key';
+export const collaborationSessionStorage = 'fireside-collaboration-session-v1';
 let unauthorizedHandler: (() => void) | null = null;
 
-export function getWriteKey() {
-  return sessionStorage.getItem(writeKeyStorage) ?? '';
+function removeLegacyWriteKey() {
+  sessionStorage.removeItem(legacyWriteKeyStorage);
 }
 
-export function saveWriteKey(value: string) {
-  sessionStorage.setItem(writeKeyStorage, value);
+export function getCollaborationSession() {
+  removeLegacyWriteKey();
+  return sessionStorage.getItem(collaborationSessionStorage) ?? '';
 }
 
-export function clearWriteKey() {
-  sessionStorage.removeItem(writeKeyStorage);
+export function saveCollaborationSession(value: string) {
+  removeLegacyWriteKey();
+  sessionStorage.setItem(collaborationSessionStorage, value);
+}
+
+export function clearCollaborationSession() {
+  removeLegacyWriteKey();
+  sessionStorage.removeItem(collaborationSessionStorage);
 }
 
 export function onUnauthorized(handler: (() => void) | null) {
@@ -30,13 +44,19 @@ async function readBody<T>(response: Response, notifyUnauthorized = true): Promi
     message?: string;
     code?: string;
     phase?: ActivityPhase;
+    retryAfterSeconds?: number;
   };
   if (!response.ok) {
-    if (response.status === 401 && notifyUnauthorized) {
-      clearWriteKey();
+    if (response.status === 401 && body.code === 'ACCESS_SESSION_REQUIRED' && notifyUnauthorized) {
+      clearCollaborationSession();
       unauthorizedHandler?.();
     }
-    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code, body.phase);
+    const retryAfterHeader = Number(response.headers.get('Retry-After'));
+    const retryAfterCandidate = body.retryAfterSeconds ?? retryAfterHeader;
+    const retryAfter = Number.isFinite(retryAfterCandidate) && retryAfterCandidate > 0
+      ? Math.ceil(retryAfterCandidate)
+      : undefined;
+    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code, body.phase, retryAfter);
   }
   return body as T;
 }
@@ -45,8 +65,8 @@ async function request<T>(url: string, options?: RequestInit, requiresAccess = o
   const headers = new Headers(options?.headers);
   if (options?.body) headers.set('Content-Type', 'application/json');
   if (requiresAccess) {
-    const key = getWriteKey();
-    if (key) headers.set('X-Fireside-Write-Key', key);
+    const session = getCollaborationSession();
+    if (session) headers.set('X-Fireside-Session', session);
   }
   const response = await fetch(url, {
     ...options,
@@ -63,7 +83,14 @@ export const api = {
   access: () => request<{ enabled: boolean }>('/api/access'),
   verifyAccess: async (key: string) => {
     const response = await fetch('/api/access/verify', { method: 'POST', headers: { 'X-Fireside-Write-Key': key } });
-    await readBody<void>(response, false);
+    return readBody<{ sessionToken: string; expiresAt: string }>(response, false);
+  },
+  accessSession: async () => {
+    const headers = new Headers();
+    const session = getCollaborationSession();
+    if (session) headers.set('X-Fireside-Session', session);
+    const response = await fetch('/api/access/session', { headers, cache: 'no-store' });
+    return readBody<{ valid: true; expiresAt: string }>(response, false);
   },
   topics: async (sort: TopicSort = 'manual') => {
     const response = await fetch(`/api/topics?sort=${sort}`);
@@ -84,8 +111,8 @@ export const api = {
   remove: (id: number, revision: number) => request<void>(`/api/topics/${id}`, { method: 'DELETE', headers: revisionHeaders(revision) }),
   reorder: async (orderedIds: number[], baseVersion: number) => {
     const headers = new Headers({ 'Content-Type': 'application/json' });
-    const key = getWriteKey();
-    if (key) headers.set('X-Fireside-Write-Key', key);
+    const session = getCollaborationSession();
+    if (session) headers.set('X-Fireside-Session', session);
     const response = await fetch('/api/topics/reorder', {
       method: 'POST',
       headers,
