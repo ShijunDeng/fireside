@@ -217,6 +217,107 @@ describe('数据库兼容性与并发', () => {
     await rm(directory, { recursive: true, force: true });
   });
 
+  it('无损归一化旧库的重复位置并可幂等重启', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-duplicate-position-'));
+    const databasePath = path.join(directory, 'legacy.db');
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        position INTEGER NOT NULL DEFAULT 0,
+        title TEXT NOT NULL, summary TEXT NOT NULL, proposer TEXT NOT NULL, presenter TEXT,
+        tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'OPEN', scheduled_at TEXT,
+        duration INTEGER, room TEXT, takeaway TEXT, material_url TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+      );
+    `);
+    const timestamps = {
+      createdAt: '2026-08-01T10:00:00.000Z',
+      updatedAt: '2026-08-02T11:00:00.000Z',
+      scheduledAt: '2026-08-08T12:30:00.000Z',
+    };
+    const insert = legacy.prepare(`
+      INSERT INTO topics
+        (position, title, summary, proposer, presenter, tags, status, scheduled_at, duration, room, takeaway, material_url, created_at, updated_at, archived_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run(2, '旧议题甲', '甲简介', '甲发起', null, '["迁移甲"]', 'OPEN', null, null, null, null, null, timestamps.createdAt, timestamps.updatedAt, null);
+    insert.run(1, '旧议题乙', '乙简介', '乙发起', '乙分享', '["迁移乙"]', 'SCHEDULED', timestamps.scheduledAt, 55, '旧会议室', null, null, timestamps.createdAt, timestamps.updatedAt, null);
+    insert.run(1, '旧议题丙', '丙简介', '丙发起', '丙分享', '["迁移丙"]', 'ARCHIVED', timestamps.scheduledAt, 35, '线上', '丙收获', 'https://example.com/legacy', timestamps.createdAt, timestamps.updatedAt, timestamps.scheduledAt);
+    const beforeRows = legacy.prepare('SELECT * FROM topics ORDER BY id').all() as Array<Record<string, unknown> & { position: number }>;
+    legacy.close();
+
+    const firstStart = buildApp({ databasePath, seed: false, serveStatic: false });
+    await firstStart.ready();
+    const firstResponse = await firstStart.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(firstResponse.statusCode, 200);
+    const firstTopics = firstResponse.json() as Array<{
+      position: number; title: string; summary: string; proposer: string; presenter: string | null;
+      tags: string[]; status: string; scheduledAt: string | null; duration: number | null;
+      room: string | null; takeaway: string | null; materialUrl: string | null;
+      createdAt: string; updatedAt: string; archivedAt: string | null;
+    }>;
+    assert.deepEqual(firstTopics.map(({ title, position }) => ({ title, position })), [
+      { title: '旧议题乙', position: 1 },
+      { title: '旧议题丙', position: 2 },
+      { title: '旧议题甲', position: 3 },
+    ]);
+    await firstStart.close();
+
+    const verifyBusinessData = new Database(databasePath);
+    const afterRows = verifyBusinessData.prepare('SELECT * FROM topics ORDER BY id').all() as Array<Record<string, unknown> & { position: number }>;
+    const withoutPosition = ({ position: _position, ...row }: Record<string, unknown> & { position: number }) => row;
+    assert.deepEqual(afterRows.map(withoutPosition), beforeRows.map(withoutPosition));
+    verifyBusinessData.close();
+
+    const secondStart = buildApp({ databasePath, seed: false, serveStatic: false });
+    await secondStart.ready();
+    const secondResponse = await secondStart.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual(secondResponse.json(), firstTopics);
+    await secondStart.close();
+
+    const migrated = new Database(databasePath);
+    const index = (migrated.prepare("PRAGMA index_list('topics')").all() as { name: string; unique: number }[])
+      .find(({ name }) => name === 'idx_topics_position');
+    assert.equal(index?.unique, 1);
+    assert.throws(() => migrated.prepare('UPDATE topics SET position = 1 WHERE position = 2').run(), /UNIQUE constraint failed/);
+    migrated.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('把同名非唯一位置索引升级为唯一索引', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-nonunique-index-'));
+    const databasePath = path.join(directory, 'legacy.db');
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, position INTEGER NOT NULL DEFAULT 0,
+        title TEXT NOT NULL, summary TEXT NOT NULL, proposer TEXT NOT NULL, presenter TEXT,
+        tags TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'OPEN', scheduled_at TEXT,
+        duration INTEGER, room TEXT, takeaway TEXT, material_url TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT
+      );
+      CREATE INDEX idx_topics_position ON topics(position);
+    `);
+    const now = new Date().toISOString();
+    const insert = legacy.prepare("INSERT INTO topics (position, title, summary, proposer, created_at, updated_at) VALUES (1, ?, ?, '迁移测试', ?, ?)");
+    insert.run('同名索引甲', '甲简介', now, now);
+    insert.run('同名索引乙', '乙简介', now, now);
+    legacy.close();
+
+    const migrationApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await migrationApp.ready();
+    const response = await migrationApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((response.json() as { position: number }[]).map(({ position }) => position), [1, 2]);
+    await migrationApp.close();
+    const migrated = new Database(databasePath);
+    const index = (migrated.prepare("PRAGMA index_list('topics')").all() as { name: string; unique: number }[])
+      .find(({ name }) => name === 'idx_topics_position');
+    assert.equal(index?.unique, 1);
+    migrated.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
   it('两个应用实例并发认领时只有一个成功', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-concurrency-'));
     const databasePath = path.join(directory, 'shared.db');

@@ -147,8 +147,18 @@ export function createDatabase(databasePath: string, seed = true) {
   if (!columns.some((column) => column.name === 'position')) {
     db.exec('ALTER TABLE topics ADD COLUMN position INTEGER NOT NULL DEFAULT 0');
   }
-  db.exec('UPDATE topics SET position = id WHERE position = 0');
-  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_position ON topics(position)');
+  const positionIndex = (db.prepare("PRAGMA index_list('topics')").all() as { name: string; unique: number }[])
+    .find(({ name }) => name === 'idx_topics_position');
+  if (!positionIndex || positionIndex.unique !== 1) {
+    db.transaction(() => {
+      if (positionIndex) db.exec('DROP INDEX idx_topics_position');
+      const orderedIds = (db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[])
+        .map(({ id }) => id);
+      const updatePosition = db.prepare('UPDATE topics SET position = ? WHERE id = ?');
+      orderedIds.forEach((id, index) => updatePosition.run(index + 1, id));
+      db.exec('CREATE UNIQUE INDEX idx_topics_position ON topics(position)');
+    }).immediate();
+  }
   initializeSampleData(db, seed);
   return db;
 }
