@@ -91,12 +91,18 @@ function seedDatabase(db: Database.Database) {
     },
   ] as const;
 
-  const transaction = db.transaction(() => {
-    for (const [index, sample] of samples.entries()) {
-      insert.run({ ...sample, position: index + 1, tags: JSON.stringify(sample.tags) });
-    }
-  });
-  transaction();
+  for (const [index, sample] of samples.entries()) {
+    insert.run({ ...sample, position: index + 1, tags: JSON.stringify(sample.tags) });
+  }
+}
+
+function initializeSampleData(db: Database.Database, seed: boolean) {
+  db.transaction(() => {
+    const initialized = db.prepare("SELECT 1 FROM app_state WHERE key = 'sample_data_initialized'").get();
+    if (initialized) return;
+    if (seed) seedDatabase(db);
+    db.prepare("INSERT INTO app_state (key, value) VALUES ('sample_data_initialized', ?)").run(seed ? 'seed-enabled' : 'seed-disabled');
+  }).immediate();
 }
 
 export function createDatabase(databasePath: string, seed = true) {
@@ -132,6 +138,10 @@ export function createDatabase(databasePath: string, seed = true) {
       version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0)
     );
     INSERT OR IGNORE INTO topic_order_state (id, version) VALUES (1, 0);
+    CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
   const columns = db.prepare('PRAGMA table_info(topics)').all() as { name: string }[];
   if (!columns.some((column) => column.name === 'position')) {
@@ -139,6 +149,6 @@ export function createDatabase(databasePath: string, seed = true) {
   }
   db.exec('UPDATE topics SET position = id WHERE position = 0');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_position ON topics(position)');
-  if (seed) seedDatabase(db);
+  initializeSampleData(db, seed);
   return db;
 }

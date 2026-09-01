@@ -151,6 +151,41 @@ describe('围炉夜话 API', () => {
 });
 
 describe('数据库兼容性与并发', () => {
+  it('演示数据只初始化一次，用户清空后重启不会复活', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-seed-once-'));
+    const databasePath = path.join(directory, 'seed.db');
+    const firstStart = buildApp({ databasePath, seed: true, serveStatic: false });
+    await firstStart.ready();
+    const seeded = await firstStart.inject({ method: 'GET', url: '/api/topics' });
+    assert.equal(seeded.json().length, 4);
+    for (const topic of seeded.json() as { id: number }[]) {
+      const deleted = await firstStart.inject({ method: 'DELETE', url: `/api/topics/${topic.id}` });
+      assert.equal(deleted.statusCode, 204);
+    }
+    await firstStart.close();
+
+    const restarted = buildApp({ databasePath, seed: true, serveStatic: false });
+    await restarted.ready();
+    const afterRestart = await restarted.inject({ method: 'GET', url: '/api/topics' });
+    assert.deepEqual(afterRestart.json(), []);
+    await restarted.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('首次明确禁用演示数据后，后续启动不会改变决定', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-seed-disabled-'));
+    const databasePath = path.join(directory, 'empty.db');
+    const firstStart = buildApp({ databasePath, seed: false, serveStatic: false });
+    await firstStart.ready();
+    await firstStart.close();
+    const restarted = buildApp({ databasePath, seed: true, serveStatic: false });
+    await restarted.ready();
+    const topics = await restarted.inject({ method: 'GET', url: '/api/topics' });
+    assert.deepEqual(topics.json(), []);
+    await restarted.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
   it('为旧数据库无损添加 position 字段', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-migration-'));
     const databasePath = path.join(directory, 'legacy.db');
