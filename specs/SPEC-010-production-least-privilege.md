@@ -141,6 +141,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 写许可必须绑定当前 release commit，不能使用可被旧版本/旧事务重放的固定布尔文件。只有健康 marker、previous 语义、业务指纹和事务“向前提交”状态均已 fsync 后，控制器才原子发布目标 commit 的写许可。一旦许可发布，任何后续清理失败或控制器退出都不得恢复启动前数据库或让已返回 2xx 的业务写丢失；recovery 必须识别 committed 阶段并向前完成 current/marker/清理。
 - `publish` 的 temp fsync、rename 和目录 fsync 有不同可见性，但调用者在进入已 fsync 的 committed phase 后不得再走回退分支；即使 rename 后目录 fsync 报错且并发请求已读到许可，recovery 也只能重试发布并向前完成。事务前 revoke 若 unlink 已可见但目录 fsync 失败，必须恢复 origin commit 的许可或留下可恢复 journal，不能在无事务状态静默永久 503。
 - 为消除 revoke 的无日志窗口，控制器必须先持久化可恢复 journal 与 active marker，再撤销 origin 写许可；journal/marker/revoke 任一步失败均按 journal 恢复 origin。journal 清理发生在许可持久化之后；若 active marker 的最终清理失败，watchdog/gate 仍须清除该过期标记，不能让备份永久拒绝。
+- transaction、healthy marker、release-active 与 writes-enabled 等固定文件路径在原子替换前必须拒绝目录、链接和非预期类型，并使用不把目标当目录的 `mv -T` 语义。异常类型原样保留人工证据，临时文件不能被移入其中；命令不得误报成功或先清 journal。
 - 普通无事务启动也必须让服务进程的 release commit 与 root-owned 写许可一致；缺失、错误 commit、错误类型/权限/链接时读取仍可服务但业务写失败关闭。首次部署文档和生产验收必须在成功 bootstrap 后确认许可已发布，重启后仍匹配 current。
 - 含业务数据的预检目录必须遵守既有敏感副本清理门禁。bootstrap 与 promote/rollback/backup 共用同一个 root-only 维护锁，任何失败均不得误报成功。
 
@@ -218,6 +219,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 43. 在 service gate 已确认 transaction owner 活跃后阻塞它，杀 controller 并让 watchdog进入恢复，再释放 gate；最终必须是 origin MainPID/cwd/current/selector/permit一致、journal 不复活且 target 写/runner不持续运行。gate mutex 类型、owner、mode、link count任一错误均失败关闭。
 44. switched orphan 分别由 watchdog、人工 recover、backup gate 先取得；三条恢复都必须在明显小于 gate mutex 120秒超时内释放 mutex供 service gate 消费恢复许可，再重新取得并完成 origin health，不能死锁。backup 只能在完整恢复后执行 origin runner。
 45. 让 controller 的 sync 等子进程在父进程被杀后持续存活，逐一检查其 `/proc/<pid>/fd` 不含主锁/gate锁；watchdog立即取得同一inode恢复。backup CLI尝试unlink/replace lock、selector与permit均EPERM，且并发controller直到runner共享锁释放后才能进入。
+46. 分别把 transaction、release-active、writes-enabled、healthy marker预置为目录或链接；原子发布必须失败且不把temp移入目标、不清journal、不输出成功，原异常类型保留。恢复证据缺失时Node/backup继续失败关闭而不是误报健康。
 
 ### 7.2 生产
 
@@ -298,3 +300,5 @@ gate mutex 实现复审确认恢复者若持 mutex 同步 `systemctl restart`，
 锁 fd 复审确认仅在 systemctl 等少数调用点关闭 fd 不足：持久化 sync 子进程可在 controller 死亡后继续占主锁，永久阻止 watchdog。主锁改由 `flock --close` 监督者持有，controller 全后代从未获得 fd；gate 锁路径同样必须证明无继承。该恢复可用性 P1 使成熟度计数保持 0。
 
 backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护锁或运行许可，绕过互斥与写屏障。root gate 负责锁准备，runner 只读 open + shared flock 并把 `/run` 设为只读；候选 CLI 破坏尝试必须 EPERM。该高价值 P2 使成熟度计数保持 0。
+
+固定文件原子替换复审确认 `mv -f temp fixedPath` 遇到目录会把 temp 移入并返回成功，可能清 journal却让写许可永久失效。transaction、healthy、active和permit统一先拒绝异常类型并使用`mv -Tf`；四类目标目录/链接回归必须保留证据且无假成功。该高价值P2使成熟度计数保持0。
