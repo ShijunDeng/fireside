@@ -75,6 +75,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - `server-build/server/index.js`、`backup-cli.js`、预检入口、客户端 `index.html`、`package.json`、`package-lock.json` 与 manifest 必须是 release 内普通文件，不能是符号链接；manifest 校验失败、产物陈旧或被篡改时拒绝安装。
 - 生产依赖安装在 release 内；release 建成、依赖安装和最小自检成功后才允许进入提升阶段。
 - 每个 release 以 Git commit 标识且不可就地修改；至少保留当前与上一健康 release。回滚只切换链接并重启 service，不触碰状态目录。
+- immutable release 的目标不存在检查必须在取得共同维护锁后执行，并在最终发布前再次确认；最终目录移动必须使用不把既有目标当目录的 `mv -T` 或等强 no-replace语义。两个相同 SHA 并发 install 时只有一个可成功，另一个明确拒绝且不能把 publish stage 嵌入、修改文件集合或让既有 manifest失配。
 
 ### FR-OPS-010 候选门禁、原子提升与失败回滚
 
@@ -220,6 +221,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 44. switched orphan 分别由 watchdog、人工 recover、backup gate 先取得；三条恢复都必须在明显小于 gate mutex 120秒超时内释放 mutex供 service gate 消费恢复许可，再重新取得并完成 origin health，不能死锁。backup 只能在完整恢复后执行 origin runner。
 45. 让 controller 的 sync 等子进程在父进程被杀后持续存活，逐一检查其 `/proc/<pid>/fd` 不含主锁/gate锁；watchdog立即取得同一inode恢复。backup CLI尝试unlink/replace lock、selector与permit均EPERM，且并发controller直到runner共享锁释放后才能进入。
 46. 分别把 transaction、release-active、writes-enabled、healthy marker预置为目录或链接；原子发布必须失败且不把temp移入目标、不清journal、不输出成功，原异常类型保留。恢复证据缺失时Node/backup继续失败关闭而不是误报健康。
+47. 两个同 SHA install 在第一次“目标 absent”后用 barrier交错；最终仅一个成功，另一个拒绝或锁冲突，既有 release 的字节、manifest和子项集合完全不变，无嵌套publish目录，失败者不得输出installed成功。
 
 ### 7.2 生产
 
@@ -302,3 +304,5 @@ gate mutex 实现复审确认恢复者若持 mutex 同步 `systemctl restart`，
 backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护锁或运行许可，绕过互斥与写屏障。root gate 负责锁准备，runner 只读 open + shared flock 并把 `/run` 设为只读；候选 CLI 破坏尝试必须 EPERM。该高价值 P2 使成熟度计数保持 0。
 
 固定文件原子替换复审确认 `mv -f temp fixedPath` 遇到目录会把 temp 移入并返回成功，可能清 journal却让写许可永久失效。transaction、healthy、active和permit统一先拒绝异常类型并使用`mv -Tf`；四类目标目录/链接回归必须保留证据且无假成功。该高价值P2使成熟度计数保持0。
+
+候选安装并发复审确认 release目标 absent检查在取锁前、最终`mv`又会把stage移入已有目录；同SHA双install可污染immutable tree并误报成功。目标检查移入锁内并在发布前复核，最终使用`mv -T`/no-replace语义；并发barrier证明既有release零变化。该P1使成熟度计数保持0。

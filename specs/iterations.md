@@ -239,3 +239,4 @@
 - 锁fd继承阻断 AB：仅关闭systemctl/curl仍让sync/stat/hash等子进程继承主锁，controller死亡后watchdog可永久等待。主锁由`flock --close`监督者持有，controller及全部后代从未拥有fd；gate锁也须以存活子进程故障注入证明不会延长owner生命周期。
 - backup运行态写权阻断 AC：UID0 runner曾可写整个`/run`并替换维护锁/selector/permit。root gate预建严格锁，runner只读open同inode取得共享flock，sandbox内`/run`只读；候选CLI破坏尝试EPERM且controller严格等待共享锁释放。
 - 固定文件替换阻断 AD：`mv -f temp fixedPath` 遇目标目录会把temp移入并返回0，可能清journal后留下永久503。transaction/healthy/release-active/writes-enabled统一拒绝异常类型并使用`mv -Tf`；目录/链接夹具验证不误报、不清证据、不把temp移入。
+- 同SHA安装竞态阻断 AE：release absent检查在取锁前且最终`mv`会嵌入已存在目录，两个install可污染immutable tree并误报。锁内检查并在发布前复核，最终`mv -T`或no-replace；并发barrier验证失败者不改变既有文件/manifest/子项集合。
