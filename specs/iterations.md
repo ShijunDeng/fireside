@@ -227,3 +227,4 @@
 - bootstrap 数据阻断 P：target live health 时 80 已可接受业务写，随后 marker/sync/clear 失败却会从启动前备份恢复，造成已返回 2xx 的数据永久丢失。所有发布在可回退窗口使用按 commit 绑定的 root-owned 写屏障，业务写返回 503且零副作用；写许可发布是不可逆提交点，此后的 recovery 只能向前完成，任何成功写都不得再被旧备份覆盖。
 - 启动门禁设计阻断 Q：纯 ExecStartPre 存在 current TOCTOU、一次许可消费后 controller 死亡窗口和重复 flock 自锁；fd 9 还可能被 systemctl 子进程继承，backup 共用恢复 sandbox 会扩大候选 runner 权限。journal 加随机 txid/owner/锁 inode/单次 generation许可；gate 固化不可变 runtime selector，独立 watchdog 在 owner 死亡后接管；所有子进程关闭锁 fd；backup root gate 与最小权限 runner 拆分并在共享锁后复查无 journal。
 - SQLite 边车阻断 R：bootstrap 仅识别 wal/shm，遗漏真实 hot `fireside.db-journal`；无 main 时安装新DB会被旧 rollback journal 回放并损坏，恢复后 journal 仍在导致永久循环。无 main+任一三类边车必须先拒绝并保留证据；停止 workload 后安装/恢复清理 wal/shm/journal 并按目录 fsync 顺序持久化。
+- watchdog 就绪阻断 S：异步 systemd-run exec成功不证明watchdog仍活着并已等待锁，controller可在没有恢复者时切换。使用txid绑定的Type=notify握手；固定控制器/锁验证完成且即将等待才READY，controller有界等待并复查active，异常退出自动重启；watchdog capability收敛到恢复DB所需最小集合。

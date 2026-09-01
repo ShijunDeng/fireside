@@ -103,6 +103,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 新事务必须有至少 128-bit 随机 txid，并把 owner boot id、PID/starttime、固定控制器身份和锁 inode 作为附加证据。每次受控 service restart 使用 journal 内原子 fsync 的单次许可，绑定 txid、phase、expected commit、purpose 和递增 generation；gate 原子消费，旧许可、第二次 restart、错误 current/phase/owner/lock 一律拒绝。PID 或 lock-busy 单独都不是授权。
 - service gate 在同一锁内把已验证 commit 固化为 root-owned 不可变运行 selector，MainPID 的 WorkingDirectory/ExecStart 必须引用 selector 而不是可变 `current`，关闭 pre-gate→exec 的 current TOCTOU。gate 拿到锁时直接在同一 worker 内恢复，不得再次调用会重复 flock 的入口。
 - 在第一份 journal 前启动独立 root-owned watchdog；它等待控制器释放同一锁，正常流程看到 journal 已清即退出，控制器异常死亡而相同 txid journal 仍在则接管恢复。watchdog/gate 的失败必须 fail-closed；受控 target 即使在许可消费后的极小窗口启动，也会被独立 watchdog 停止并恢复，不能持续成为公网版本。
+- “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能写第一份 journal。exec 后立即退出、坏参数/锁、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
+- watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
 - fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
 - backup 不得与 root recovery 共用一个扩大写权限的 sandbox。使用独立 root-owned gate/recovery unit，再进入保持现有最小权限的 runner unit；runner 在取得共享锁后再次只读确认没有 journal并解析已健康 selector，防止 gate→runner 间竞态。任意 active transaction 都不得执行 target backup CLI 或 prune。
 - 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
@@ -130,6 +132,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 首次 current 切换后必须启动 socket/service并通过与 promote 相同的双 unit、稳定 PID、UID、cwd 和连续 HTTP 健康门禁；成功后写健康标记、持久化并清事务，`previous` 保持不存在。健康失败应完整回到“未 bootstrap”状态并返回 3；恢复失败返回 4。
 - bootstrap 或其他发布事务开始切换前必须关闭 root-owned 运行时写许可。候选可以在公网 80 完成只读 live health，但从首次启动到所有可回退步骤持久化完成之间，创建、编辑、删除、排序、认领、排期、报名、归档等业务写必须稳定返回 `503 RELEASE_IN_PROGRESS` 且没有数据库副作用；页面保留草稿并提示稍后重试。认证换取短期会话和公开读取不修改业务数据，可以继续。
 - 写许可必须绑定当前 release commit，不能使用可被旧版本/旧事务重放的固定布尔文件。只有健康 marker、previous 语义、业务指纹和事务“向前提交”状态均已 fsync 后，控制器才原子发布目标 commit 的写许可。一旦许可发布，任何后续清理失败或控制器退出都不得恢复启动前数据库或让已返回 2xx 的业务写丢失；recovery 必须识别 committed 阶段并向前完成 current/marker/清理。
+- `publish` 的 temp fsync、rename 和目录 fsync 有不同可见性，但调用者在进入已 fsync 的 committed phase 后不得再走回退分支；即使 rename 后目录 fsync 报错且并发请求已读到许可，recovery 也只能重试发布并向前完成。事务前 revoke 若 unlink 已可见但目录 fsync 失败，必须恢复 origin commit 的许可或留下可恢复 journal，不能在无事务状态静默永久 503。
 - 普通无事务启动也必须让服务进程的 release commit 与 root-owned 写许可一致；缺失、错误 commit、错误类型/权限/链接时读取仍可服务但业务写失败关闭。首次部署文档和生产验收必须在成功 bootstrap 后确认许可已发布，重启后仍匹配 current。
 - 含业务数据的预检目录必须遵守既有敏感副本清理门禁。bootstrap 与 promote/rollback/backup 共用同一个 root-only 维护锁，任何失败均不得误报成功。
 
@@ -197,6 +200,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 33. watchdog 在 journal 前已成功启动；分别在许可写前、消费前、消费后、Node exec 前后和 health 中杀 controller，最终都自动停止 target、恢复 origin 并清理许可。正常流程 watchdog 无副作用退出；watchdog启动失败则切换前退出 2。
 34. controller 持锁时启动一个会存活的 systemctl 等子进程并杀 controller，子进程不得继续持有锁；watchdog能立即获得锁并恢复。backup gate 与最小权限 runner 分离，恢复权限不会进入候选 backup CLI 的 unit namespace。
 35. 用 DELETE journal、FULL 同步和 cache spill 建立真实 hot `fireside.db-journal` 后移走旧 main；bootstrap 必须退出 2，journal 类型/字节/hash 不变且不创建 current/DB/备份。另让 target 启动生成 journal 后在健康门禁失败，恢复结果严格等于初始 absent 或原备份，目录无 main/wal/shm/journal 残留。
+36. watchdog dispatcher exec 后立即退出、参数/锁 inode 错误、不发 READY、READY 超时、READY 后被 kill 等场景均不得形成无恢复者的 current 切换；只有 PID 1 收到对应 txid worker 的 READY 且 unit active 才继续。正常结束不重启，异常退出自动重启并恢复同 txid journal。
+37. 写许可 temp fsync、rename 前、rename 后目录 fsync 分别故障：rename 前业务写保持503；许可一旦可见后的任意2xx在命令失败/SIGKILL/recovery后仍存在。origin revoke 的 unlink 后 fsync 失败不得留下无journal的永久503。
 
 ### 7.2 生产
 
@@ -261,3 +266,5 @@ bootstrap 数据复审发现 live health 窗口已经由 socket 向公网开放�
 启动门禁设计复审确认纯 ExecStartPre 仍有 current TOCTOU、许可消费后 owner 死亡窗口与重复 flock 死锁；发布锁还可能被 systemctl 子进程继承，backup 若共用恢复 sandbox 会扩大 root 候选 runner 权限。采用 txid/单次许可、不可变 runtime selector、独立 watchdog、子进程关闭锁 fd和 gate/runner 分离；这些相邻 P1 继续保持成熟度计数为 0。
 
 SQLite 恢复复审还构造出真实 hot rollback journal：无 main 时若遗漏 `fireside.db-journal`，安装的新库会在首次打开时被旧 journal 回放成损坏页，失败恢复又留下 journal 导致永久重试循环。边车边界扩展到 wal/shm/journal，并要求拒绝孤儿、停止 workload 后清理与目录 fsync。该 P1 继续保持成熟度计数为 0。
+
+watchdog 就绪复审确认异步 `systemd-run` 只证明 dispatcher 被 exec，不能证明守护者仍活着并在等待锁；若随后 controller 死亡，原 P1 仍存在。增加 Type=notify 的 txid 就绪握手、active 复查、异常自动重启和最小 capability 沙箱。该 P1 继续保持成熟度计数为 0。
