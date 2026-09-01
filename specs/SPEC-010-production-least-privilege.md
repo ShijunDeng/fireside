@@ -83,6 +83,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 控制器不得让 root Git 继承调用者的 `HOME`、XDG、全局/系统配置、`core.fsmonitor`、hooks 或其他可执行配置。所有 Git 读取都必须使用固定 PATH、空的 global/system config，并在命令行禁用 repository-local fsmonitor 与 hooks；隔离生产夹具须注入恶意 HOME/XDG 与仓库本地 fsmonitor 哨兵，证明 status/archive/授权检查前后均不会执行。
 - root 工具的临时目录、代理和 systemd/DBus 目标同样不能由调用者决定：控制器固定 root-only `TMPDIR`，清除大小写代理、`NO_PROXY`、DBus/SYSTEMD 变量；健康 curl 还必须显式 `--noproxy '*'`。manifest 校验不得在调用者目录创建随后按路径重新打开的 root 临时文件，systemctl/systemd-run 只能连接本机系统 manager。
 - 完整 40 位 commit 还必须属于授权的 `refs/remotes/origin/main`。安装记录 Git tree OID、唯一源码归档 SHA-256、锁文件 SHA-256、Node/npm 版本及全量文件 manifest；完整 SHA 只解决歧义，不能代替发布授权。
+- 生产授权不能信任开发用户可改写的本地 remote-tracking ref；控制器必须从固定 HTTPS GitHub 仓库在隔离 Git 环境中读取权威 `refs/heads/main`，并只安装当时精确的远端 main commit。文档的 443 SSH push 后须显式更新/验证 tracking ref，不能假设“向 URL push”等价于命名 remote fetch。
 - 安装候选和提升为 `current` 是两个明确阶段。候选至少通过 JavaScript 语法、生产依赖加载、完整自动化/构建，以及在最新一致备份的隔离副本上完成数据库启动迁移、`/api/health`、公开 Topic 读取和关闭；任一失败时 `current` 完全不变。
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
@@ -92,6 +93,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
 - 候选目录存在不等于健康。构建失败、预检失败或曾提升失败的 release 不能被 `current`、`previous` 或备份 timer 隐式采用。
 - `current` 与 `previous` 不能原子双写，因此切换前把 `{from,to,originalPrevious,phase}` 以 0600 文件和目录 fsync 写入 root-only 事务日志；切换、restart/health、previous 更新各阶段都持久化。任一未完成事务在下一次变更前一律安全恢复 `from + originalPrevious`，并由开机 recovery unit 在应用启动前执行相同恢复，不能依赖操作者恰好再次发布。
+- 所有 `mktemp`、权限设置、备份复制/所有权变更和目标拼接都必须逐步检查；临时目录为空、创建失败或不在固定 root 下时必须在接触备份前退出。禁止空 stage 退化为 `/fireside.db` 或任何 fixed root 外路径。恢复 previous 为 `none` 时删除旧链接失败也必须返回致命恢复失败并保留 transaction，不能在 sync 成功后误报恢复完成。
+- healthy marker 的 manifest digest 必须先独立计算、检查命令状态并验证为 64 位 SHA-256（仅显式 legacy current 可用固定标记），再写 marker；禁止让 command substitution 失败被外层 `printf` 成功掩盖。marker 生成/持久化失败属于提升失败，必须回到调用前版本。
 - 健康门禁不是单次 200：socket 与 service active，MainPID UID 为 `fireside`、cwd 精确指向目标 release，PID 在稳定观察窗不变化，且多个新连接健康请求连续成功。previous 更新或其持久化失败也视为提升失败并恢复原版本。
 - socket 与 service 的 active 状态必须分别检查并同时成立；禁止依赖 `systemctl is-active unitA unitB` 的“任一 active 即成功”聚合退出语义。任一 inactive/failed/not-found 都必须拒绝健康版本或触发自动恢复。
 
@@ -144,6 +147,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 12. 为 install 的 Git fixture 分别在恶意 `HOME/.gitconfig`、`XDG_CONFIG_HOME/git/config` 与仓库 `.git/config` 配置 `core.fsmonitor` 外部程序；控制器必须继续给出预期业务结果且所有哨兵均不存在。调用环境中的 Git config/exec/SSH 变量不得改变 commit、授权 ref、归档或 dirty 判定。
 13. 注入攻击者 `TMPDIR`、`GIT_CONFIG_PARAMETERS`、`GIT_EXEC_PATH`、`GIT_TRACE*`、大小写代理与 `DBUS_SYSTEM_BUS_ADDRESS`/SYSTEMD 变量；manifest 比较只能使用 root 私有临时对象，本机健康请求不得到达假代理，systemd 操作不得连接调用者总线。真实候选 health 失败时仍须回退，不能被代理的伪造 200 判健康。
 14. 生产等价 health hook 分别返回“socket inactive + service active”“socket active + service inactive”，两种都必须失败；只有两者各自 active 才继续 PID/cwd/UID、稳定窗和 HTTP 校验。
+15. 让 preflight root 不存在、不可写或让 `mktemp/chmod/install/chown` 逐点失败；不得创建 `/fireside.db` 或 fixed preflight root 外文件，指针/业务指纹不变。把待删除 previous 链接替换为不可删除项时，recover/rollback 必须返回 4、保留 transaction，不能报告成功或 3。
+16. 临时 bare remote 流程证明“按 443 URL push → 显式 fetch tracking ref → 精确校验”可复现；生产 install 另以固定 HTTPS `refs/heads/main` 为权威，开发用户篡改本地 `refs/remotes/origin/main` 不能授权未推送 commit。
+17. 注入 manifest digest 读取/hash 失败；不得生成空 digest healthy marker，不得把目标记为 previous/healthy，提升必须按事务语义自动恢复。
 
 ### 7.2 生产
 
@@ -178,3 +184,9 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 环境复审还确认 `TMPDIR` 可把 root manifest 临时文件引到攻击者父目录，代理可劫持回环 health，DBus/SYSTEMD 环境可改写 systemctl 目标。上述变量必须由统一净化层清除，生产临时目录必须 root-only，curl 还需主动禁用代理；故障回归须证明假代理无请求且候选真实 health 失败仍自动回退。
 
 健康门禁复审还复现：单条 `systemctl is-active fireside.socket fireside.service` 在任一单元 active 时即可返回 0，不能证明两者同时 active。实现必须拆成两个独立断言，并覆盖两种单边 active 组合；该 P1 继续使成熟度计数为 0。
+
+失败路径复审进一步发现，promote 没有检查 preflight `mktemp/chmod/install/chown`：stage 为空时目标会退化为 `/fireside.db`，造成 root 把完整生产备份遗留在错误路径；`restore_previous_pointer none` 也可能忽略删除失败、清 journal 后误报恢复完成。所有路径构造必须先证明非空且位于固定父目录，每个文件操作都要失败即停，恢复不完整必须返回 4 并保留证据。
+
+同类状态掩蔽还存在于 healthy marker：`printf "$(release_manifest_digest)"` 会吞掉内部 hash 失败并写出空 digest。digest 必须先独立取得且验证格式；失败时不得把不可验证 release 标记为健康，必须进入自动恢复。
+
+发布文档和授权链也存在闭环缺口：直接向 SSH URL push 不会更新命名 remote 的 tracking ref，而本地 ref 本身又可由开发用户改写。文档必须显式 fetch/验证；生产控制器则从固定 HTTPS GitHub `refs/heads/main` 读取权威 commit，不能把开发者仓库元数据当授权根。

@@ -212,3 +212,6 @@
 - 修复复审阻断 E：root Git 仍会读取调用者 `HOME/.gitconfig`、`XDG_CONFIG_HOME/git/config` 和开发用户可写仓库 `.git/config`；`core.fsmonitor` 足以在 `git status` 前执行外部程序。所有 Git 命令必须使用空 global/system config、清除 HOME/XDG/Git 执行变量并显式禁用本地 fsmonitor/hooks；三种来源的恶意配置均须由哨兵回归覆盖。
 - 阻断 E 的相邻环境面：无模板 `mktemp` 仍继承攻击者 `TMPDIR`；回环 curl 可被 `http_proxy`/`ALL_PROXY` 导向伪造健康代理；systemctl/systemd-run 可受 DBus/SYSTEMD 环境影响。统一净化必须覆盖这些变量，生产临时文件只落 root 私有目录，curl 显式禁代理，并以代理零请求和真实失败仍回退验收。
 - 修复复审阻断 F：`systemctl is-active socket service` 的多单元退出码是“至少一个 active”，不能证明 socket 与 app 同时健康。生产门禁必须分别检查两个 unit；socket-only 和 service-only 两种组合都须拒绝，只有双 active 才进入 PID/cwd/UID/HTTP 稳定窗。
+- 修复复审阻断 G：promote 未检查 preflight `mktemp/chmod/install/chown`；stage 为空会把生产备份目标拼成 `/fireside.db`。每步必须 guard，目标在复制前验证为固定 root 的非空子路径。恢复 previous=none 时删除失败也不能被后续 sync 掩盖，必须返回 4 并保留 transaction。
+- 阻断 G 的同类状态掩蔽：healthy marker 直接在 `printf` 参数中计算 manifest digest，内部 hash 失败会被外层成功吞掉并写空 digest。实现必须先独立计算并验证 digest；失败触发自动恢复，不能留下未来不可回滚的“健康”版本。
+- 发布流程补强：按 SSH URL push 不更新 `refs/remotes/origin/main`，README 必须显式 fetch 后再验证；生产 controller 不能信任开发用户可改写的本地 tracking ref，须从固定 HTTPS GitHub 权威 main 核对精确 commit。
