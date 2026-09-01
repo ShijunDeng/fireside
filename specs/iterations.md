@@ -235,3 +235,4 @@
 - 敏感 pending DB 阻断 X：bootstrap 原子替换前的完整数据库副本曾已 chown 给应用 UID，SIGKILL 会永久遗留 `.bootstrap.<pid>` 且 recovery 不清理。固定 root-only pending 名并纳入类型/所有者/链接数严格恢复清理；rename 后才降权最终主库，逐阶段崩溃注入证明无应用可读孤儿。
 - bootstrap 恢复身份阻断 Y：journal 只记录备份名时，截断/位腐坏备份可覆盖最后一份有效主库并清 journal误报成功。事务绑定备份 size+SHA-256；恢复在触碰指针/主库前验证固定目录、root:root0600、单链接普通文件与内容身份，pending复制后再次校验，失败保留现有主库和全部证据。
 - gate/watchdog 互斥阻断 Z：service gate 在 owner 校验后无锁写 journal/selector，controller SIGKILL 后可与 watchdog恢复并发并复活已清事务。增加独立 root-only gate mutex；许可消费全程持有，watchdog取得主锁后再持有才恢复，controller不持该锁且所有路径统一锁序。确定性阻塞注入验证 journal 不复活、最终运行态全为origin。
+- mutex 恢复自锁阻断 AA：恢复者持 gate mutex 同步 restart 会等待同样需要该 mutex 的 service gate。恢复者持主锁写好 reverting/pending许可后临时释放 mutex，restart后重新取得并复核同一txid/generation/consumed及健康；watchdog、人工 recover、backup gate 的 switched orphan 均须无120秒超时并完整恢复origin。
