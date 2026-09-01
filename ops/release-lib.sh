@@ -70,6 +70,21 @@ release_git_authoritative_fetch() {
       ssh://git@ssh.github.com:443/ShijunDeng/fireside.git refs/heads/main
 }
 
+release_sanitize_runtime_dependencies() {
+  local dependencies_root=$1
+  [[ -d ${dependencies_root} && ! -L ${dependencies_root} ]] \
+    || { release_die 'release dependencies root is invalid'; return 1; }
+  find "${dependencies_root}" -type d -name .bin -prune -exec rm -rf -- {} + || return 1
+  if find "${dependencies_root}" -type d -name .bin -print -quit | grep -q .; then
+    release_die 'release dependencies retain an npm command directory'
+    return 1
+  fi
+  if find "${dependencies_root}" -type l -print -quit | grep -q .; then
+    release_die 'release dependencies contain an unsupported symbolic link'
+    return 1
+  fi
+}
+
 release_systemctl() {
   /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/systemctl "$@"
 }

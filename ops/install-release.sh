@@ -195,11 +195,9 @@ cp -a -- "${build_stage}/server-build" "${publish_stage}/server-build"
 cp -a -- "${build_stage}/node_modules" "${publish_stage}/node_modules"
 install -o root -g root -m 0644 "${build_stage}/package.json" "${publish_stage}/package.json"
 install -o root -g root -m 0644 "${build_stage}/package-lock.json" "${publish_stage}/package-lock.json"
-if [[ -d ${publish_stage}/node_modules/.bin ]]; then
-  rm -rf -- "${publish_stage}/node_modules/.bin"
-fi
-if find "${publish_stage}" -type l -print -quit | grep -q .; then
-  release_die 'release dependencies contain unsupported symbolic links outside node_modules/.bin'
+release_sanitize_runtime_dependencies "${publish_stage}/node_modules"
+if find "${publish_stage}/server-build" -type l -print -quit | grep -q .; then
+  release_die 'release build output contains an unsupported symbolic link'
 fi
 printf '%s\n' "${commit}" > "${publish_stage}/RELEASE_COMMIT"
 cat > "${publish_stage}/RELEASE_METADATA" <<EOF

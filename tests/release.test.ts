@@ -186,6 +186,38 @@ const rootReleaseHarnessUnavailable = typeof process.getuid === 'function' && pr
 describe('版本化发布门禁', {
   skip: rootReleaseHarnessUnavailable ? 'controller fixtures require trusted root ownership semantics' : false,
 }, () => {
+  it('递归删除嵌套 npm .bin，但拒绝其余依赖链接', async () => {
+    const root = await temporaryDirectory('fireside-release-dependency-links-');
+    const dependencies = path.join(root, 'node_modules');
+    const nestedBin = path.join(dependencies, 'one/node_modules/two/.bin');
+    await mkdir(nestedBin, { recursive: true });
+    await symlink('../command.js', path.join(nestedBin, 'command'));
+    const unsupported = path.join(dependencies, 'one/runtime-link');
+    await symlink('runtime.js', unsupported);
+
+    const rejected = run('bash', [
+      '-c',
+      'source "$1"; release_sanitize_runtime_dependencies "$2"',
+      'dependency-links',
+      releaseLib,
+      dependencies,
+    ]);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /unsupported symbolic link/);
+    await assert.rejects(stat(nestedBin));
+    assert.equal(await readlink(unsupported), 'runtime.js');
+
+    await unlink(unsupported);
+    const accepted = run('bash', [
+      '-c',
+      'source "$1"; release_sanitize_runtime_dependencies "$2"',
+      'dependency-links',
+      releaseLib,
+      dependencies,
+    ]);
+    assert.equal(accepted.status, 0, accepted.stderr);
+  });
+
   it('从完整 commit 归档构建候选，不复制 ignored 陈旧产物且不切 current', async () => {
     const root = await temporaryDirectory('fireside-release-install-');
     const source = path.join(root, 'source');
@@ -227,11 +259,14 @@ set -eu
 stage=$1
 test ! -e "$stage/server-build/server/index.js"
 grep -Fxq 'from-commit' "$stage/tracked-marker"
-mkdir -p "$stage/server-build/server" "$stage/server-build/dist" "$stage/node_modules"
+mkdir -p "$stage/server-build/server" "$stage/server-build/dist" \
+  "$stage/node_modules/top/.bin" "$stage/node_modules/nested/node_modules/.bin"
 printf '%s\n' '// FRESH-COMMIT-BUILD' > "$stage/server-build/server/index.js"
 printf '%s\n' '// backup' > "$stage/server-build/server/backup-cli.js"
 printf '%s\n' '// preflight' > "$stage/server-build/server/preflight-cli.js"
 printf '%s\n' '<main>fresh</main>' > "$stage/server-build/dist/index.html"
+ln -s ../command.js "$stage/node_modules/top/.bin/command"
+ln -s ../command.js "$stage/node_modules/nested/node_modules/.bin/command"
 `);
     await writeExecutable(preflightHook, '#!/usr/bin/env bash\nset -eu\nexit 0\n');
     const currentSentinel = path.join(root, 'current-sentinel');
@@ -257,6 +292,8 @@ printf '%s\n' '<main>fresh</main>' > "$stage/server-build/dist/index.html"
     assert.match(await readFile(path.join(installed, 'RELEASE_METADATA'), 'utf8'), new RegExp(`commit=${commit}`));
     assert.equal(await readFile(currentSentinel, 'utf8'), 'unchanged');
     await assert.rejects(readFile(gitConfigSentinel));
+    await assert.rejects(stat(path.join(installed, 'node_modules/top/.bin')));
+    await assert.rejects(stat(path.join(installed, 'node_modules/nested/node_modules/.bin')));
 
     await writeFile(path.join(source, 'tracked-marker'), 'unauthorized-next-commit\n');
     execFileSync('git', ['add', 'tracked-marker'], { cwd: source });
