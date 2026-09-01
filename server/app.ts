@@ -55,6 +55,7 @@ type AppOptions = {
   logger?: boolean;
   serveStatic?: boolean;
   beforeTopicUpdate?: () => Promise<void>;
+  afterTopicRowsRead?: () => Promise<void>;
 };
 
 function validationMessage(error: z.ZodError) {
@@ -92,9 +93,20 @@ export function buildApp(options: AppOptions = {}) {
       status: "CASE status WHEN 'SCHEDULED' THEN 0 WHEN 'OPEN' THEN 1 WHEN 'CLAIMED' THEN 2 ELSE 3 END, position ASC",
     }[parsed.data.sort];
     const where = parsed.data.status ? ' WHERE status = ?' : '';
-    const rows = db.prepare(`SELECT * FROM topics${where} ORDER BY ${orderBy}`)
-      .all(...(parsed.data.status ? [parsed.data.status] : []));
-    reply.header('X-Order-Version', String(readOrderVersion()));
+    db.exec('BEGIN DEFERRED');
+    let rows: unknown[];
+    let orderVersion: number;
+    try {
+      rows = db.prepare(`SELECT * FROM topics${where} ORDER BY ${orderBy}`)
+        .all(...(parsed.data.status ? [parsed.data.status] : []));
+      if (options.afterTopicRowsRead) await options.afterTopicRowsRead();
+      orderVersion = readOrderVersion();
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.inTransaction) db.exec('ROLLBACK');
+      throw error;
+    }
+    reply.header('X-Order-Version', String(orderVersion));
     return (rows as Parameters<typeof rowToTopic>[0][]).map(rowToTopic);
   });
 

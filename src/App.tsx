@@ -388,9 +388,13 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('ALL');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<TopicSort>('manual');
+  const [loadedSort, setLoadedSort] = useState<TopicSort | null>(null);
   const [orderVersion, setOrderVersion] = useState(0);
   const [reordering, setReordering] = useState(false);
   const reorderInFlight = useRef(false);
+  const topicRequestId = useRef(0);
+  const statsRequestId = useRef(0);
+  const activeSort = useRef<TopicSort>('manual');
   const [view, setView] = useState<ViewMode>('list');
   const [calendarCursor, setCalendarCursor] = useState(new Date());
   const [draggedId, setDraggedId] = useState<number | null>(null);
@@ -398,19 +402,40 @@ export default function App() {
   const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
   const [toast, setToast] = useState('');
 
-  const load = useCallback(async () => {
+  const loadTopics = useCallback(async (requestedSort: TopicSort) => {
+    const requestId = ++topicRequestId.current;
+    setLoading(true);
+    setLoadedSort(null);
     try {
-      const [topicData, statData] = await Promise.all([api.topics(sort), api.stats()]);
+      const topicData = await api.topics(requestedSort);
+      if (requestId !== topicRequestId.current || requestedSort !== activeSort.current) return false;
       setTopics(topicData.topics);
       setOrderVersion(topicData.orderVersion);
-      setStats(statData);
+      setLoadedSort(requestedSort);
       setLoadError('');
+      return true;
     } catch (error) {
+      if (requestId !== topicRequestId.current || requestedSort !== activeSort.current) return false;
       setLoadError(error instanceof Error ? error.message : '炉火暂时熄灭了');
+      return false;
     } finally {
-      setLoading(false);
+      if (requestId === topicRequestId.current && requestedSort === activeSort.current) setLoading(false);
     }
-  }, [sort]);
+  }, []);
+
+  const loadStats = useCallback(async () => {
+    const requestId = ++statsRequestId.current;
+    try {
+      const statData = await api.stats();
+      if (requestId === statsRequestId.current) setStats(statData);
+    } catch {
+      // 统计卡片保留最近一次成功结果，不干扰议题列表的加载与排序来源。
+    }
+  }, []);
+
+  const load = useCallback(async () => {
+    await Promise.all([loadTopics(sort), loadStats()]);
+  }, [loadStats, loadTopics, sort]);
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
@@ -435,7 +460,14 @@ export default function App() {
     await load();
   }
   function scrollToTopics() { document.querySelector('#topics')?.scrollIntoView({ behavior: 'smooth' }); }
-  const canManualReorder = view === 'list' && sort === 'manual' && tab === 'ALL' && !search.trim();
+  function changeSort(nextSort: TopicSort) {
+    activeSort.current = nextSort;
+    topicRequestId.current += 1;
+    setLoadedSort(null);
+    setLoading(true);
+    setSort(nextSort);
+  }
+  const canManualReorder = view === 'list' && sort === 'manual' && loadedSort === 'manual' && !loading && tab === 'ALL' && !search.trim();
 
   async function persistOrder(next: Topic[], previous: Topic[], moved: Topic) {
     if (reorderInFlight.current) return;
@@ -451,10 +483,8 @@ export default function App() {
     } catch (error) {
       setTopics(previous);
       try {
-        const authoritative = await api.topics('manual');
-        setTopics(authoritative.topics);
-        setOrderVersion(authoritative.orderVersion);
-        setLiveMessage('已同步服务端最新议题顺序');
+        const synced = await loadTopics('manual');
+        setLiveMessage(synced ? '已同步服务端最新议题顺序' : '排序保存失败，已恢复操作前顺序');
       } catch {
         setLiveMessage('排序保存失败，已恢复操作前顺序');
       }
@@ -551,7 +581,7 @@ export default function App() {
           </div>
           <div className="sort-control">
             {view === 'list' && <label>排序方式
-              <select value={sort} onChange={(event) => setSort(event.target.value as TopicSort)}>
+              <select value={sort} disabled={reordering} onChange={(event) => changeSort(event.target.value as TopicSort)}>
                 <option value="manual">手动排序</option>
                 <option value="newest">最新创建</option>
                 <option value="oldest">最早创建</option>
@@ -559,7 +589,7 @@ export default function App() {
                 <option value="status">议题状态</option>
               </select>
             </label>}
-            {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">清除搜索并切回“全部议题”后可手动排序</span>}
+            {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">{loading || loadedSort !== 'manual' ? '正在加载可排序快照…' : '清除搜索并切回“全部议题”后可手动排序'}</span>}
             {reordering && <span className="sort-saving">正在保存顺序…</span>}
           </div>
         </div>

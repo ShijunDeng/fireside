@@ -114,4 +114,56 @@ test.describe('议题管理工作台', () => {
     await page.reload();
     await expect(page.getByRole('article').first()).toContainText(targetTitle);
   });
+
+  test('忽略晚到的其他排序响应，手动重排只使用最新快照', async ({ page }) => {
+    const initialResponsePromise = page.waitForResponse((response) => response.url().includes('/api/topics?sort=manual'));
+    await page.goto('/');
+    const initialResponse = await initialResponsePromise;
+    const manualTopics = await initialResponse.json() as { id: number; title: string }[];
+    const manualVersion = Number(initialResponse.headers()['x-order-version']);
+    const manualIds = manualTopics.map(({ id }) => id);
+    const manualTitles = manualTopics.map(({ title }) => title);
+    let signalNewest!: () => void;
+    let releaseNewest!: () => void;
+    const newestStarted = new Promise<void>((resolve) => { signalNewest = resolve; });
+    const newestReleased = new Promise<void>((resolve) => { releaseNewest = resolve; });
+    await page.route('**/api/topics?sort=newest', async (route) => {
+      signalNewest();
+      await newestReleased;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: { 'X-Order-Version': String(manualVersion) },
+        body: JSON.stringify([...manualTopics].reverse()),
+      });
+    });
+
+    const sortSelect = page.getByLabel('排序方式');
+    await sortSelect.selectOption('newest');
+    await newestStarted;
+    const latestManualResponse = page.waitForResponse((response) => response.url().includes('/api/topics?sort=manual'));
+    await sortSelect.selectOption('manual');
+    await latestManualResponse;
+    const topicCards = page.locator('.topic-card');
+    await expect(topicCards).toHaveCount(manualTopics.length);
+    expect(await topicCards.getByRole('heading').allTextContents()).toEqual(manualTitles);
+
+    const lateNewestResponse = page.waitForResponse((response) => response.url().includes('/api/topics?sort=newest'));
+    releaseNewest();
+    await lateNewestResponse;
+    expect(await topicCards.getByRole('heading').allTextContents()).toEqual(manualTitles);
+    await expect(page.getByText('正在点燃炉火…')).toHaveCount(0);
+
+    let reorderPayload: { orderedIds: number[]; baseVersion: number } | undefined;
+    await page.route('**/api/topics/reorder', async (route) => {
+      reorderPayload = route.request().postDataJSON() as { orderedIds: number[]; baseVersion: number };
+      await route.fulfill({ status: 204, headers: { 'X-Order-Version': String(manualVersion + 1) } });
+    });
+    await topicCards.nth(1).getByTitle('上移').click();
+    await expect.poll(() => reorderPayload).toBeTruthy();
+    expect(reorderPayload).toEqual({
+      orderedIds: [manualIds[1], manualIds[0], ...manualIds.slice(2)],
+      baseVersion: manualVersion,
+    });
+  });
 });

@@ -334,4 +334,60 @@ describe('数据库兼容性与并发', () => {
     await Promise.all([firstApp.close(), secondApp.close()]);
     await rm(directory, { recursive: true, force: true });
   });
+
+  it('列表与顺序版本来自同一个只读快照', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-read-snapshot-'));
+    const databasePath = path.join(directory, 'shared.db');
+    let pauseNextRead = false;
+    let signalRowsRead!: () => void;
+    let releaseRead!: () => void;
+    const rowsRead = new Promise<void>((resolve) => { signalRowsRead = resolve; });
+    const readReleased = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const readingApp = buildApp({
+      databasePath,
+      seed: false,
+      serveStatic: false,
+      afterTopicRowsRead: async () => {
+        if (!pauseNextRead) return;
+        pauseNextRead = false;
+        signalRowsRead();
+        await readReleased;
+      },
+    });
+    const writingApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await Promise.all([readingApp.ready(), writingApp.ready()]);
+    for (const title of ['快照甲', '快照乙', '快照丙']) {
+      await writingApp.inject({ method: 'POST', url: '/api/topics', payload: { title, summary: `${title}的简介`, proposer: '快照测试', tags: [] } });
+    }
+    const before = await writingApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const oldIds = (before.json() as { id: number }[]).map(({ id }) => id);
+    const oldVersion = Number(before.headers['x-order-version']);
+
+    pauseNextRead = true;
+    const pendingSnapshot = readingApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    await rowsRead;
+    const newIds = [...oldIds].reverse();
+    const concurrentReorder = await writingApp.inject({
+      method: 'POST',
+      url: '/api/topics/reorder',
+      payload: { orderedIds: newIds, baseVersion: oldVersion },
+    });
+    assert.equal(concurrentReorder.statusCode, 204);
+    releaseRead();
+
+    const snapshot = await pendingSnapshot;
+    assert.deepEqual((snapshot.json() as { id: number }[]).map(({ id }) => id), oldIds);
+    assert.equal(Number(snapshot.headers['x-order-version']), oldVersion);
+    const staleWrite = await readingApp.inject({
+      method: 'POST',
+      url: '/api/topics/reorder',
+      payload: { orderedIds: [oldIds[1], oldIds[0], oldIds[2]], baseVersion: oldVersion },
+    });
+    assert.equal(staleWrite.statusCode, 409);
+    const authoritative = await writingApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((authoritative.json() as { id: number }[]).map(({ id }) => id), newIds);
+
+    await Promise.all([readingApp.close(), writingApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
 });
