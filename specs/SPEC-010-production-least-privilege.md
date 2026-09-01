@@ -103,6 +103,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 每次启动门禁不能与持排他锁同步等待 `systemctl restart` 的正常 promote 自锁死，也不能把调用者环境、可写 marker 或“lock 正忙”本身当作授权。受控 restart 与 orphan 的区分必须绑定 root-owned事务、当前指针和活跃控制器所有权；控制器在放行点前后异常退出时，下一次 service/backup 入口仍须先恢复，且 backup 绝不能从未验收 target 执行或 prune。
 - 新事务必须有至少 128-bit 随机 txid，并把 owner boot id、PID/starttime、固定控制器身份和锁 inode 作为附加证据。每次受控 service restart 使用 journal 内原子 fsync 的单次许可，绑定 txid、phase、expected commit、purpose 和递增 generation；gate 原子消费，旧许可、第二次 restart、错误 current/phase/owner/lock 一律拒绝。PID 或 lock-busy 单独都不是授权。
 - service gate 在同一锁内把已验证 commit 固化为 root-owned 不可变运行 selector，MainPID 的 WorkingDirectory/ExecStart 必须引用 selector 而不是可变 `current`，关闭 pre-gate→exec 的 current TOCTOU。gate 拿到锁时直接在同一 worker 内恢复，不得再次调用会重复 flock 的入口。
+- 主发布锁忙时 service gate 的许可消费也必须与 watchdog 原子互斥：使用第二个 root:root 0600、普通单链接 gate mutex，service gate 在 owner校验→消费journal→selector 固化全程持有；watchdog 取得主锁后再按统一锁序取得 gate mutex 才恢复。controller 不持 gate mutex，避免 systemctl restart 自锁。owner 校验后 controller 死亡时，watchdog要么先阻断 gate，要么等待 gate 完成后恢复，旧 gate 不能在 journal 清理后复活 target 事务。
 - 在第一份 journal 前启动独立 root-owned watchdog；它等待控制器释放同一锁，正常流程看到 journal 已清即退出，控制器异常死亡而相同 txid journal 仍在则接管恢复。watchdog/gate 的失败必须 fail-closed；受控 target 即使在许可消费后的极小窗口启动，也会被独立 watchdog 停止并恢复，不能持续成为公网版本。
 - “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能写第一份 journal。exec 后立即退出、坏参数/锁、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
 - watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
@@ -212,6 +213,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 40. 从 `/proc/<pid>/environ` 和测试哨兵证明 service/backup gate、recovery、watchdog及其子进程均不含业务写口令或会话密钥；应用 Node 仍可完成合法认证。unit 不得因应用 `EnvironmentFile` 把密钥传给 root gate。
 41. 分别在 bootstrap 临时数据库 copy、file sync、rename、最终 chown 后杀死 controller；recovery 后原业务指纹不变（原本无库则仍无库），状态目录无 `.bootstrap.*`，失败状态下 `fireside`/`nobody` 均不能读取任何孤儿副本。错误类型、链接或非 root pending 文件必须拒绝自动删除并保留人工证据。
 42. 在 bootstrap 的 switched/healthy 阶段分别截断、翻转备份一字节，或改变其 mode/owner/link/type；recovery 必须返回4，主库 hash 不变、current 与 journal 证据保留，不能先删指针或覆盖数据库。只有 filename+size+SHA-256与严格元数据全部匹配的备份才能恢复并清 journal。
+43. 在 service gate 已确认 transaction owner 活跃后阻塞它，杀 controller 并让 watchdog进入恢复，再释放 gate；最终必须是 origin MainPID/cwd/current/selector/permit一致、journal 不复活且 target 写/runner不持续运行。gate mutex 类型、owner、mode、link count任一错误均失败关闭。
 
 ### 7.2 生产
 
@@ -284,3 +286,5 @@ watchdog 就绪复审确认异步 `systemd-run` 只证明 dispatcher 被 exec，
 bootstrap 敏感副本复审发现原子 rename 前已把完整迁移库 chown 给应用 UID，SIGKILL 会遗留不受备份策略管理的 `.bootstrap.<pid>`。临时库改为 root-only 固定 pending 名并纳入严格恢复清理，最终 rename 后才降权；该高价值 P2 继续使成熟度计数为 0。
 
 bootstrap 恢复完整性复审确认事务只记录备份文件名时，截断或位腐坏的备份会覆盖最后一份有效迁移主库并在清 journal 后误报恢复成功。事务必须绑定备份大小/hash，恢复在任何主库或指针变更前校验内容与严格元数据，复制后再次校验再 rename；该数据毁损 P1 使成熟度计数保持 0。
+
+service gate 许可消费复审确认 owner 瞬时校验与 journal/selector 写入之间可被 controller SIGKILL 切开；watchdog恢复清理后，旧 gate 能再次复活 target 事务。新增独立 root-only gate mutex：gate消费全程持有，watchdog取得主锁后再持有才恢复，controller从不持有；该一致性 P1 使成熟度计数保持 0。

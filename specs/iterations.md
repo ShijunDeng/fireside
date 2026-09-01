@@ -234,3 +234,4 @@
 - 密钥隔离阻断 W：把 root gate 直接写进含 `EnvironmentFile=/etc/fireside.env` 的 app unit，会让 controller 及其子进程继承业务写口令。service gate 改为无 EnvironmentFile 的独立 root unit，controller入口先清除应用密钥；`/proc` 与哨兵验证 gate/watchdog/recovery/backup 均不继承，只有非 root Node 持有所需密钥。
 - 敏感 pending DB 阻断 X：bootstrap 原子替换前的完整数据库副本曾已 chown 给应用 UID，SIGKILL 会永久遗留 `.bootstrap.<pid>` 且 recovery 不清理。固定 root-only pending 名并纳入类型/所有者/链接数严格恢复清理；rename 后才降权最终主库，逐阶段崩溃注入证明无应用可读孤儿。
 - bootstrap 恢复身份阻断 Y：journal 只记录备份名时，截断/位腐坏备份可覆盖最后一份有效主库并清 journal误报成功。事务绑定备份 size+SHA-256；恢复在触碰指针/主库前验证固定目录、root:root0600、单链接普通文件与内容身份，pending复制后再次校验，失败保留现有主库和全部证据。
+- gate/watchdog 互斥阻断 Z：service gate 在 owner 校验后无锁写 journal/selector，controller SIGKILL 后可与 watchdog恢复并发并复活已清事务。增加独立 root-only gate mutex；许可消费全程持有，watchdog取得主锁后再持有才恢复，controller不持该锁且所有路径统一锁序。确定性阻塞注入验证 journal 不复活、最终运行态全为origin。
