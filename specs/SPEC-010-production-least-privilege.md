@@ -124,6 +124,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - bootstrap 只在 `current`、`previous`、发布事务三者均不存在时运行；任一已存在（包括错误类型、悬空链接或半完成状态）都拒绝。目标 release 仍须通过完整 commit、manifest、运行树和预检门禁。第二次 bootstrap 必须拒绝且不改变 current、数据库、备份或服务。
 - systemd 单元、`fireside`/`fireside-build` 身份、root-only 密钥、`/var/lib/fireside-release`、生产状态和备份目录是 bootstrap 的显式前置条件。README 必须先安装/加载单元并让 recovery 进入本次开机的 active-exited 状态，再执行 install/bootstrap；不能先 promote、后安装单元。
 - 无主库时，候选在 root-only 临时目录创建 `seed=false` 的空业务库并通过健康、公开读取、关闭和业务指纹检查，再以 `fireside:fireside 0600` 安装为生产库；不得在预检前建立 `current`。失败恢复后不得遗留 current/previous、空主库、WAL/SHM 或健康标记。
+- SQLite 边车必须完整覆盖 `-wal`、`-shm` 和 rollback `-journal`。无主库而任一同名边车以普通文件、链接、目录或其他类型存在时，bootstrap 在触碰指针/数据库前拒绝并原样保留证据；不能把 hot journal 当作无关文件。workload 已停止后的安装/恢复须安全清理三类旧边车并同步目录，再原子替换主库并再次同步；原本无库的失败恢复不遗留本次任何主库或边车。
 - 已有主库但没有 current 时，bootstrap 必须先停止 socket/service、防止新写入，再用目标 release 的崩溃安全 backup runner 创建并持久化一致备份，在副本上迁移和校验 `businessDataSha256`，最后才安装迁移后的独立副本。失败或中断必须从记录的原始备份恢复主库，保留该 root-only 备份，不得把空库或半迁移库当成成功状态。
 - bootstrap 在首次数据库替换和 `current` 切换前写入可 fsync 的 root-only 事务日志，记录目标 commit、原主库是 absent 还是对应的严格备份文件，以及阶段。开机/手动 recovery 对 bootstrap 的确定性结果是：停止服务、移除首次 current/previous、恢复原主库或删除本次新建主库及边车，然后清日志；恢复任一步失败返回 4 并保留证据。
 - 首次 current 切换后必须启动 socket/service并通过与 promote 相同的双 unit、稳定 PID、UID、cwd 和连续 HTTP 健康门禁；成功后写健康标记、持久化并清事务，`previous` 保持不存在。健康失败应完整回到“未 bootstrap”状态并返回 3；恢复失败返回 4。
@@ -195,6 +196,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 32. gate 拒绝旧 txid/旧 generation/第二次消费、错误 owner PID starttime/boot id、错误锁 inode/phase/current/commit 和非 root/错误权限/链接许可；运行 selector 只能由 gate 在锁内原子更新，controller 在 gate 返回到 Node exec 间切 current 也不能改变本次实际启动 release。
 33. watchdog 在 journal 前已成功启动；分别在许可写前、消费前、消费后、Node exec 前后和 health 中杀 controller，最终都自动停止 target、恢复 origin 并清理许可。正常流程 watchdog 无副作用退出；watchdog启动失败则切换前退出 2。
 34. controller 持锁时启动一个会存活的 systemctl 等子进程并杀 controller，子进程不得继续持有锁；watchdog能立即获得锁并恢复。backup gate 与最小权限 runner 分离，恢复权限不会进入候选 backup CLI 的 unit namespace。
+35. 用 DELETE journal、FULL 同步和 cache spill 建立真实 hot `fireside.db-journal` 后移走旧 main；bootstrap 必须退出 2，journal 类型/字节/hash 不变且不创建 current/DB/备份。另让 target 启动生成 journal 后在健康门禁失败，恢复结果严格等于初始 absent 或原备份，目录无 main/wal/shm/journal 残留。
 
 ### 7.2 生产
 
@@ -257,3 +259,5 @@ Git 配置复审又确定性证明 repository-local `url.*.insteadOf` 能把固�
 bootstrap 数据复审发现 live health 窗口已经由 socket 向公网开放业务写，而后续 healthy/marker/sync/clear 任一步失败仍会用启动前备份覆盖主库，形成“用户收到 2xx 后数据消失”。采用按 release commit 绑定的 root-owned 写许可：可回退阶段业务写统一 503；许可发布是不可逆提交点，之后 recovery 只能向前完成，不能恢复旧数据库。该数据丢失 P1 再次把成熟度计数归零。
 
 启动门禁设计复审确认纯 ExecStartPre 仍有 current TOCTOU、许可消费后 owner 死亡窗口与重复 flock 死锁；发布锁还可能被 systemctl 子进程继承，backup 若共用恢复 sandbox 会扩大 root 候选 runner 权限。采用 txid/单次许可、不可变 runtime selector、独立 watchdog、子进程关闭锁 fd和 gate/runner 分离；这些相邻 P1 继续保持成熟度计数为 0。
+
+SQLite 恢复复审还构造出真实 hot rollback journal：无 main 时若遗漏 `fireside.db-journal`，安装的新库会在首次打开时被旧 journal 回放成损坏页，失败恢复又留下 journal 导致永久重试循环。边车边界扩展到 wal/shm/journal，并要求拒绝孤儿、停止 workload 后清理与目录 fsync。该 P1 继续保持成熟度计数为 0。
