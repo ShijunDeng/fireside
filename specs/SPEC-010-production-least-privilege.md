@@ -105,12 +105,14 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - 每次启动门禁不能与持排他锁同步等待 `systemctl restart` 的正常 promote 自锁死，也不能把调用者环境、可写 marker 或“lock 正忙”本身当作授权。受控 restart 与 orphan 的区分必须绑定 root-owned事务、当前指针和活跃控制器所有权；控制器在放行点前后异常退出时，下一次 service/backup 入口仍须先恢复，且 backup 绝不能从未验收 target 执行或 prune。
 - 新事务必须有至少 128-bit 随机 txid，并把 owner boot id、PID/starttime、固定控制器身份和锁 inode 作为附加证据。每次受控 service restart 使用 journal 内原子 fsync 的单次许可，绑定 txid、phase、expected commit、purpose 和递增 generation；gate 原子消费，旧许可、第二次 restart、错误 current/phase/owner/lock 一律拒绝。PID 或 lock-busy 单独都不是授权。
 - service gate 在同一锁内把已验证 commit 固化为 root-owned 不可变运行 selector，MainPID 的 WorkingDirectory/ExecStart 必须引用 selector 而不是可变 `current`，关闭 pre-gate→exec 的 current TOCTOU。gate 拿到锁时直接在同一 worker 内恢复，不得再次调用会重复 flock 的入口。
+- runtime tree 可读校验必须覆盖完整绝对路径的每一级父目录，而不只 commit目录内部。生产 `/opt`、`/opt/fireside`、`releases` 与commit目录均须真实目录、root所有、非group/world writable且other可遍历；任一级0700、错误owner、链接或异常类型都在发布selector/permit前失败关闭。测试根使用等价可注入路径检查。
 - 主发布锁忙时 service gate 的许可消费也必须与 watchdog 原子互斥：使用第二个 root:root 0600、普通单链接 gate mutex，service gate 在 owner校验→消费journal→selector 固化全程持有；watchdog 取得主锁后再按统一锁序取得 gate mutex 才恢复。正常 controller 不持 gate mutex。恢复者持主锁和 mutex 写好 `reverting + pending recovery permit` 后，必须临时释放 mutex 让本次 service gate 消费，随后重新取得 mutex，并在仍持主锁下复核相同 txid/generation 已 consumed 与 MainPID/cwd/health后继续，不能持 mutex 同步等待 restart 形成自锁。owner 校验后 controller 死亡时，watchdog要么先阻断旧 gate，要么等待它完成后恢复，旧 gate 不能在 journal 清理后复活 target 事务。
 - 在第一份 journal 前启动独立 root-owned watchdog；它等待控制器释放同一锁，正常流程看到 journal 已清即退出，控制器异常死亡而相同 txid journal 仍在则接管恢复。watchdog/gate 的失败必须 fail-closed；受控 target 即使在许可消费后的极小窗口启动，也会被独立 watchdog 停止并恢复，不能持续成为公网版本。
 - “systemd-run 成功 exec”不等于 watchdog 已就绪。watchdog 必须使用 txid 绑定的 `Type=notify`（或同强度握手），在验证固定生产控制器、txid、锁 owner/mode/link/inode且已准备阻塞等待该锁后才向 PID 1 发 READY；controller 有界等待 READY 并复查 unit active 后才能写第一份 journal。exec 后立即退出、坏参数/锁、未 READY、超时或 unit 被杀均在切换前失败关闭；异常退出由 PID 1 重启，正常看到 journal 已清后成功退出。
 - watchdog 的 systemd sandbox 只保留恢复主库和所有权所需的最小 `CAP_DAC_OVERRIDE/CAP_CHOWN/CAP_FOWNER`，不保留完整 root capability、网络或生产密钥访问；工作路径固定且不能被调用环境覆盖。
 - fd 9 等发布锁描述符不得被 systemctl/systemd-run/curl/Node 或任意子进程继承。外部命令执行前显式关闭该 fd；“杀 controller 但保留子进程”时锁必须立即释放给 watchdog，不能形成 owner 已死而 lock 仍忙的不可恢复状态。
 - 主维护锁优先由 `flock --close` 监督进程持有，controller 本身及其全部后代从未拥有该 fd；不能只在已知 systemctl/curl 调用点关闭，因为 sync/stat/hash 等任一存活子进程都可能继承。测试让持久化子进程在父 controller 被杀后继续存活，watchdog必须立即取得同一 inode。
+- `flock --close` 监督者与唯一 mutating worker 必须有死亡耦合：worker在独立 session/process group运行。恢复者取得空闲主锁后若 journal owner仍活跃，视为监督者失联；须校验固定controller身份、PID/starttime/boot/session/PGID后终止并reap整个受信进程组，再接管恢复。不能一边恢复一边让旧worker/后代复活journal；身份无法证明时返回4保留证据。
 - backup 不得与 root recovery 共用一个扩大写权限的 sandbox。使用独立 root-owned gate/recovery unit，再进入保持现有最小权限的 runner unit；runner 在取得共享锁后再次只读确认没有 journal并解析已健康 selector，防止 gate→runner 间竞态。任意 active transaction 都不得执行 target backup CLI 或 prune。
 - service gate 与 backup gate 的 orphan 语义不同：service gate 仅在旧 MainPID 已停止的 `ExecStartPre` 中允许无 restart 恢复，随后本次启动 origin；backup gate 若先于 watchdog 取得孤儿锁，必须执行完整的授权 restart、验证 origin MainPID/cwd/health、重建 selector/许可并清 journal后才能进入 runner，不能只回指针后让仍运行的 target 留在公网。也可以不清 journal并让本次 backup 失败等待 watchdog，但绝不能从 target 备份。
 - 最小权限 backup runner 不得写 `/run`。root gate 负责创建和严格验证维护锁；runner 仅以只读 fd 对同一 inode 取得共享 flock，并在整个 `/run` 只读的 sandbox 中复查 transaction/active/selector/permit。候选 backup CLI 尝试 unlink/replace lock、selector或permit必须得到 EPERM，发布控制器只能在该共享锁释放后取得独占锁。
@@ -224,6 +226,8 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 46. 分别把 transaction、release-active、writes-enabled、healthy marker预置为目录或链接；原子发布必须失败且不把temp移入目标、不清journal、不输出成功，原异常类型保留。恢复证据缺失时Node/backup继续失败关闭而不是误报健康。
 47. 两个同 SHA install 在第一次“目标 absent”后用 barrier交错；最终仅一个成功，另一个拒绝或锁冲突，既有 release 的字节、manifest和子项集合完全不变，无嵌套publish目录，失败者不得输出installed成功。
 48. 让`rollback --previous`在旧previous可见时与一个完成更新previous的promote交错；回滚取得锁后必须采用当时的新previous或明确拒绝，不能成功落到锁外解析的旧commit。
+49. 在switched阶段阻塞独立worker，仅SIGKILL flock监督PID；watchdog取得锁后必须先杀死并reap该worker完整进程组再恢复。即使随后释放旧阻塞点，也不得复活journal或target，最终origin运行态一致。
+50. 把 releases root或其父目录改为0700/错误owner/链接，service与backup gate必须在写selector/permit前失败；恢复为root:root0755后冷启动重建成功且应用UID可读取完整入口路径。
 
 ### 7.2 生产
 
@@ -310,3 +314,7 @@ backup runner 权限复审确认 UID0 加 `ReadWritePaths=/run` 可替换维护�
 候选安装并发复审确认 release目标 absent检查在取锁前、最终`mv`又会把stage移入已有目录；同SHA双install可污染immutable tree并误报成功。目标检查移入锁内并在发布前复核，最终使用`mv -T`/no-replace语义；并发barrier证明既有release零变化。该P1使成熟度计数保持0。
 
 `rollback --previous`复审确认wrapper在锁外解析previous会与并发promote交错并静默选择上上版。`--previous`意图必须原样进入主锁后再解析；并发测试只允许采用锁时刻值或明确拒绝。该合理P2使成熟度计数保持0。
+
+`flock --close`监督者复审确认单独SIGKILL监督PID会提前释放锁而留下活跃mutating worker，watchdog可与旧worker并发并被复活journal。worker改为独立进程组；接管者发现锁空闲但owner仍活跃时必须验证并终止/reap整组后才恢复。该一致性P1使成熟度计数保持0。
+
+runtime可读性复审确认只检查release子树会漏掉`/opt/fireside/releases`等父目录0700漂移，root gate成功但应用启动EACCES循环。固定绝对父链须逐级校验root所有、不可写和other+x；该高价值P2使成熟度计数保持0。

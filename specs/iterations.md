@@ -241,3 +241,5 @@
 - 固定文件替换阻断 AD：`mv -f temp fixedPath` 遇目标目录会把temp移入并返回0，可能清journal后留下永久503。transaction/healthy/release-active/writes-enabled统一拒绝异常类型并使用`mv -Tf`；目录/链接夹具验证不误报、不清证据、不把temp移入。
 - 同SHA安装竞态阻断 AE：release absent检查在取锁前且最终`mv`会嵌入已存在目录，两个install可污染immutable tree并误报。锁内检查并在发布前复核，最终`mv -T`或no-replace；并发barrier验证失败者不改变既有文件/manifest/子项集合。
 - previous回滚意图阻断 AF：wrapper锁外解析`--previous`可与并发promote交错并静默回到上上版。原样传入主锁监督下的promote再解析；锁时值变化时只允许采用新previous或明确拒绝。
+- supervisor死亡耦合阻断 AG：仅杀`flock --close`父会释放锁但留下旧mutating worker。worker置于独立session/process group；接管者若见journal owner仍活跃，验证固定身份后终止/reap整组再恢复，无法证明则返回4。故障注入不得复活journal/target。
+- release父链可读阻断 AH：静态检查只覆盖commit子树会漏`/opt/fireside/releases`等父目录0700，root gate误放而应用EACCES循环。完整父链逐级验证真实目录、root owner、非可写、other+x，失败不发布selector/permit。
