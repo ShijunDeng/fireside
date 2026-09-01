@@ -17,6 +17,7 @@ function topic(overrides: Partial<Topic> = {}): Topic {
     duration: 40,
     room: '三楼围炉会议室',
     meetingUrl: null,
+    hasMeetingUrl: false,
     participantCount: 0,
     takeaway: null,
     materialUrl: null,

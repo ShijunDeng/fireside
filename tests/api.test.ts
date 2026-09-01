@@ -25,6 +25,83 @@ describe('围炉夜话 API', () => {
     assert.equal(response.json().ok, true);
   });
 
+  it('以共享口令保护全部写操作、名单和真实会议入口', async () => {
+    const protectedApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey: 'correct-horse-battery-staple' });
+    await protectedApp.ready();
+    const publicAccess = await protectedApp.inject({ method: 'GET', url: '/api/access' });
+    assert.deepEqual(publicAccess.json(), { enabled: true });
+    assert.equal((await protectedApp.inject({ method: 'GET', url: '/api/topics' })).statusCode, 200);
+    assert.equal((await protectedApp.inject({ method: 'GET', url: '/api/stats' })).statusCode, 200);
+    assert.equal((await protectedApp.inject({ method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': 'wrong' } })).statusCode, 401);
+    assert.equal((await protectedApp.inject({ method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': 'correct-horse-battery-staple' } })).statusCode, 204);
+
+    const protectedRoutes = [
+      { method: 'POST', url: '/api/topics' },
+      { method: 'PATCH', url: '/api/topics/1' },
+      { method: 'DELETE', url: '/api/topics/1' },
+      { method: 'POST', url: '/api/topics/reorder' },
+      { method: 'POST', url: '/api/topics/1/claim' },
+      { method: 'POST', url: '/api/topics/1/release' },
+      { method: 'POST', url: '/api/topics/1/schedule' },
+      { method: 'POST', url: '/api/topics/1/unschedule' },
+      { method: 'POST', url: '/api/topics/1/archive' },
+      { method: 'POST', url: '/api/topics/1/unarchive' },
+      { method: 'GET', url: '/api/topics/1/participants' },
+      { method: 'POST', url: '/api/topics/1/participants' },
+      { method: 'DELETE', url: '/api/topics/1/participants/1' },
+      { method: 'GET', url: '/api/topics/1/meeting-access' },
+    ] as const;
+    for (const route of protectedRoutes) {
+      const response = await protectedApp.inject({ ...route, payload: ['POST', 'PATCH'].includes(route.method) ? {} : undefined });
+      assert.equal(response.statusCode, 401, `${route.method} ${route.url} 必须先鉴权`);
+      assert.equal(response.json().code, 'ACCESS_REQUIRED');
+    }
+
+    const headers = { 'x-fireside-write-key': 'correct-horse-battery-staple' };
+    const created = await protectedApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '受保护的线上议题', summary: '匿名响应不能泄露会议 secret。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    assert.equal(created.statusCode, 201);
+    const id = created.json().id as number;
+    const secretMeeting = 'https://meet.example.test/team?passcode=top-secret';
+    const scheduled = await protectedApp.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers,
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 40, room: '三楼会议室', meetingUrl: secretMeeting },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    assert.equal(scheduled.json().meetingUrl, null);
+    assert.equal(scheduled.json().hasMeetingUrl, true);
+    const joined = await protectedApp.inject({ method: 'POST', url: `/api/topics/${id}/participants`, headers, payload: { name: '隐私参与者' } });
+    assert.equal(joined.statusCode, 201);
+
+    const publicTopics = await protectedApp.inject({ method: 'GET', url: '/api/topics' });
+    assert.equal(publicTopics.body.includes('top-secret'), false);
+    assert.equal(publicTopics.body.includes('隐私参与者'), false);
+    const participants = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers });
+    assert.deepEqual((participants.json() as { name: string }[]).map(({ name }) => name), ['隐私参与者']);
+    const meeting = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access`, headers });
+    assert.equal(meeting.json().meetingUrl, secretMeeting);
+
+    const legacyCreated = await protectedApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '旧会议字段', summary: '兼容历史 room URL。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    const legacyId = legacyCreated.json().id as number;
+    await protectedApp.inject({
+      method: 'POST', url: `/api/topics/${legacyId}/schedule`, headers,
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: secretMeeting, meetingUrl: '' },
+    });
+    const legacyPublic = (await protectedApp.inject({ method: 'GET', url: '/api/topics' })).json() as { id: number; room: string; meetingUrl: null; hasMeetingUrl: boolean }[];
+    const legacyTopic = legacyPublic.find(({ id }) => id === legacyId)!;
+    assert.equal(legacyTopic.room, '线上会议');
+    assert.equal(legacyTopic.meetingUrl, null);
+    assert.equal(legacyTopic.hasMeetingUrl, true);
+    assert.equal((await protectedApp.inject({ method: 'GET', url: `/api/topics/${legacyId}/meeting-access`, headers })).json().meetingUrl, secretMeeting);
+
+    await protectedApp.close();
+  });
+
   it('完成创建、认领、排期和归档的完整流程', async () => {
     const created = await app.inject({
       method: 'POST',
@@ -166,12 +243,16 @@ describe('围炉夜话 API', () => {
       payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 60, room: '线上会议', meetingUrl },
     });
     assert.equal(scheduled.statusCode, 200);
-    assert.equal(scheduled.json().meetingUrl, meetingUrl);
+    assert.equal(scheduled.json().meetingUrl, null);
+    assert.equal(scheduled.json().hasMeetingUrl, true);
+    const meetingAccess = await app.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access` });
+    assert.equal(meetingAccess.json().meetingUrl, meetingUrl);
 
     const firstJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: 'Alice' } });
     assert.equal(firstJoin.statusCode, 201);
     const duplicateJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '  alice  ' } });
     assert.equal(duplicateJoin.statusCode, 409);
+    assert.equal(duplicateJoin.json().code, 'PARTICIPANT_DUPLICATE');
     const secondJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '小林' } });
     assert.equal(secondJoin.statusCode, 201);
     const participants = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
@@ -183,6 +264,7 @@ describe('围炉夜话 API', () => {
     await app.inject({ method: 'POST', url: `/api/topics/${id}/archive`, payload: { takeaway: '参会闭环完成。', materialUrl: '' } });
     const joinArchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '迟到者' } });
     assert.equal(joinArchived.statusCode, 409);
+    assert.equal(joinArchived.json().code, 'TOPIC_STATE_CONFLICT');
     const leaveArchived = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(leaveArchived.statusCode, 409);
 
@@ -265,6 +347,29 @@ describe('围炉夜话 API', () => {
 });
 
 describe('数据库兼容性与并发', () => {
+  it('口令轮换后旧口令立即失效且数据保持可读', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-key-rotation-'));
+    const databasePath = path.join(directory, 'rotation.db');
+    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'old-key' });
+    await firstApp.ready();
+    const created = await firstApp.inject({
+      method: 'POST', url: '/api/topics', headers: { 'x-fireside-write-key': 'old-key' },
+      payload: { title: '口令轮换议题', summary: '轮换口令不能影响业务数据。', proposer: '安全测试', tags: [] },
+    });
+    const id = created.json().id as number;
+    await firstApp.close();
+
+    const rotatedApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey: 'new-key' });
+    await rotatedApp.ready();
+    assert.equal((await rotatedApp.inject({ method: 'GET', url: '/api/topics' })).json()[0].title, '口令轮换议题');
+    assert.equal((await rotatedApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-write-key': 'old-key' }, payload: { title: '不应成功' } })).statusCode, 401);
+    const updated = await rotatedApp.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: { 'x-fireside-write-key': 'new-key' }, payload: { title: '新口令生效' } });
+    assert.equal(updated.statusCode, 200);
+    assert.equal(updated.json().title, '新口令生效');
+    await rotatedApp.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
   it('演示数据只初始化一次，用户清空后重启不会复活', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-seed-once-'));
     const databasePath = path.join(directory, 'seed.db');

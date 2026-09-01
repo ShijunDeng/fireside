@@ -38,6 +38,7 @@ export function rowToTopic(row: TopicRow): Topic {
     duration: row.duration,
     room: row.room,
     meetingUrl: row.meeting_url,
+    hasMeetingUrl: Boolean(row.meeting_url || (row.room && /^https?:\/\/\S+$/i.test(row.room))),
     participantCount: row.participant_count ?? 0,
     takeaway: row.takeaway,
     materialUrl: row.material_url,

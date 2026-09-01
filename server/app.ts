@@ -3,6 +3,7 @@ import fastifyStatic from '@fastify/static';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { writeKeyMatches } from './access.js';
 import { createDatabase, rowToTopic } from './db.js';
 import type { Topic } from './types.js';
 
@@ -63,6 +64,7 @@ type AppOptions = {
   databasePath?: string;
   seed?: boolean;
   logger?: boolean;
+  writeKey?: string;
   serveStatic?: boolean;
   beforeTopicUpdate?: () => Promise<void>;
   afterTopicRowsRead?: () => Promise<void>;
@@ -73,7 +75,10 @@ function validationMessage(error: z.ZodError) {
 }
 
 export function buildApp(options: AppOptions = {}) {
-  const app = Fastify({ logger: options.logger ?? false });
+  const app = Fastify({
+    logger: options.logger ? { redact: ['req.headers.x-fireside-write-key'] } : false,
+  });
+  const writeKey = options.writeKey ?? process.env.FIRESIDE_WRITE_KEY ?? '';
   const databasePath = options.databasePath ?? process.env.DATABASE_PATH ?? path.join(projectRoot, 'data', 'fireside.db');
   const db = createDatabase(databasePath, options.seed ?? true);
   const readOrderVersion = () => (db.prepare('SELECT version FROM topic_order_state WHERE id = 1').get() as { version: number }).version;
@@ -87,7 +92,41 @@ export function buildApp(options: AppOptions = {}) {
 
   app.addHook('onClose', async () => db.close());
 
+  app.addHook('onRequest', async (request, reply) => {
+    if (!writeKey) return;
+    const pathOnly = request.url.split('?')[0];
+    const sensitiveRead = request.method === 'GET' && /^\/api\/topics\/\d+\/(?:participants|meeting-access)$/.test(pathOnly);
+    const businessWrite = ['POST', 'PATCH', 'DELETE'].includes(request.method)
+      && pathOnly !== '/api/access/verify';
+    if (!sensitiveRead && !businessWrite) return;
+    const header = request.headers['x-fireside-write-key'];
+    const candidate = Array.isArray(header) ? header[0] : header;
+    if (!writeKeyMatches(candidate, writeKey)) {
+      return reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '需要正确的围炉口令才能继续协作' });
+    }
+  });
+
   app.get('/api/health', async () => ({ ok: true, service: 'fireside', time: new Date().toISOString() }));
+  app.get('/api/access', async () => ({ enabled: Boolean(writeKey) }));
+  app.post('/api/access/verify', async (request, reply) => {
+    if (!writeKey) return reply.code(204).send();
+    const header = request.headers['x-fireside-write-key'];
+    const candidate = Array.isArray(header) ? header[0] : header;
+    return writeKeyMatches(candidate, writeKey)
+      ? reply.code(204).send()
+      : reply.code(401).send({ code: 'ACCESS_REQUIRED', message: '围炉口令不正确' });
+  });
+
+  const toPublicTopic = (row: Parameters<typeof rowToTopic>[0]) => {
+    const topic = rowToTopic(row);
+    const legacyMeeting = Boolean(topic.room && /^https?:\/\/\S+$/i.test(topic.room));
+    return {
+      ...topic,
+      room: legacyMeeting ? '线上会议' : topic.room,
+      meetingUrl: null,
+      hasMeetingUrl: Boolean(topic.meetingUrl || legacyMeeting),
+    };
+  };
 
   app.get('/api/topics', async (request, reply) => {
     const parsed = z.object({
@@ -121,7 +160,7 @@ export function buildApp(options: AppOptions = {}) {
       throw error;
     }
     reply.header('X-Order-Version', String(orderVersion));
-    return (rows as Parameters<typeof rowToTopic>[0][]).map(rowToTopic);
+    return (rows as Parameters<typeof rowToTopic>[0][]).map(toPublicTopic);
   });
 
   app.get('/api/stats', async () => {
@@ -133,7 +172,7 @@ export function buildApp(options: AppOptions = {}) {
       claimed: counts.CLAIMED ?? 0,
       scheduled: counts.SCHEDULED ?? 0,
       archived: counts.ARCHIVED ?? 0,
-      nextTopic: next ? rowToTopic(next as Parameters<typeof rowToTopic>[0]) : null,
+      nextTopic: next ? toPublicTopic(next as Parameters<typeof rowToTopic>[0]) : null,
     };
   });
 
@@ -152,7 +191,7 @@ export function buildApp(options: AppOptions = {}) {
       return db.prepare('SELECT * FROM topics WHERE id = ?').get(result.lastInsertRowid);
     }).immediate();
     reply.header('X-Order-Version', String(readOrderVersion()));
-    return reply.code(201).send(rowToTopic(topic as Parameters<typeof rowToTopic>[0]));
+    return reply.code(201).send(toPublicTopic(topic as Parameters<typeof rowToTopic>[0]));
   });
 
   app.patch('/api/topics/:id', async (request, reply) => {
@@ -188,7 +227,7 @@ export function buildApp(options: AppOptions = {}) {
     const result = db.prepare(`UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')} WHERE id = ?`)
       .run(...updates.map(({ value }) => value), params.data.id);
     if (result.changes === 0) return reply.code(404).send({ message: '没有找到这个议题' });
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.delete('/api/topics/:id', async (request, reply) => {
@@ -243,7 +282,7 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '这个议题已经被认领或排期' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.post('/api/topics/:id/release', async (request, reply) => {
@@ -257,7 +296,7 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '只有准备中的议题可以重新开放认领' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.post('/api/topics/:id/schedule', async (request, reply) => {
@@ -272,7 +311,7 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '议题需要先被认领，才能安排分享' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.post('/api/topics/:id/unschedule', async (request, reply) => {
@@ -294,7 +333,7 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '只有已排期的议题可以取消排期' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.post('/api/topics/:id/archive', async (request, reply) => {
@@ -310,7 +349,7 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '只有已排期的议题可以归档' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
   });
 
   app.post('/api/topics/:id/unarchive', async (request, reply) => {
@@ -327,7 +366,19 @@ export function buildApp(options: AppOptions = {}) {
         ? reply.code(409).send({ message: '只有已归档的议题可以撤销归档' })
         : reply.code(404).send({ message: '没有找到这个议题' });
     }
-    return rowToTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+    return toPublicTopic(db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0]);
+  });
+
+  app.get('/api/topics/:id/meeting-access', async (request, reply) => {
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const row = db.prepare('SELECT room, meeting_url FROM topics WHERE id = ?').get(params.data.id) as { room: string | null; meeting_url: string | null } | undefined;
+    if (!row) return reply.code(404).send({ message: '没有找到这个议题' });
+    const legacyMeetingUrl = row.room && /^https?:\/\/\S+$/i.test(row.room) ? row.room : null;
+    const meetingUrl = row.meeting_url || legacyMeetingUrl;
+    return meetingUrl
+      ? { meetingUrl }
+      : reply.code(404).send({ message: '这个议题没有线上会议入口' });
   });
 
   app.get('/api/topics/:id/participants', async (request, reply) => {
@@ -358,8 +409,8 @@ export function buildApp(options: AppOptions = {}) {
       return { status: 'ok' as const, participant: { id: Number(result.lastInsertRowid), topicId: params.data.id, name: body.data.name, createdAt: now } };
     }).immediate();
     if (outcome.status === 'missing') return reply.code(404).send({ message: '没有找到这个议题' });
-    if (outcome.status === 'invalid') return reply.code(409).send({ message: '只有已排期的议题可以报名' });
-    if (outcome.status === 'duplicate') return reply.code(409).send({ message: '这个名字已经报名，请勿重复提交' });
+    if (outcome.status === 'invalid') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '只有已排期的议题可以报名' });
+    if (outcome.status === 'duplicate') return reply.code(409).send({ code: 'PARTICIPANT_DUPLICATE', message: '这个名字已经报名，请勿重复提交' });
     return reply.code(201).send(outcome.participant);
   });
 
@@ -378,7 +429,7 @@ export function buildApp(options: AppOptions = {}) {
       return result.changes === 1 ? 'ok' as const : 'missing-participant' as const;
     }).immediate();
     if (outcome === 'missing-topic') return reply.code(404).send({ message: '没有找到这个议题' });
-    if (outcome === 'invalid') return reply.code(409).send({ message: '活动已结束或取消，不能修改报名' });
+    if (outcome === 'invalid') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '活动已结束或取消，不能修改报名' });
     if (outcome === 'missing-participant') return reply.code(404).send({ message: '没有找到这条报名记录' });
     return reply.code(204).send();
   });

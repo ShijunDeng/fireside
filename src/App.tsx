@@ -20,6 +20,7 @@ import {
   Lightbulb,
   Link as LinkIcon,
   List,
+  LockKeyhole,
   MapPin,
   Pencil,
   Plus,
@@ -27,13 +28,15 @@ import {
   Search,
   Share2,
   Sparkles,
+  ShieldCheck,
   Trash2,
   UserRound,
   UserRoundPlus,
   Users,
+  UnlockKeyhole,
   X,
 } from 'lucide-react';
-import { api, ApiError } from './api';
+import { api, ApiError, clearWriteKey, getWriteKey, onUnauthorized, saveWriteKey } from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
 import { buildPosterModel, isPosterEligible, posterToBlob, renderTopicPoster } from './poster';
 import type { Participant, Stats, Topic, TopicSort, TopicStatus } from './types';
@@ -165,11 +168,12 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction, onParticipants, onPoster, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
+function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
   topic: Topic;
   onAction: (kind: ModalKind, topic: Topic) => void;
   onParticipants: (topic: Topic) => void;
   onPoster: (topic: Topic) => void;
+  onMeeting: (topic: Topic) => void;
   draggable: boolean;
   reordering: boolean;
   index: number;
@@ -180,7 +184,7 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, draggable, reord
 }) {
   const overdue = topic.status === 'SCHEDULED' && Boolean(topic.scheduledAt) && !isPosterEligible(topic);
   const meta = overdue ? { label: '待归档', className: 'scheduled' } : statusMeta[topic.status];
-  const meetingUrl = topicMeetingUrl(topic);
+  const hasMeetingUrl = topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic));
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
@@ -210,7 +214,7 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, draggable, reord
         <div className="schedule-box">
           <div><CalendarDays size={16} /><strong>{formatDate(topic.scheduledAt)}</strong></div>
           <div><MapPin size={15} /><span>{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room}</span><Clock3 size={15} /><span>{topic.duration} 分钟</span></div>
-          {meetingUrl && <a className="meeting-link" href={meetingUrl} target="_blank" rel="noreferrer"><LinkIcon size={14} />加入会议</a>}
+          {hasMeetingUrl && <button className="meeting-link" onClick={() => onMeeting(topic)}><LinkIcon size={14} />加入会议</button>}
           {overdue && <p className="schedule-overdue">排期已过，请完成归档或编辑后重新安排。</p>}
         </div>
       )}
@@ -248,12 +252,13 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, draggable, reord
   );
 }
 
-function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
+function CalendarView({ topics, mode, cursor, onCursorChange, onEdit, onMeeting }: {
   topics: Topic[];
   mode: Exclude<ViewMode, 'list'>;
   cursor: Date;
   onCursorChange: (date: Date) => void;
   onEdit: (topic: Topic) => void;
+  onMeeting: (topic: Topic) => void;
 }) {
   const today = new Date();
   const [expandedDays, setExpandedDays] = useState<Set<string>>(() => new Set());
@@ -330,7 +335,7 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
                 <div className="week-day-head"><span>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'][day.getDay()]}</span><strong>{day.getDate()}</strong></div>
                 <div className="week-events">
                   {events.length ? events.map((topic) => {
-                    const meetingUrl = topicMeetingUrl(topic);
+                    const hasMeetingUrl = topic.status === 'SCHEDULED' && (topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic)));
                     return <div key={topic.id} className={`week-event ${statusMeta[topic.status].className}`}>
                       <button className="week-event-main" onClick={() => onEdit(topic)} aria-label={`编辑 ${topic.title}`}>
                         <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
@@ -339,7 +344,7 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
                         <span><MapPin size={12} />{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '地点待定'}</span>
                         <small>{topic.duration ?? 0} 分钟</small>
                       </button>
-                      {meetingUrl && <a className="week-join" href={meetingUrl} target="_blank" rel="noreferrer"><LinkIcon size={12} />加入会议</a>}
+                      {hasMeetingUrl && <button className="week-join" onClick={() => onMeeting(topic)}><LinkIcon size={12} />加入会议</button>}
                     </div>;
                   }) : <p className="no-events">留一晚给未知</p>}
                 </div>
@@ -352,10 +357,12 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onEdit }: {
   );
 }
 
-function ParticipantsModal({ topic, onClose, onChanged }: {
+function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersion }: {
   topic: Topic;
   onClose: () => void;
   onChanged: () => void;
+  onConflict: (message: string) => void;
+  unlockVersion: number;
 }) {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [loading, setLoading] = useState(true);
@@ -365,6 +372,7 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
   const dialogRef = useDialogA11y(onClose);
 
   const loadParticipants = useCallback(async () => {
+    setLoading(true);
     try {
       setParticipants(await api.participants(topic.id));
       setError('');
@@ -373,7 +381,7 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
     } finally {
       setLoading(false);
     }
-  }, [topic.id]);
+  }, [topic.id, unlockVersion]);
 
   useEffect(() => { void loadParticipants(); }, [loadParticipants]);
 
@@ -389,6 +397,7 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
       await loadParticipants();
       onChanged();
     } catch (err) {
+      if (err instanceof ApiError && err.code === 'TOPIC_STATE_CONFLICT') return onConflict(err.message);
       setError(err instanceof Error ? err.message : '报名失败，请稍后重试');
     } finally {
       setSubmitting(false);
@@ -403,6 +412,7 @@ function ParticipantsModal({ topic, onClose, onChanged }: {
       await loadParticipants();
       onChanged();
     } catch (err) {
+      if (err instanceof ApiError && err.code === 'TOPIC_STATE_CONFLICT') return onConflict(err.message);
       setError(err instanceof Error ? err.message : '取消报名失败，请稍后重试');
     } finally {
       setSubmitting(false);
@@ -534,6 +544,78 @@ function PosterModal({ topic, onClose }: { topic: Topic; onClose: () => void }) 
           <p className="poster-save-hint">手机端可长按左侧图片保存；支持文件分享时也可直接发送给伙伴。</p>
           {notice && <div className="form-error" role="status">{notice}</div>}
         </div>
+      </div>
+    </div>
+  </div>;
+}
+
+function AccessModal({ message, onClose, onUnlocked }: { message: string; onClose: () => void; onUnlocked: () => void }) {
+  const dialogRef = useDialogA11y(onClose);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const current = dialogRef.current;
+    const underlying = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]')).filter((dialog) => dialog !== current);
+    underlying.forEach((dialog) => { dialog.inert = true; });
+    return () => underlying.forEach((dialog) => { dialog.inert = false; });
+  }, [dialogRef]);
+
+  async function unlock(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const key = String(new FormData(event.currentTarget).get('writeKey')).trim();
+    setSubmitting(true);
+    setError('');
+    try {
+      await api.verifyAccess(key);
+      saveWriteKey(key);
+      onUnlocked();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '口令验证失败，请重试');
+      setSubmitting(false);
+    }
+  }
+
+  return <div className="modal-backdrop access-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal access-modal" role="dialog" aria-modal="true" aria-labelledby="access-title" tabIndex={-1}>
+      <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
+      <span className="modal-eyebrow"><LockKeyhole size={14} /> TRUSTED COLLABORATORS</span>
+      <h2 id="access-title">解锁围炉协作</h2>
+      <p className="modal-intro">{message}</p>
+      <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>口令只保存在当前浏览器会话，不会写入网址或 Git。</span></p></div>
+      <form onSubmit={unlock}>
+        <label>围炉口令<input name="writeKey" type="password" required autoComplete="current-password" autoFocus data-initial-focus placeholder="输入团队共享口令" /></label>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在验证…' : '解锁协作'}{!submitting && <UnlockKeyhole size={16} />}</button>
+      </form>
+    </div>
+  </div>;
+}
+
+function MeetingModal({ topic, onClose, unlockVersion }: { topic: Topic; onClose: () => void; unlockVersion: number }) {
+  const dialogRef = useDialogA11y(onClose);
+  const [meetingUrl, setMeetingUrl] = useState('');
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    setMeetingUrl('');
+    setError('');
+    void api.meetingAccess(topic.id)
+      .then(({ meetingUrl: value }) => { if (active) setMeetingUrl(value); })
+      .catch((err) => { if (active) setError(err instanceof Error ? err.message : '会议入口加载失败'); });
+    return () => { active = false; };
+  }, [topic.id, unlockVersion]);
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal meeting-modal" role="dialog" aria-modal="true" aria-labelledby="meeting-title" tabIndex={-1}>
+      <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
+      <span className="modal-eyebrow"><LinkIcon size={14} /> MEETING ACCESS</span>
+      <h2 id="meeting-title">进入线上围炉</h2>
+      <p className="modal-intro">会议入口只向已解锁协作者展示，请勿把包含会议凭证的网址公开转发。</p>
+      <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>
+      <div className="meeting-access-panel" aria-live="polite">
+        {!meetingUrl && !error && <p>正在准备会议入口…</p>}
+        {meetingUrl && <a className="submit-btn" href={meetingUrl} target="_blank" rel="noreferrer" data-initial-focus>进入线上会议 <ArrowRight size={16} /></a>}
+        {error && <div className="form-error">{error}</div>}
       </div>
     </div>
   </div>;
@@ -728,6 +810,14 @@ export default function App() {
   const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
   const [participantsTopic, setParticipantsTopic] = useState<Topic | null>(null);
   const [posterTopic, setPosterTopic] = useState<Topic | null>(null);
+  const [meetingTopic, setMeetingTopic] = useState<Topic | null>(null);
+  const [accessReady, setAccessReady] = useState(false);
+  const [accessEnabled, setAccessEnabled] = useState(true);
+  const [accessUnlocked, setAccessUnlocked] = useState(() => Boolean(getWriteKey()));
+  const [accessModalOpen, setAccessModalOpen] = useState(false);
+  const [accessMessage, setAccessMessage] = useState('输入团队共享口令后，即可创建、认领、排期与维护议题。');
+  const [unlockVersion, setUnlockVersion] = useState(0);
+  const pendingAccessAction = useRef<(() => void | Promise<void>) | null>(null);
   const [toast, setToast] = useState('');
 
   const loadTopics = useCallback(async (requestedSort: TopicSort) => {
@@ -767,6 +857,39 @@ export default function App() {
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const status = await api.access();
+        if (!active) return;
+        setAccessEnabled(status.enabled);
+        if (!status.enabled) {
+          setAccessUnlocked(true);
+        } else if (getWriteKey()) {
+          try {
+            await api.verifyAccess(getWriteKey());
+            if (active) setAccessUnlocked(true);
+          } catch {
+            clearWriteKey();
+          }
+        }
+      } finally {
+        if (active) setAccessReady(true);
+      }
+    })();
+    onUnauthorized(() => {
+      pendingAccessAction.current = null;
+      setAccessEnabled(true);
+      setAccessUnlocked(false);
+      setAccessMessage('围炉口令已失效。你刚才的操作没有自动重放，请解锁后确认内容并重新提交。');
+      setAccessModalOpen(true);
+    });
+    return () => {
+      active = false;
+      onUnauthorized(null);
+    };
+  }, []);
+  useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(''), 3500);
     return () => window.clearTimeout(timer);
@@ -781,7 +904,58 @@ export default function App() {
     });
   }, [search, tab, topics]);
 
-  function openAction(kind: ModalKind, topic: Topic | null = null) { setModal({ kind, topic }); }
+  const canCollaborate = !accessEnabled || accessUnlocked;
+  function requireAccess(action: () => void | Promise<void>, message = '输入团队共享口令后，即可参与并维护围炉议题。') {
+    if (canCollaborate) return void action();
+    pendingAccessAction.current = action;
+    setAccessMessage(message);
+    setAccessModalOpen(true);
+  }
+  function finishUnlock() {
+    setAccessUnlocked(true);
+    setAccessReady(true);
+    setAccessModalOpen(false);
+    setUnlockVersion((value) => value + 1);
+    const action = pendingAccessAction.current;
+    pendingAccessAction.current = null;
+    if (action) window.requestAnimationFrame(() => void action());
+  }
+  function closeAccess() {
+    pendingAccessAction.current = null;
+    setAccessModalOpen(false);
+  }
+  function openAccess() {
+    if (canCollaborate && accessEnabled) {
+      clearWriteKey();
+      setAccessUnlocked(false);
+      setToast('当前浏览器会话已退出协作模式');
+      return;
+    }
+    pendingAccessAction.current = null;
+    setAccessMessage('输入团队共享口令后，即可创建、认领、排期与维护议题。');
+    setAccessModalOpen(true);
+  }
+  function openAction(kind: ModalKind, topic: Topic | null = null) {
+    requireAccess(async () => {
+      let editableTopic = topic;
+      if (kind === 'edit' && topic?.hasMeetingUrl) {
+        try {
+          const { meetingUrl } = await api.meetingAccess(topic.id);
+          editableTopic = { ...topic, meetingUrl };
+        } catch (error) {
+          setToast(error instanceof Error ? error.message : '会议入口加载失败');
+          return;
+        }
+      }
+      setModal({ kind, topic: editableTopic });
+    });
+  }
+  function openParticipants(topic: Topic) {
+    requireAccess(() => setParticipantsTopic(topic), '报名姓名属于团队协作信息，请先输入围炉口令。');
+  }
+  function openMeeting(topic: Topic) {
+    requireAccess(() => setMeetingTopic(topic), '真实会议入口受保护，请先输入围炉口令。');
+  }
   async function complete(message: string) {
     setModal(null);
     setToast(message);
@@ -789,6 +963,11 @@ export default function App() {
   }
   async function resolveConflict(message: string) {
     setModal(null);
+    setToast(`${message}，已同步最新状态`);
+    await load();
+  }
+  async function resolveParticipantConflict(message: string) {
+    setParticipantsTopic(null);
     setToast(`${message}，已同步最新状态`);
     await load();
   }
@@ -807,7 +986,7 @@ export default function App() {
     setLoading(true);
     setSort(nextSort);
   }
-  const canManualReorder = view === 'list' && sort === 'manual' && loadedSort === 'manual' && !loading && tab === 'ALL' && !search.trim();
+  const canManualReorder = canCollaborate && view === 'list' && sort === 'manual' && loadedSort === 'manual' && !loading && tab === 'ALL' && !search.trim();
 
   async function persistOrder(next: Topic[], previous: Topic[], moved: Topic) {
     if (reorderInFlight.current) return;
@@ -828,7 +1007,11 @@ export default function App() {
       } catch {
         setLiveMessage('排序保存失败，已恢复操作前顺序');
       }
-      const prefix = error instanceof ApiError && error.status === 409 ? '顺序发生冲突，已同步最新结果' : '排序保存失败，已同步服务端结果';
+      const prefix = error instanceof ApiError && error.status === 401
+        ? '协作权限已失效，顺序已回滚'
+        : error instanceof ApiError && error.status === 409
+          ? '顺序发生冲突，已同步最新结果'
+          : '排序保存失败，已同步服务端结果';
       setToast(error instanceof Error ? `${prefix}：${error.message}` : prefix);
     } finally {
       reorderInFlight.current = false;
@@ -867,6 +1050,7 @@ export default function App() {
       <nav>
         <button onClick={scrollToTopics}>议题广场</button>
         <button onClick={() => showTopicView('SCHEDULED', 'week')}>本周排期</button>
+        <button className={`access-button ${canCollaborate ? 'unlocked' : ''}`} onClick={openAccess} title={canCollaborate && accessEnabled ? '退出当前协作会话' : undefined}>{canCollaborate ? <UnlockKeyhole size={14} /> : <LockKeyhole size={14} />}{canCollaborate ? '协作已解锁' : '解锁协作'}</button>
         <button className="nav-cta" onClick={() => openAction('create')}><Plus size={16} /> 发起议题</button>
       </nav>
     </header>
@@ -930,7 +1114,7 @@ export default function App() {
                 <option value="status">议题状态</option>
               </select>
             </label>}
-            {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">{loading || loadedSort !== 'manual' ? '正在加载可排序快照…' : '清除搜索并切回“全部议题”后可手动排序'}</span>}
+            {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">{!canCollaborate ? '解锁协作后可调整顺序' : loading || loadedSort !== 'manual' ? '正在加载可排序快照…' : '清除搜索并切回“全部议题”后可手动排序'}</span>}
             {reordering && <span className="sort-saving">正在保存顺序…</span>}
           </div>
         </div>
@@ -943,15 +1127,16 @@ export default function App() {
               index={index}
               total={visibleTopics.length}
               onAction={openAction}
-              onParticipants={setParticipantsTopic}
+              onParticipants={openParticipants}
               onPoster={setPosterTopic}
+              onMeeting={openMeeting}
               draggable={canManualReorder}
               reordering={reordering}
               onDragStart={(id) => { if (!reorderInFlight.current) setDraggedId(id); }}
               onDrop={dropTopic}
               onMove={moveTopic}
             />)}</div>
-          : visibleTopics.length && view !== 'list' ? <CalendarView topics={visibleTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onEdit={(topic) => openAction('edit', topic)} />
+          : visibleTopics.length && view !== 'list' ? <CalendarView topics={visibleTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onEdit={(topic) => openAction('edit', topic)} onMeeting={openMeeting} />
           : <div className="empty-state"><Lightbulb /><h3>这里还没有火种</h3><p>换个筛选条件，或者成为第一个发起议题的人。</p><button onClick={() => openAction('create')}>发起议题</button></div>}
         <p className="sr-only" aria-live="polite">{liveMessage}</p>
       </section>
@@ -993,8 +1178,10 @@ export default function App() {
     <footer className="shell"><div className="brand muted"><span className="brand-mark"><Flame size={16} /></span><span>围炉夜话</span></div><p>Curiosity is the spark. Sharing keeps it alive.</p><span>团队共创 · 公开浏览</span></footer>
 
     {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} />}
-    {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} />}
+    {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} />}
     {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} />}
+    {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} unlockVersion={unlockVersion} />}
+    {accessModalOpen && <AccessModal message={accessMessage} onClose={closeAccess} onUnlocked={finishUnlock} />}
     {toast && <div className="toast"><span><Check size={15} /></span>{toast}</div>}
   </>;
 }

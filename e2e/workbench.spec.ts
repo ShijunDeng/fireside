@@ -1,7 +1,15 @@
 import { expect, test } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
+const writeKey = 'e2e-fireside-write-key';
+const writeHeaders = { 'X-Fireside-Write-Key': writeKey };
+
 test.describe('议题管理工作台', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript((key) => {
+      if (localStorage.getItem('e2e-force-locked') !== '1') sessionStorage.setItem('fireside-write-key', key);
+    }, writeKey);
+  });
   test('在月历和周历中展示排期，并可从事件进入编辑', async ({ page }) => {
     await page.goto('/');
     await page.getByRole('button', { name: '月历' }).click();
@@ -108,10 +116,13 @@ test.describe('议题管理工作台', () => {
     await page.getByLabel('线上会议链接（选填）').fill(meetingUrl);
     await page.getByRole('button', { name: '确认排期' }).click();
 
-    const cardMeetingLink = card.getByRole('link', { name: '加入会议' });
-    await expect(cardMeetingLink).toHaveAttribute('href', meetingUrl);
-    await expect(cardMeetingLink).toHaveAttribute('target', '_blank');
-    await expect(cardMeetingLink).toHaveAttribute('rel', 'noreferrer');
+    await card.getByRole('button', { name: '加入会议' }).click();
+    let meetingDialog = page.getByRole('dialog');
+    let meetingAccessLink = meetingDialog.getByRole('link', { name: '进入线上会议' });
+    await expect(meetingAccessLink).toHaveAttribute('href', meetingUrl);
+    await expect(meetingAccessLink).toHaveAttribute('target', '_blank');
+    await expect(meetingAccessLink).toHaveAttribute('rel', 'noreferrer');
+    await meetingDialog.getByRole('button', { name: '关闭' }).click();
     const participantButton = card.getByRole('button', { name: /报名参加/ });
     await participantButton.click();
     const participantDialog = page.getByRole('dialog');
@@ -133,20 +144,114 @@ test.describe('议题管理工作台', () => {
 
     await page.getByRole('button', { name: '周历' }).click();
     const weekEvent = page.locator('.week-event').filter({ hasText: title });
-    const weekMeetingLink = weekEvent.getByRole('link', { name: '加入会议' });
-    await expect(weekMeetingLink).toHaveAttribute('href', meetingUrl);
-    await page.context().route('https://meet.example.test/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<title>模拟会议室</title>' }));
-    const popupPromise = page.waitForEvent('popup');
-    await weekMeetingLink.click();
-    const popup = await popupPromise;
-    expect(popup.url()).toBe(meetingUrl);
-    await popup.close();
+    await weekEvent.getByRole('button', { name: '加入会议' }).click();
+    meetingDialog = page.getByRole('dialog');
+    meetingAccessLink = meetingDialog.getByRole('link', { name: '进入线上会议' });
+    await expect(meetingAccessLink).toHaveAttribute('href', meetingUrl);
+    await meetingDialog.getByRole('button', { name: '关闭' }).click();
     await expect(page.getByRole('heading', { name: '编辑议题' })).toHaveCount(0);
 
     await page.getByRole('button', { name: '列表' }).click();
     await card.getByRole('button', { name: /删除/ }).click();
     await page.getByRole('button', { name: '确认删除' }).click();
     await expect(card).toHaveCount(0);
+  });
+
+  test('公网只读脱敏，解锁后协作且失效口令不会丢失表单', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const protectedTitle = `公网隐私验收-${marker}`;
+    const secretMeeting = `https://meet.example.test/private/${marker}?passcode=never-public`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title: protectedTitle, summary: '公开页面可以看到议题，但不能看到会议凭证和报名姓名。', proposer: '隐私组织者', presenter: '隐私组织者', tags: ['隐私'],
+    } });
+    const topic = await created.json() as { id: number };
+    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+      scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(), duration: 40, room: '三楼围炉会议室', meetingUrl: secretMeeting,
+    } });
+    await request.post(`/api/topics/${topic.id}/participants`, { headers: writeHeaders, data: { name: '不公开的报名人' } });
+
+    const publicTopics = await request.get('/api/topics');
+    expect(publicTopics.status()).toBe(200);
+    expect(await publicTopics.text()).not.toContain('never-public');
+    expect(await publicTopics.text()).not.toContain('不公开的报名人');
+    expect((await request.get(`/api/topics/${topic.id}/participants`)).status()).toBe(401);
+    expect((await request.get(`/api/topics/${topic.id}/meeting-access`)).status()).toBe(401);
+    expect((await request.post('/api/topics', { data: {} })).status()).toBe(401);
+
+    await page.goto('/');
+    await page.evaluate(() => {
+      localStorage.setItem('e2e-force-locked', '1');
+      sessionStorage.removeItem('fireside-write-key');
+    });
+    await page.reload();
+    await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+    await expect(page.locator('body')).not.toContainText('never-public');
+    await expect(page.locator('body')).not.toContainText('不公开的报名人');
+    const protectedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: protectedTitle, exact: true }) });
+    await protectedCard.getByRole('button', { name: '加入会议' }).click();
+    let accessDialog = page.getByRole('dialog');
+    await expect(accessDialog.getByRole('heading', { name: '解锁围炉协作' })).toBeVisible();
+    await accessDialog.getByLabel('围炉口令').fill('wrong-key');
+    await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    await expect(accessDialog.getByText('围炉口令不正确')).toBeVisible();
+    await accessDialog.getByLabel('围炉口令').fill(writeKey);
+    await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    const meetingDialog = page.getByRole('dialog');
+    await expect(meetingDialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', secretMeeting);
+    await meetingDialog.getByRole('button', { name: '关闭' }).click();
+    await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+
+    await page.getByRole('button', { name: '协作已解锁' }).click();
+    await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+    await page.getByRole('button', { name: /发起议题/ }).first().click();
+    accessDialog = page.getByRole('dialog');
+    await accessDialog.getByLabel('围炉口令').fill(writeKey);
+    await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    const retainedTitle = `口令失效表单保留-${marker}`;
+    await page.getByLabel('议题标题').fill(retainedTitle);
+    await page.getByLabel('一句话简介').fill('第一次提交因口令失效而失败，重新解锁后由用户再次确认。');
+    await page.getByLabel('你的名字').fill('协作测试者');
+    await page.evaluate(() => sessionStorage.setItem('fireside-write-key', 'expired-key'));
+    await page.getByRole('button', { name: '发布议题' }).click();
+    accessDialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '解锁围炉协作' }) });
+    await expect(accessDialog).toBeVisible();
+    await expect(page.locator('input[name="title"]')).toHaveValue(retainedTitle);
+    await accessDialog.getByLabel('围炉口令').fill(writeKey);
+    await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    await expect(page.locator('input[name="title"]')).toHaveValue(retainedTitle);
+    await page.getByRole('button', { name: '发布议题' }).click();
+    await expect(page.getByRole('heading', { name: retainedTitle, exact: true })).toBeVisible();
+
+    const allTopics = await request.get('/api/topics');
+    const cleanupIds = (await allTopics.json() as { id: number; title: string }[])
+      .filter((item) => item.title === protectedTitle || item.title === retainedTitle)
+      .map(({ id }) => id);
+    await Promise.all(cleanupIds.map((id) => request.delete(`/api/topics/${id}`, { headers: writeHeaders })));
+  });
+
+  test('报名弹窗遇到活动状态冲突会关闭并同步权威结果', async ({ page, request }, testInfo) => {
+    const title = `报名冲突验收-${testInfo.project.name}-${Date.now()}`;
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
+      title, summary: '打开报名后由另一位协调者归档。', proposer: '冲突测试', presenter: '冲突测试', tags: [],
+    } });
+    const topic = await created.json() as { id: number };
+    await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
+      scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '冲突测试会议室', meetingUrl: '',
+    } });
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: '报名参加' }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByLabel('你的名字').fill('晚到的参与者');
+    const archived = await request.post(`/api/topics/${topic.id}/archive`, { headers: writeHeaders, data: { takeaway: '由另一位协调者完成归档。', materialUrl: '' } });
+    expect(archived.status()).toBe(200);
+    await dialog.getByRole('button', { name: '确认报名' }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(card).toContainText('已经归档');
+    await expect(page.getByText(/已同步最新状态/)).toBeVisible();
+
+    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
   });
 
   test('未来排期一键生成脱敏的 1080×1440 PNG 海报并恢复焦点', async ({ page, request }, testInfo) => {
@@ -156,7 +261,7 @@ test.describe('议题管理工作台', () => {
     const future = new Date(Date.now() + 3 * 86_400_000);
     future.setHours(19, 30, 0, 0);
     const past = new Date(Date.now() - 86_400_000);
-    const created = await request.post('/api/topics', { data: {
+    const created = await request.post('/api/topics', { headers: writeHeaders, data: {
       title,
       summary: '验证长按预览与隐私脱敏，会议号：998877 密码 alpha。',
       proposer: '海报发起人',
@@ -165,16 +270,16 @@ test.describe('议题管理工作台', () => {
     } });
     expect(created.ok()).toBe(true);
     const topic = await created.json() as { id: number };
-    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { data: {
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, { headers: writeHeaders, data: {
       scheduledAt: future.toISOString(), duration: 45, room: '三楼围炉会议室', meetingUrl: secretUrl,
     } });
     expect(scheduled.ok()).toBe(true);
-    const pastCreated = await request.post('/api/topics', { data: {
+    const pastCreated = await request.post('/api/topics', { headers: writeHeaders, data: {
       title: `过期海报验收 ${marker}`, summary: '过期排期不能继续宣传。', proposer: '海报测试', presenter: '海报测试', tags: [],
     } });
     expect(pastCreated.ok()).toBe(true);
     const pastTopic = await pastCreated.json() as { id: number };
-    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { data: {
+    const pastScheduled = await request.post(`/api/topics/${pastTopic.id}/schedule`, { headers: writeHeaders, data: {
       scheduledAt: past.toISOString(), duration: 30, room: '旧会议室', meetingUrl: '',
     } });
     expect(pastScheduled.ok()).toBe(true);
@@ -231,8 +336,8 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByRole('img', { name: /围炉夜话宣讲海报/ })).toBeVisible();
     await page.getByRole('button', { name: '关闭' }).click();
 
-    await request.delete(`/api/topics/${topic.id}`);
-    await request.delete(`/api/topics/${pastTopic.id}`);
+    await request.delete(`/api/topics/${topic.id}`, { headers: writeHeaders });
+    await request.delete(`/api/topics/${pastTopic.id}`, { headers: writeHeaders });
   });
 
   test('统计与五步说明进入真实功能', async ({ page }) => {
@@ -271,11 +376,13 @@ test.describe('议题管理工作台', () => {
       const title = `月历溢出-${testInfo.project.name}-${Date.now()}-${index}`;
       titles.push(title);
       const created = await request.post('/api/topics', {
+        headers: writeHeaders,
         data: { title, summary: '验证同一天超过三个议题后仍可展开查看。', proposer: '月历测试', presenter: '月历测试', tags: [] },
       });
       const topic = await created.json() as { id: number };
       ids.push(topic.id);
       await request.post(`/api/topics/${topic.id}/schedule`, {
+        headers: writeHeaders,
         data: { scheduledAt: scheduledAt.toISOString(), duration: 30, room: '月历测试会议室', meetingUrl: '' },
       });
     }
@@ -299,7 +406,7 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByText('标签最多 5 个')).toBeVisible();
     await page.getByRole('button', { name: '关闭' }).click();
 
-    await Promise.all(ids.map((id) => request.delete(`/api/topics/${id}`)));
+    await Promise.all(ids.map((id) => request.delete(`/api/topics/${id}`, { headers: writeHeaders })));
   });
 
   test('上移按钮保存手动顺序，刷新后保持', async ({ page }) => {

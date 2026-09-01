@@ -1,26 +1,62 @@
 import type { Participant, Stats, Topic, TopicSort } from './types';
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) {
+  constructor(message: string, public status: number, public code?: string) {
     super(message);
   }
 }
 
-async function readBody<T>(response: Response): Promise<T> {
+const writeKeyStorage = 'fireside-write-key';
+let unauthorizedHandler: (() => void) | null = null;
+
+export function getWriteKey() {
+  return sessionStorage.getItem(writeKeyStorage) ?? '';
+}
+
+export function saveWriteKey(value: string) {
+  sessionStorage.setItem(writeKeyStorage, value);
+}
+
+export function clearWriteKey() {
+  sessionStorage.removeItem(writeKeyStorage);
+}
+
+export function onUnauthorized(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
+
+async function readBody<T>(response: Response, notifyUnauthorized = true): Promise<T> {
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status);
+  if (!response.ok) {
+    if (response.status === 401 && notifyUnauthorized) {
+      clearWriteKey();
+      unauthorizedHandler?.();
+    }
+    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code);
+  }
   return body as T;
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+async function request<T>(url: string, options?: RequestInit, requiresAccess = options?.method !== undefined && options.method !== 'GET') {
+  const headers = new Headers(options?.headers);
+  if (options?.body) headers.set('Content-Type', 'application/json');
+  if (requiresAccess) {
+    const key = getWriteKey();
+    if (key) headers.set('X-Fireside-Write-Key', key);
+  }
   const response = await fetch(url, {
     ...options,
-    headers: { ...(options?.body ? { 'Content-Type': 'application/json' } : {}), ...options?.headers },
+    headers,
   });
   return readBody<T>(response);
 }
 
 export const api = {
+  access: () => request<{ enabled: boolean }>('/api/access'),
+  verifyAccess: async (key: string) => {
+    const response = await fetch('/api/access/verify', { method: 'POST', headers: { 'X-Fireside-Write-Key': key } });
+    await readBody<void>(response, false);
+  },
   topics: async (sort: TopicSort = 'manual') => {
     const response = await fetch(`/api/topics?sort=${sort}`);
     return {
@@ -35,9 +71,12 @@ export const api = {
     request<Topic>(`/api/topics/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   remove: (id: number) => request<void>(`/api/topics/${id}`, { method: 'DELETE' }),
   reorder: async (orderedIds: number[], baseVersion: number) => {
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+    const key = getWriteKey();
+    if (key) headers.set('X-Fireside-Write-Key', key);
     const response = await fetch('/api/topics/reorder', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ orderedIds, baseVersion }),
     });
     await readBody<void>(response);
@@ -52,7 +91,8 @@ export const api = {
   archive: (id: number, data: { takeaway: string; materialUrl: string }) =>
     request<Topic>(`/api/topics/${id}/archive`, { method: 'POST', body: JSON.stringify(data) }),
   unarchive: (id: number) => request<Topic>(`/api/topics/${id}/unarchive`, { method: 'POST', body: JSON.stringify({}) }),
-  participants: (id: number) => request<Participant[]>(`/api/topics/${id}/participants`),
+  meetingAccess: (id: number) => request<{ meetingUrl: string }>(`/api/topics/${id}/meeting-access`, undefined, true),
+  participants: (id: number) => request<Participant[]>(`/api/topics/${id}/participants`, undefined, true),
   join: (id: number, name: string) => request<Participant>(`/api/topics/${id}/participants`, { method: 'POST', body: JSON.stringify({ name }) }),
   leave: (id: number, participantId: number) => request<void>(`/api/topics/${id}/participants/${participantId}`, { method: 'DELETE' }),
 };

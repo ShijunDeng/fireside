@@ -13,6 +13,7 @@ export interface Topic {
   duration: number | null;
   room: string | null;
   meetingUrl: string | null;
+  hasMeetingUrl: boolean;
   participantCount: number;
   takeaway: string | null;
   materialUrl: string | null;

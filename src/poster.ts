@@ -54,7 +54,7 @@ export function isPosterEligible(topic: Topic, now = new Date()) {
 
 export function posterLocation(topic: Topic) {
   const room = topic.room?.trim() || '';
-  if (topic.meetingUrl) {
+  if (topic.meetingUrl || topic.hasMeetingUrl) {
     return room && !ONLINE_PATTERN.test(room)
       ? `${sanitizePosterText(room)} · 线上参与 · 会议链接请在议题广场获取`
       : '线上参与 · 会议链接请在议题广场获取';
