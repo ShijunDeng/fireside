@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { writeKeyMatches } from './access.js';
 import { createDatabase, rowToTopic } from './db.js';
+import { analyzeMeetingRoom } from './meeting.js';
 import type { Topic } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,6 +60,7 @@ const reorderSchema = z.object({
   baseVersion: z.number().int().nonnegative(),
 });
 const participantSchema = z.object({ name: nonEmptyText('参与者姓名', 30) });
+const sensitiveRoomMessage = '地点中不能填写会议链接、会议号或密码，请使用线上会议链接字段';
 const stateRestrictedEditFields = new Set([
   'presenter', 'scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl',
 ]);
@@ -122,12 +124,12 @@ export function buildApp(options: AppOptions = {}) {
 
   const toPublicTopic = (row: Parameters<typeof rowToTopic>[0]) => {
     const topic = rowToTopic(row);
-    const legacyMeeting = Boolean(topic.room && /^https?:\/\/\S+$/i.test(topic.room));
+    const legacyMeeting = analyzeMeetingRoom(topic.room);
     return {
       ...topic,
-      room: legacyMeeting ? '线上会议' : topic.room,
+      room: legacyMeeting.publicRoom || null,
       meetingUrl: null,
-      hasMeetingUrl: Boolean(topic.meetingUrl || legacyMeeting),
+      hasMeetingUrl: Boolean(topic.meetingUrl || legacyMeeting.meetingUrl),
     };
   };
 
@@ -201,6 +203,9 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     const body = editTopicSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
+    if (body.data.room !== undefined && analyzeMeetingRoom(body.data.room).sensitive) {
+      return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
+    }
     const row = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
     if (!row) return reply.code(404).send({ message: '没有找到这个议题' });
     const current = rowToTopic(row);
@@ -312,6 +317,9 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     const body = scheduleSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
+    if (analyzeMeetingRoom(body.data.room).sensitive) {
+      return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
+    }
     const result = db.prepare("UPDATE topics SET scheduled_at = ?, duration = ?, room = ?, meeting_url = ?, status = 'SCHEDULED', updated_at = ? WHERE id = ? AND status = 'CLAIMED'")
       .run(body.data.scheduledAt, body.data.duration, body.data.room, body.data.meetingUrl || null, new Date().toISOString(), params.data.id);
     if (result.changes === 0) {
@@ -383,8 +391,7 @@ export function buildApp(options: AppOptions = {}) {
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const row = db.prepare('SELECT room, meeting_url FROM topics WHERE id = ?').get(params.data.id) as { room: string | null; meeting_url: string | null } | undefined;
     if (!row) return reply.code(404).send({ message: '没有找到这个议题' });
-    const legacyMeetingUrl = row.room && /^https?:\/\/\S+$/i.test(row.room) ? row.room : null;
-    const meetingUrl = row.meeting_url || legacyMeetingUrl;
+    const meetingUrl = row.meeting_url || analyzeMeetingRoom(row.room).meetingUrl;
     return meetingUrl
       ? { meetingUrl }
       : reply.code(404).send({ message: '这个议题没有线上会议入口' });

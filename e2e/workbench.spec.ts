@@ -112,6 +112,10 @@ test.describe('议题管理工作台', () => {
     await page.getByRole('button', { name: '发布议题' }).click();
     const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
     await card.getByRole('button', { name: /安排分享/ }).click();
+    await page.getByLabel('地点 / 参与说明').fill('线上入口：https://meet.test/x?passcode=must-not-leak');
+    await page.getByRole('button', { name: '确认排期' }).click();
+    await expect(page.getByRole('alert')).toContainText('地点中不能填写会议链接、会议号或密码');
+    await expect(page.getByRole('heading', { name: '安排炉边分享' })).toBeVisible();
     await page.getByLabel('地点 / 参与说明').fill('线上会议');
     await page.getByLabel('线上会议链接（选填）').fill(meetingUrl);
     await page.getByRole('button', { name: '确认排期' }).click();

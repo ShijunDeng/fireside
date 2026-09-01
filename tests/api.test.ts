@@ -83,21 +83,12 @@ describe('围炉夜话 API', () => {
     const meeting = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access`, headers });
     assert.equal(meeting.json().meetingUrl, secretMeeting);
 
-    const legacyCreated = await protectedApp.inject({
-      method: 'POST', url: '/api/topics', headers,
-      payload: { title: '旧会议字段', summary: '兼容历史 room URL。', proposer: '组织者', presenter: '组织者', tags: [] },
+    const sensitiveRoom = await protectedApp.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers,
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: `线上入口：${secretMeeting}`, meetingUrl: '' },
     });
-    const legacyId = legacyCreated.json().id as number;
-    await protectedApp.inject({
-      method: 'POST', url: `/api/topics/${legacyId}/schedule`, headers,
-      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: secretMeeting, meetingUrl: '' },
-    });
-    const legacyPublic = (await protectedApp.inject({ method: 'GET', url: '/api/topics' })).json() as { id: number; room: string; meetingUrl: null; hasMeetingUrl: boolean }[];
-    const legacyTopic = legacyPublic.find(({ id }) => id === legacyId)!;
-    assert.equal(legacyTopic.room, '线上会议');
-    assert.equal(legacyTopic.meetingUrl, null);
-    assert.equal(legacyTopic.hasMeetingUrl, true);
-    assert.equal((await protectedApp.inject({ method: 'GET', url: `/api/topics/${legacyId}/meeting-access`, headers })).json().meetingUrl, secretMeeting);
+    assert.equal(sensitiveRoom.statusCode, 400);
+    assert.equal(sensitiveRoom.json().code, 'SENSITIVE_ROOM_CONTENT');
 
     await protectedApp.close();
   });
@@ -291,6 +282,45 @@ describe('围炉夜话 API', () => {
     assert.equal(invalidUrl.statusCode, 400);
   });
 
+  it('拒绝把会议链接或凭证写入地点且保留普通地点', async () => {
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '地点边界议题', summary: '会议秘密只能进入受保护字段。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    const id = created.json().id as number;
+    const sensitiveRooms = [
+      'https://meet.example.test/join?passcode=omega',
+      '线上入口：https://meet.example.test/join?pwd=omega',
+      '请访问 www.example.test/join?pwd=omega',
+      '腾讯会议 123 456 789，密码：秘密口令',
+      'Teams 会议号=998877 passcode = a-b_C',
+      '线上参与 pwd=hidden-token',
+    ];
+    for (const room of sensitiveRooms) {
+      const response = await app.inject({
+        method: 'POST', url: `/api/topics/${id}/schedule`,
+        payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room, meetingUrl: '' },
+      });
+      assert.equal(response.statusCode, 400, room);
+      assert.equal(response.json().code, 'SENSITIVE_ROOM_CONTENT', room);
+    }
+
+    const scheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`,
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 30, room: '腾讯会议室 A', meetingUrl: '' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    for (const room of ['密码学读书会', '3号会议室', '三楼围炉会议室']) {
+      assert.equal((await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { room } })).statusCode, 200, room);
+    }
+    for (const room of sensitiveRooms) {
+      const response = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, payload: { room } });
+      assert.equal(response.statusCode, 400, room);
+      assert.equal(response.json().code, 'SENSITIVE_ROOM_CONTENT', room);
+    }
+    await app.inject({ method: 'DELETE', url: `/api/topics/${id}` });
+  });
+
   it('拒绝缺少关键信息的议题', async () => {
     const response = await app.inject({ method: 'POST', url: '/api/topics', payload: { title: '', summary: '', proposer: '' } });
     assert.equal(response.statusCode, 400);
@@ -367,6 +397,49 @@ describe('数据库兼容性与并发', () => {
     assert.equal(updated.statusCode, 200);
     assert.equal(updated.json().title, '新口令生效');
     await rotatedApp.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('匿名脱敏历史混合会议地点且授权后仍可加入', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-legacy-meeting-room-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const writeKey = 'legacy-meeting-test-key';
+    const legacyApp = buildApp({ databasePath, seed: false, serveStatic: false, writeKey });
+    await legacyApp.ready();
+    const legacyDb = new Database(databasePath);
+    const now = new Date().toISOString();
+    const insert = legacyDb.prepare(`
+      INSERT INTO topics
+        (position, title, summary, proposer, presenter, tags, status, scheduled_at, duration, room, meeting_url, created_at, updated_at)
+      VALUES (?, ?, '历史兼容隐私测试', '旧系统', '旧分享人', '[]', 'SCHEDULED', ?, 30, ?, NULL, ?, ?)
+    `);
+    const mixedSecret = 'legacy-private-token';
+    const mixedUrl = `https://meet.example.test/legacy?passcode=${mixedSecret}`;
+    const mixedId = Number(insert.run(1, '历史混合 URL', new Date(Date.now() + 86_400_000).toISOString(), `线上入口：${mixedUrl}，请勿转发`, now, now).lastInsertRowid);
+    const credentialId = Number(insert.run(2, '历史纯凭证', new Date(Date.now() + 172_800_000).toISOString(), '腾讯会议 123 456 789，密码：秘密口令', now, now).lastInsertRowid);
+    insert.run(3, '历史普通地点', new Date(Date.now() + 259_200_000).toISOString(), '密码学读书会 · 3号会议室', now, now);
+    legacyDb.close();
+
+    const publicTopics = await legacyApp.inject({ method: 'GET', url: '/api/topics' });
+    assert.equal(publicTopics.body.includes(mixedSecret), false);
+    assert.equal(publicTopics.body.includes('123 456 789'), false);
+    assert.equal(publicTopics.body.includes('秘密口令'), false);
+    const topics = publicTopics.json() as { id: number; room: string; hasMeetingUrl: boolean }[];
+    const mixedTopic = topics.find(({ id }) => id === mixedId)!;
+    assert.equal(mixedTopic.room, '线上会议');
+    assert.equal(mixedTopic.hasMeetingUrl, true);
+    const credentialTopic = topics.find(({ id }) => id === credentialId)!;
+    assert.equal(credentialTopic.room, '线上参与信息已隐藏');
+    assert.equal(credentialTopic.hasMeetingUrl, false);
+    assert.equal(topics.find(({ room }) => room.includes('密码学读书会'))?.hasMeetingUrl, false);
+    const stats = await legacyApp.inject({ method: 'GET', url: '/api/stats' });
+    assert.equal(stats.body.includes(mixedSecret), false);
+    assert.equal(stats.json().nextTopic.room, '线上会议');
+    const headers = { 'x-fireside-write-key': writeKey };
+    assert.equal((await legacyApp.inject({ method: 'GET', url: `/api/topics/${mixedId}/meeting-access`, headers })).json().meetingUrl, mixedUrl);
+    assert.equal((await legacyApp.inject({ method: 'GET', url: `/api/topics/${credentialId}/meeting-access`, headers })).statusCode, 404);
+
+    await legacyApp.close();
     await rm(directory, { recursive: true, force: true });
   });
 

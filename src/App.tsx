@@ -744,7 +744,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
             <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={defaultScheduleTime()} autoFocus data-initial-focus /></label>
             <div className="form-row">
               <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={40} /></label>
-              <label>地点 / 参与说明<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
+              <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
             </div>
             <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} placeholder="https://" /></label>
           </>}
@@ -764,7 +764,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
               <label>分享时间<input name="scheduledAt" type="datetime-local" required defaultValue={formatDateTimeInput(topic.scheduledAt)} /></label>
               <div className="form-row">
                 <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={topic.duration ?? 40} /></label>
-                <label>地点 / 参与说明<input name="room" required maxLength={60} defaultValue={legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? ''} /></label>
+                <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue={legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? ''} /></label>
               </div>
               <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} defaultValue={topicMeetingUrl(topic) ?? ''} placeholder="https://" /></label>
             </>}
@@ -777,7 +777,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict }: {
           {kind === 'release' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>分享人署名会被清空，议题内容继续保留。</span></p></div>}
           {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>日历事件与现有报名会被移除，分享人和议题内容继续保留。</span></p></div>}
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
-          {error && <div className="form-error">{error}</div>}
+          {error && <div className="form-error" role="alert">{error}</div>}
           <button className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
             {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? '保存修改' : '确认删除'}
             {!submitting && <ChevronRight size={17} />}

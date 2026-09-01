@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
+import { extractMeetingUrl } from './meeting.js';
 import type { Topic, TopicStatus } from './types.js';
 
 type TopicRow = {
@@ -38,7 +39,7 @@ export function rowToTopic(row: TopicRow): Topic {
     duration: row.duration,
     room: row.room,
     meetingUrl: row.meeting_url,
-    hasMeetingUrl: Boolean(row.meeting_url || (row.room && /^https?:\/\/\S+$/i.test(row.room))),
+    hasMeetingUrl: Boolean(row.meeting_url || extractMeetingUrl(row.room)),
     participantCount: row.participant_count ?? 0,
     takeaway: row.takeaway,
     materialUrl: row.material_url,
