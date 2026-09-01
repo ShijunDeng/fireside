@@ -204,3 +204,5 @@
 - 验收：发布/回滚故障注入、manifest 篡改/陈旧/链接拒绝、root lifecycle 禁止、备份逐阶段故障与孤儿恢复；全量 check、无重试桌面/Pixel E2E、依赖审计、生产备份/恢复、真实自动回退、权限矩阵和 80 端口连续性。
 - 状态：Implementing。任一验收未完成不得接受 SPEC-010；成熟度连续无发现计数为 0。
 - 紧随项：页面承诺的周/月历参与闭环和 Pixel 当前日期定位；请求解析稳定 400/413/415。两者均已由独立证据确认，Iteration 023 完成后继续，不能停止循环。
+- 实现中独立审计阻断 A：生产 `systemd-run` 预检曾把 stdout 重定向到 `/dev/null`，而调用方用 command substitution 取得三次业务指纹，导致生产变量均为空且错误地“比较相等”；测试 hook 有输出所以未复现。修复必须让生产分支取得并解析非空 JSON 指纹，空/畸形输出直接拒绝，并以候选篡改指纹夹具证明不能切换。
+- 实现中独立审计阻断 B：recovery oneshot 曾由 app service 以 `Wants+After` 拉起且没有 `RemainAfterExit`；正常 promote 写 journal 后重启 app 会再次启动 recovery、撤销刚完成的切换，而 recovery 失败又不能阻止 app。修复必须使用失败可阻断的依赖与“本次开机只执行一次并保持 active-exited”的语义，真实 systemd restart 不得重跑 recovery；新 boot / 手动 recover 仍须恢复未完成 journal。
