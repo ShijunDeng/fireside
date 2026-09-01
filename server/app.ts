@@ -46,6 +46,7 @@ const editTopicSchema = z.object({
 }).refine((value) => Object.keys(value).length > 0, '至少需要修改一项内容');
 const reorderSchema = z.object({
   orderedIds: z.array(z.number().int().positive()).min(1).refine((ids) => new Set(ids).size === ids.length, '排序列表不能包含重复议题'),
+  baseVersion: z.number().int().nonnegative(),
 });
 
 type AppOptions = {
@@ -64,6 +65,14 @@ export function buildApp(options: AppOptions = {}) {
   const app = Fastify({ logger: options.logger ?? false });
   const databasePath = options.databasePath ?? process.env.DATABASE_PATH ?? path.join(projectRoot, 'data', 'fireside.db');
   const db = createDatabase(databasePath, options.seed ?? true);
+  const readOrderVersion = () => (db.prepare('SELECT version FROM topic_order_state WHERE id = 1').get() as { version: number }).version;
+  const bumpOrderVersion = () => db.prepare('UPDATE topic_order_state SET version = version + 1 WHERE id = 1').run();
+  const setPositions = (orderedIds: number[]) => {
+    const update = db.prepare('UPDATE topics SET position = ?, updated_at = ? WHERE id = ?');
+    const now = new Date().toISOString();
+    orderedIds.forEach((id, index) => update.run(-(index + 1), now, id));
+    orderedIds.forEach((id, index) => update.run(index + 1, now, id));
+  };
 
   app.addHook('onClose', async () => db.close());
 
@@ -85,6 +94,7 @@ export function buildApp(options: AppOptions = {}) {
     const where = parsed.data.status ? ' WHERE status = ?' : '';
     const rows = db.prepare(`SELECT * FROM topics${where} ORDER BY ${orderBy}`)
       .all(...(parsed.data.status ? [parsed.data.status] : []));
+    reply.header('X-Order-Version', String(readOrderVersion()));
     return (rows as Parameters<typeof rowToTopic>[0][]).map(rowToTopic);
   });
 
@@ -104,12 +114,16 @@ export function buildApp(options: AppOptions = {}) {
     const parsed = createTopicSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ message: validationMessage(parsed.error) });
     const now = new Date().toISOString();
-    const { nextPosition } = db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS nextPosition FROM topics').get() as { nextPosition: number };
-    const result = db.prepare(`
-      INSERT INTO topics (position, title, summary, proposer, tags, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
-    `).run(nextPosition, parsed.data.title, parsed.data.summary, parsed.data.proposer, JSON.stringify(parsed.data.tags), now, now);
-    const topic = db.prepare('SELECT * FROM topics WHERE id = ?').get(result.lastInsertRowid);
+    const topic = db.transaction(() => {
+      const { nextPosition } = db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS nextPosition FROM topics').get() as { nextPosition: number };
+      const result = db.prepare(`
+        INSERT INTO topics (position, title, summary, proposer, tags, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
+      `).run(nextPosition, parsed.data.title, parsed.data.summary, parsed.data.proposer, JSON.stringify(parsed.data.tags), now, now);
+      bumpOrderVersion();
+      return db.prepare('SELECT * FROM topics WHERE id = ?').get(result.lastInsertRowid);
+    }).immediate();
+    reply.header('X-Order-Version', String(readOrderVersion()));
     return reply.code(201).send(rowToTopic(topic as Parameters<typeof rowToTopic>[0]));
   });
 
@@ -151,21 +165,40 @@ export function buildApp(options: AppOptions = {}) {
   app.delete('/api/topics/:id', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const result = db.prepare('DELETE FROM topics WHERE id = ?').run(params.data.id);
-    if (result.changes === 0) return reply.code(404).send({ message: '没有找到这个议题' });
+    const deleted = db.transaction(() => {
+      const result = db.prepare('DELETE FROM topics WHERE id = ?').run(params.data.id);
+      if (result.changes === 0) return false;
+      const remainingIds = (db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[]).map(({ id }) => id);
+      setPositions(remainingIds);
+      bumpOrderVersion();
+      return true;
+    }).immediate();
+    if (!deleted) return reply.code(404).send({ message: '没有找到这个议题' });
+    reply.header('X-Order-Version', String(readOrderVersion()));
     return reply.code(204).send();
   });
 
   app.post('/api/topics/reorder', async (request, reply) => {
     const body = reorderSchema.safeParse(request.body);
     if (!body.success) return reply.code(400).send({ message: validationMessage(body.error) });
-    const existing = db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[];
-    if (existing.length !== body.data.orderedIds.length || existing.some(({ id }) => !body.data.orderedIds.includes(id))) {
+    const outcome = db.transaction(() => {
+      const currentVersion = readOrderVersion();
+      if (currentVersion !== body.data.baseVersion) return { status: 'conflict' as const, version: currentVersion };
+      const existing = db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[];
+      if (existing.length !== body.data.orderedIds.length || existing.some(({ id }) => !body.data.orderedIds.includes(id))) {
+        return { status: 'invalid' as const, version: currentVersion };
+      }
+      setPositions(body.data.orderedIds);
+      bumpOrderVersion();
+      return { status: 'ok' as const, version: currentVersion + 1 };
+    }).immediate();
+    reply.header('X-Order-Version', String(outcome.version));
+    if (outcome.status === 'conflict') {
+      return reply.code(409).send({ message: '议题顺序已被其他操作更新，请同步后重试' });
+    }
+    if (outcome.status === 'invalid') {
       return reply.code(400).send({ message: '排序列表需要包含全部议题' });
     }
-    const update = db.prepare('UPDATE topics SET position = ?, updated_at = ? WHERE id = ?');
-    const now = new Date().toISOString();
-    db.transaction(() => body.data.orderedIds.forEach((id, index) => update.run(index + 1, now, id)))();
     return reply.code(204).send();
   });
 

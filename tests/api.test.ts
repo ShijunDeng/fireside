@@ -134,15 +134,18 @@ describe('围炉夜话 API', () => {
   it('持久化完整的手动排序并拒绝不完整列表', async () => {
     const before = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
     const ids = (before.json() as { id: number }[]).map(({ id }) => id);
+    const baseVersion = Number(before.headers['x-order-version']);
     const reversed = [...ids].reverse();
-    const reordered = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed } });
+    const reordered = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed, baseVersion } });
     assert.equal(reordered.statusCode, 204);
+    assert.equal(Number(reordered.headers['x-order-version']), baseVersion + 1);
     const after = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
     assert.deepEqual((after.json() as { id: number }[]).map(({ id }) => id), reversed);
 
-    const incomplete = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed.slice(1) } });
+    const currentVersion = Number(after.headers['x-order-version']);
+    const incomplete = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: reversed.slice(1), baseVersion: currentVersion } });
     assert.equal(incomplete.statusCode, 400);
-    const duplicate = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: [reversed[0], reversed[0]] } });
+    const duplicate = await app.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: [reversed[0], reversed[0]], baseVersion: currentVersion } });
     assert.equal(duplicate.statusCode, 400);
   });
 });
@@ -244,6 +247,56 @@ describe('数据库兼容性与并发', () => {
     assert.equal(finalTopic.room, '并发测试会议室');
 
     await Promise.all([editingApp.close(), lifecycleApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('排序版本 CAS 阻止陈旧写并在成员变化后失效', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-order-cas-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    const secondApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await Promise.all([firstApp.ready(), secondApp.ready()]);
+    for (const title of ['排序甲', '排序乙', '排序丙']) {
+      await firstApp.inject({ method: 'POST', url: '/api/topics', payload: { title, summary: `${title}的简介`, proposer: '排序测试', tags: [] } });
+    }
+    const snapshot = await firstApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const ids = (snapshot.json() as { id: number }[]).map(({ id }) => id);
+    const version = Number(snapshot.headers['x-order-version']);
+    const firstOrder = [ids[1], ids[0], ids[2]];
+    const secondOrder = [ids[0], ids[2], ids[1]];
+    const [first, second] = await Promise.all([
+      firstApp.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: firstOrder, baseVersion: version } }),
+      secondApp.inject({ method: 'POST', url: '/api/topics/reorder', payload: { orderedIds: secondOrder, baseVersion: version } }),
+    ]);
+    assert.deepEqual([first.statusCode, second.statusCode].sort(), [204, 409]);
+    const winningOrder = first.statusCode === 204 ? firstOrder : secondOrder;
+    const final = await firstApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((final.json() as { id: number }[]).map(({ id }) => id), winningOrder);
+    assert.deepEqual((final.json() as { position: number }[]).map(({ position }) => position), [1, 2, 3]);
+
+    const beforeCreateVersion = Number(final.headers['x-order-version']);
+    await secondApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '新成员', summary: '创建后使旧排序版本失效。', proposer: '排序测试', tags: [] },
+    });
+    const staleAfterCreate = await firstApp.inject({
+      method: 'POST', url: '/api/topics/reorder',
+      payload: { orderedIds: winningOrder, baseVersion: beforeCreateVersion },
+    });
+    assert.equal(staleAfterCreate.statusCode, 409);
+
+    const beforeDelete = await firstApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeDeleteIds = (beforeDelete.json() as { id: number }[]).map(({ id }) => id);
+    await secondApp.inject({ method: 'DELETE', url: `/api/topics/${beforeDeleteIds.at(-1)}` });
+    const staleAfterDelete = await firstApp.inject({
+      method: 'POST', url: '/api/topics/reorder',
+      payload: { orderedIds: beforeDeleteIds, baseVersion: Number(beforeDelete.headers['x-order-version']) },
+    });
+    assert.equal(staleAfterDelete.statusCode, 409);
+    const compacted = await firstApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((compacted.json() as { position: number }[]).map(({ position }) => position), [1, 2, 3]);
+
+    await Promise.all([firstApp.close(), secondApp.close()]);
     await rm(directory, { recursive: true, force: true });
   });
 });

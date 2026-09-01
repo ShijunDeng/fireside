@@ -127,12 +127,18 @@ export function createDatabase(databasePath: string, seed = true) {
     );
     CREATE INDEX IF NOT EXISTS idx_topics_status ON topics(status);
     CREATE INDEX IF NOT EXISTS idx_topics_scheduled_at ON topics(scheduled_at);
+    CREATE TABLE IF NOT EXISTS topic_order_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0)
+    );
+    INSERT OR IGNORE INTO topic_order_state (id, version) VALUES (1, 0);
   `);
   const columns = db.prepare('PRAGMA table_info(topics)').all() as { name: string }[];
   if (!columns.some((column) => column.name === 'position')) {
     db.exec('ALTER TABLE topics ADD COLUMN position INTEGER NOT NULL DEFAULT 0');
   }
   db.exec('UPDATE topics SET position = id WHERE position = 0');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_position ON topics(position)');
   if (seed) seedDatabase(db);
   return db;
 }

@@ -83,4 +83,35 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByText(/排序保存失败/)).toBeVisible();
     await expect(cards.first()).toContainText(currentFirst);
   });
+
+  test('排序保存期间锁定全部排序控件并保持刷新一致', async ({ page }) => {
+    await page.goto('/');
+    const targetCard = page.getByRole('article').nth(1);
+    const targetTitle = (await targetCard.getByRole('heading').textContent())!;
+    let releaseRequest!: () => void;
+    let signalRequest!: () => void;
+    let requestCount = 0;
+    const requestStarted = new Promise<void>((resolve) => { signalRequest = resolve; });
+    const requestReleased = new Promise<void>((resolve) => { releaseRequest = resolve; });
+    await page.route('**/api/topics/reorder', async (route) => {
+      requestCount += 1;
+      signalRequest();
+      await requestReleased;
+      await route.continue();
+    });
+
+    await targetCard.getByTitle('上移').click();
+    await requestStarted;
+    await expect(targetCard.getByTitle('上移')).toBeDisabled();
+    await expect(targetCard.getByTitle('下移')).toBeDisabled();
+    await expect(targetCard.getByTitle('拖动排序')).toBeDisabled();
+    await targetCard.getByTitle('上移').click({ force: true });
+    expect(requestCount).toBe(1);
+    releaseRequest();
+    await expect(page.getByText('正在保存顺序…')).toHaveCount(0);
+    await page.unroute('**/api/topics/reorder');
+
+    await page.reload();
+    await expect(page.getByRole('article').first()).toContainText(targetTitle);
+  });
 });

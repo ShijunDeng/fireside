@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   ArrowDown,
@@ -29,7 +29,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { api } from './api';
+import { api, ApiError } from './api';
 import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
 import type { Stats, Topic, TopicSort, TopicStatus } from './types';
 
@@ -93,10 +93,11 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction, draggable, index, total, onDragStart, onDrop, onMove }: {
+function TopicCard({ topic, onAction, draggable, reordering, index, total, onDragStart, onDrop, onMove }: {
   topic: Topic;
   onAction: (kind: ModalKind, topic: Topic) => void;
   draggable: boolean;
+  reordering: boolean;
   index: number;
   total: number;
   onDragStart: (id: number) => void;
@@ -107,16 +108,16 @@ function TopicCard({ topic, onAction, draggable, index, total, onDragStart, onDr
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
-      onDragOver={(event) => draggable && event.preventDefault()}
+      onDragOver={(event) => draggable && !reordering && event.preventDefault()}
       onDrop={(event) => { event.preventDefault(); onDrop(topic.id); }}
     >
       <div className="topic-head">
         <span className={`status-pill ${meta.className}`}><i />{meta.label}</span>
         <div className="topic-head-actions">
           {draggable && <>
-            <button className="drag-handle" draggable onDragStart={(event) => { event.stopPropagation(); onDragStart(topic.id); }} title="拖动排序" aria-label={`拖动 ${topic.title} 排序`}><GripVertical size={14} /></button>
-            <button disabled={index === 0} onClick={() => onMove(topic.id, -1)} title="上移" aria-label={`将 ${topic.title} 上移`}><ArrowUp size={13} /></button>
-            <button disabled={index === total - 1} onClick={() => onMove(topic.id, 1)} title="下移" aria-label={`将 ${topic.title} 下移`}><ArrowDown size={13} /></button>
+            <button className="drag-handle" disabled={reordering} draggable={!reordering} onDragStart={(event) => { event.stopPropagation(); onDragStart(topic.id); }} title="拖动排序" aria-label={`拖动 ${topic.title} 排序`}><GripVertical size={14} /></button>
+            <button disabled={reordering || index === 0} onClick={() => onMove(topic.id, -1)} title="上移" aria-label={`将 ${topic.title} 上移`}><ArrowUp size={13} /></button>
+            <button disabled={reordering || index === total - 1} onClick={() => onMove(topic.id, 1)} title="下移" aria-label={`将 ${topic.title} 下移`}><ArrowDown size={13} /></button>
           </>}
           <span className="topic-number">#{String(topic.id).padStart(3, '0')}</span>
           <button onClick={() => onAction('edit', topic)} title="编辑议题" aria-label={`编辑 ${topic.title}`}><Pencil size={13} /></button>
@@ -387,6 +388,9 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('ALL');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<TopicSort>('manual');
+  const [orderVersion, setOrderVersion] = useState(0);
+  const [reordering, setReordering] = useState(false);
+  const reorderInFlight = useRef(false);
   const [view, setView] = useState<ViewMode>('list');
   const [calendarCursor, setCalendarCursor] = useState(new Date());
   const [draggedId, setDraggedId] = useState<number | null>(null);
@@ -397,7 +401,8 @@ export default function App() {
   const load = useCallback(async () => {
     try {
       const [topicData, statData] = await Promise.all([api.topics(sort), api.stats()]);
-      setTopics(topicData);
+      setTopics(topicData.topics);
+      setOrderVersion(topicData.orderVersion);
       setStats(statData);
       setLoadError('');
     } catch (error) {
@@ -433,19 +438,36 @@ export default function App() {
   const canManualReorder = view === 'list' && sort === 'manual' && tab === 'ALL' && !search.trim();
 
   async function persistOrder(next: Topic[], previous: Topic[], moved: Topic) {
+    if (reorderInFlight.current) return;
+    reorderInFlight.current = true;
+    setReordering(true);
     setTopics(next);
+    setLiveMessage('正在保存议题顺序');
     try {
-      await api.reorder(next.map((topic) => topic.id));
+      const nextVersion = await api.reorder(next.map((topic) => topic.id), orderVersion);
+      setOrderVersion(nextVersion);
       const position = next.findIndex((topic) => topic.id === moved.id) + 1;
       setLiveMessage(`${moved.title} 已移动到第 ${position} 位`);
     } catch (error) {
       setTopics(previous);
-      setToast(error instanceof Error ? `排序保存失败：${error.message}` : '排序保存失败，已恢复原顺序');
+      try {
+        const authoritative = await api.topics('manual');
+        setTopics(authoritative.topics);
+        setOrderVersion(authoritative.orderVersion);
+        setLiveMessage('已同步服务端最新议题顺序');
+      } catch {
+        setLiveMessage('排序保存失败，已恢复操作前顺序');
+      }
+      const prefix = error instanceof ApiError && error.status === 409 ? '顺序发生冲突，已同步最新结果' : '排序保存失败，已同步服务端结果';
+      setToast(error instanceof Error ? `${prefix}：${error.message}` : prefix);
+    } finally {
+      reorderInFlight.current = false;
+      setReordering(false);
     }
   }
 
   function moveTopic(id: number, direction: -1 | 1) {
-    if (!canManualReorder) return;
+    if (!canManualReorder || reorderInFlight.current) return;
     const from = topics.findIndex((topic) => topic.id === id);
     const to = from + direction;
     if (from < 0 || to < 0 || to >= topics.length) return;
@@ -457,7 +479,7 @@ export default function App() {
   }
 
   function dropTopic(targetId: number) {
-    if (!canManualReorder || draggedId === null || draggedId === targetId) return setDraggedId(null);
+    if (!canManualReorder || reorderInFlight.current || draggedId === null || draggedId === targetId) return setDraggedId(null);
     const from = topics.findIndex((topic) => topic.id === draggedId);
     const to = topics.findIndex((topic) => topic.id === targetId);
     if (from < 0 || to < 0) return setDraggedId(null);
@@ -538,6 +560,7 @@ export default function App() {
               </select>
             </label>}
             {view === 'list' && sort === 'manual' && !canManualReorder && <span className="sort-hint">清除搜索并切回“全部议题”后可手动排序</span>}
+            {reordering && <span className="sort-saving">正在保存顺序…</span>}
           </div>
         </div>
 
@@ -550,7 +573,8 @@ export default function App() {
               total={visibleTopics.length}
               onAction={openAction}
               draggable={canManualReorder}
-              onDragStart={setDraggedId}
+              reordering={reordering}
+              onDragStart={(id) => { if (!reorderInFlight.current) setDraggedId(id); }}
               onDrop={dropTopic}
               onMove={moveTopic}
             />)}</div>
