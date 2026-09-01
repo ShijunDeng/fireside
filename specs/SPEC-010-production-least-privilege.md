@@ -89,6 +89,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 - `npm ci` 可在无凭据的构建身份下临时访问依赖仓库；测试、构建以及含生产备份副本的预检必须在独立 cgroup 和无外网网络命名空间执行。构建 cgroup 完全结束后 root 才能复制与生成 manifest，防止残留进程在 hash 后修改工件。
 - 候选迁移隔离副本后，原 `current` 还必须在同一个已迁移副本上通过健康、公开读取和关闭，证明 schema 对上一健康版本向后兼容；否则不得切换。
 - 提升前必须成功生成一份新的在线一致备份。发布全过程使用互斥锁，防止两个发布者同时改写 `current` / `previous`。
+- 首次从历史版本提升时不能调用缺少本规格 fsync/互斥/孤儿恢复的旧 current backup CLI：正常 promote 使用已通过 manifest 与权威 main 授权的 target backup runner；rollback 使用调用前 current 的已健康 runner。runner 任一失败仍在切换前退出，且备份 transient sandbox 必须显式隐藏 `/etc/fireside.env`。
 - 提升时先解析并保存当前健康 release，再原子切换 `current`、重启服务并在有界时间内检查 HTTP 健康和 MainPID 实际运行目录。两项都成功后才原子更新 `previous` 为原健康 release并报告成功。
 - 新服务启动、健康或运行目录验证失败时，工具必须自动把 `current` 原子切回原健康 release、重启并验证恢复；返回非零且不得自动恢复数据库。若回退服务也不健康，必须返回独立的致命错误，保留 socket、状态、备份和两个 release 供人工处置。
 - 提供确定性的显式回滚工具：只接受 `/opt/fireside/releases/<40位commit>` 下已校验、服务用户可读的 release；回滚前备份，切换后执行同样的健康/运行目录门禁，失败则回到调用前版本。
@@ -156,6 +157,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 18. 在合法 manifest 后增加排序位于尾部且含换行/Tab 的路径，或让尾部 stat/hash 失败；即使生成器已输出的前缀与磁盘 manifest 完全相等，验证仍必须失败。
 19. 为已授权 commit 创建指向恶意 commit 的本地 `refs/replace`；controller 的 tree、archive 和最终 marker 必须仍对应原对象，替换内容不得进入候选。
 20. 在三次业务指纹均一致后注入 preflight stage 删除失败；命令必须返回 2，current/previous/journal 不变且明确报告待人工清理的路径状态。恢复清理能力后，同一门禁可正常完成且不残留 stage。
+21. 用“旧 origin runner 写旧哨兵、target runner 写安全哨兵”的夹具证明首次 promote 只执行 target backup CLI；成功后 rollback 使用调用前 current 的安全 runner。安全 runner 的 file/dir sync 故障仍须保持双指针/journal不变且不 prune，备份进程不可读取密钥文件。
 
 ### 7.2 生产
 
@@ -202,3 +204,5 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 主动复核补充：即使 commit SHA 由 GitHub 精确授权，本地 `refs/replace/<commit>` 仍可让默认 `git archive` 读取另一对象。隔离 Git 命令必须统一设置 no-replace 语义，并以恶意替换树证明归档身份没有被本地元数据改写。
 
 敏感副本清理复审发现：三次 preflight 成功后的显式 `rm -rf` 状态原先未检查，脚本会取消 trap 并继续发布，可能把 build 用户可读的生产数据库副本留在 `/run`。清理成功和路径消失是写发布事务前的硬门禁；失败不得切换版本或误报完成。
+
+首次生产提升还存在备份自举缺口：线上历史 current 的 backup CLI 本身没有本轮新增的崩溃安全顺序，若仍用 origin runner，第一份发布备份不满足 FR-OPS-008。正常 promote 必须使用已校验 target 的安全 runner；rollback 使用调用前 current runner，并在 transient sandbox 隐藏生产密钥。
