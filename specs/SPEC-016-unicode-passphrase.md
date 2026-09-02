@@ -49,4 +49,4 @@
 - 生产启动规则为显式配置、无首尾空白、6..256 Unicode code point；6 个重复字符与旧占位词也按用户规则接受，缺失、5、257 或首尾空白继续在监听和数据库前失败关闭。
 - 页面支持中文输入并在少于 6 字符时本地明确反馈；不预填、不保存原始口令，成功后仅保存 8 小时会话令牌。
 - `npm run check` 的 146 项单元/API/安全/发布测试、TypeScript 与生产构建全部通过；Playwright 使用 7 字中文测试口令跑完桌面 Chrome 与 Pixel 7 全业务，66 项通过、4 项按设备职责跳过，`--retries=0`。
-- 生产验收待提交部署后回写 commit、80 端口和最终口令轮换证据。
+- 生产验收：提交 `33fc1bf` 经受控 install/promote 成为 current，previous 为 `d6fd306`、journal clean；Git 外环境文件轮换为用户指定的 8 字符值后保持 `root:root 0600`。systemd service/socket 均 active，本机与公网 health、版本化口令验证均为 200，响应 commit 精确为 `33fc1bf`。
