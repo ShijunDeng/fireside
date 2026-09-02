@@ -23,11 +23,21 @@ async function issueSession(request: APIRequestContext, key = writeKey) {
 async function latestTopic(request: APIRequestContext, id: number) {
   const response = await request.get(`/api/topics/${id}`);
   if (!response.ok()) throw new Error(`Failed to read topic ${id}: ${response.status()}`);
-  return response.json() as Promise<{ id: number; revision: number; title: string }>;
+  return response.json() as Promise<{ id: number; revision: number; title: string; status: 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED' }>;
 }
 
 async function deleteLatestTopic(request: APIRequestContext, id: number) {
-  const topic = await latestTopic(request, id);
+  let topic = await latestTopic(request, id);
+  if (topic.status === 'ARCHIVED') {
+    const unarchived = await request.post(`/api/topics/${id}/unarchive`, { headers: revisionHeaders(topic.revision), data: {} });
+    if (unarchived.status() !== 200) throw new Error(`Failed to unarchive topic ${id}: ${unarchived.status()}`);
+    topic = await unarchived.json();
+  }
+  if (topic.status === 'SCHEDULED') {
+    const unscheduled = await request.post(`/api/topics/${id}/unschedule`, { headers: revisionHeaders(topic.revision), data: {} });
+    if (unscheduled.status() !== 200) throw new Error(`Failed to unschedule topic ${id}: ${unscheduled.status()}`);
+    topic = await unscheduled.json();
+  }
   const response = await request.delete(`/api/topics/${id}`, { headers: revisionHeaders(topic.revision) });
   if (response.status() !== 204) throw new Error(`Failed to delete topic ${id}: ${response.status()}`);
 }
@@ -171,7 +181,9 @@ test.describe('议题管理工作台', () => {
     const monthEvent = page.locator('.calendar-event').filter({ hasText: '把一个模糊想法做成可用 Demo' });
     await expect(monthEvent).toBeVisible();
     await monthEvent.click();
-    await expect(page.getByRole('dialog').getByRole('heading', { name: '把一个模糊想法做成可用 Demo' })).toBeVisible();
+    const activityDialog = page.getByRole('dialog', { name: '把一个模糊想法做成可用 Demo' });
+    await expect(activityDialog.getByRole('heading', { name: '把一个模糊想法做成可用 Demo' })).toBeVisible();
+    await expect(activityDialog.getByRole('button', { name: /删除/ })).toHaveCount(0);
     await page.getByRole('button', { name: '编辑维护' }).click();
     await expect(page.getByRole('heading', { name: '编辑议题' })).toBeVisible();
     await expect(page.getByLabel('分享时间')).toHaveValue(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
@@ -314,13 +326,19 @@ test.describe('议题管理工作台', () => {
     await expect(updatedCard).toBeVisible();
 
     await updatedCard.getByRole('button', { name: /删除/ }).click();
-    await expect(page.getByText('此操作不可撤销，请确认是否继续。')).toBeVisible();
+    await expect(page.getByText('删除只适用于误建或重复议题。议题内容将永久移除，此操作不可撤销。')).toBeVisible();
+    const cancelDelete = page.getByRole('button', { name: '取消', exact: true });
+    await expect(cancelDelete).toBeFocused();
+    await cancelDelete.click();
+    await expect(updatedCard.getByRole('button', { name: /删除/ })).toBeFocused();
+    await updatedCard.getByRole('button', { name: /删除/ }).click();
     await Promise.all([
       page.waitForResponse((response) => response.request().method() === 'DELETE' && response.status() === 204),
-      page.getByRole('button', { name: '确认删除' }).click(),
+      page.getByRole('button', { name: '确认永久删除' }).click(),
     ]);
     await expect(page.getByRole('heading', { name: '删除这个议题？' })).toHaveCount(0);
     await expect(updatedCard).toHaveCount(0);
+    await expect(page.locator('#topics h2')).toBeFocused();
   });
 
   test('已有报名的活动改期先确认影响，保留名单且冲突后必须重新确认', async ({ page, request }, testInfo) => {
@@ -452,7 +470,7 @@ test.describe('议题管理工作台', () => {
     await page.getByRole('button', { name: '重新开放认领' }).click();
     await expect(card).toContainText('等待添柴');
     await card.getByRole('button', { name: /删除/ }).click();
-    await page.getByRole('button', { name: '确认删除' }).click();
+    await page.getByRole('button', { name: '确认永久删除' }).click();
     await expect(card).toHaveCount(0);
   });
 
@@ -534,8 +552,11 @@ test.describe('议题管理工作台', () => {
     await expect(page.getByRole('heading', { name: '编辑议题' })).toHaveCount(0);
 
     await page.getByRole('button', { name: '列表' }).click();
+    await card.getByRole('button', { name: '取消排期' }).click();
+    await page.getByRole('button', { name: '确认取消排期' }).click();
+    await expect(card).toContainText('已被认领');
     await card.getByRole('button', { name: /删除/ }).click();
-    await page.getByRole('button', { name: '确认删除' }).click();
+    await page.getByRole('button', { name: '确认永久删除' }).click();
     await expect(card).toHaveCount(0);
   });
 
@@ -570,6 +591,7 @@ test.describe('议题管理工作台', () => {
       await expect(upcomingCard.getByRole('button', { name: '加入会议' })).toBeVisible();
       await expect(upcomingCard.getByRole('button', { name: '生成海报' })).toBeVisible();
       await expect(upcomingCard.getByRole('button', { name: '取消排期' })).toBeVisible();
+      await expect(upcomingCard.getByRole('button', { name: new RegExp(`^删除 ${upcomingTitle}$`) })).toHaveCount(0);
       await expect(upcomingCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
       await expect(upcomingCard.getByRole('button', { name: /未举行/ })).toHaveCount(0);
 
@@ -592,12 +614,14 @@ test.describe('议题管理工作台', () => {
       await expect(dialog.getByRole('heading', { name: '宣讲海报已为你备好' })).toBeVisible();
       await dialog.getByRole('button', { name: '关闭' }).click();
 
+      const boundaryStart = Date.now() + 3_600_000;
       const boundary = await createScheduledPhaseTopic(request, {
         title: liveTitle,
-        scheduledAt: new Date(Date.now() + 8_000).toISOString(),
+        scheduledAt: new Date(boundaryStart).toISOString(),
         meetingUrl: liveMeeting,
       });
       cleanupIds.push(boundary.id);
+      await page.clock.install({ time: boundaryStart - 8_000 });
       await page.reload();
       const documentLoadsAtUpcoming = await page.evaluate(() => Number(sessionStorage.getItem('e2e-phase-document-loads')));
       const liveCard = page.locator('.topic-card')
@@ -608,7 +632,13 @@ test.describe('议题管理工作台', () => {
       const staleUnscheduleDialog = page.getByRole('dialog');
       await expect(staleUnscheduleDialog.getByRole('heading', { name: '取消这次排期？' })).toBeVisible();
 
-      await expect(liveCard.locator('.status-pill')).toHaveText('进行中', { timeout: 15_000 });
+      await page.route(`**/api/topics/${boundary.id}/unschedule`, async (route) => route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'ACTIVITY_TIME_CONFLICT', message: '活动进行中，不能取消排期', phase: 'LIVE' }),
+      }));
+      await page.clock.runFor(8_010);
+      await expect(liveCard.locator('.status-pill')).toHaveText('进行中');
       expect(await page.evaluate(() => Number(sessionStorage.getItem('e2e-phase-document-loads')))).toBe(documentLoadsAtUpcoming);
       await staleUnscheduleDialog.getByRole('button', { name: '确认取消排期' }).click();
       await expect(staleUnscheduleDialog).toHaveCount(0);
@@ -621,6 +651,7 @@ test.describe('议题管理工作台', () => {
       await expect(liveCard.getByRole('button', { name: '取消排期' })).toHaveCount(0);
       await expect(liveCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
       await expect(liveCard.getByRole('button', { name: /未举行/ })).toHaveCount(0);
+      await expect(liveCard.getByRole('button', { name: new RegExp(`^删除 ${liveTitle}$`) })).toHaveCount(0);
 
       await liveCard.getByRole('button', { name: '报名参加' }).click();
       participantDialog = page.getByRole('dialog');
@@ -647,6 +678,7 @@ test.describe('议题管理工作台', () => {
       await expect(liveWeekEvent).toContainText('进行中');
       await expect(liveWeekEvent.getByRole('button', { name: '加入会议' })).toBeVisible();
       await expect(liveWeekEvent.getByRole('button', { name: '生成海报' })).toHaveCount(0);
+      await page.unroute(`**/api/topics/${boundary.id}/unschedule`);
     } finally {
       await cleanupPhaseTopics(request, cleanupIds);
     }
@@ -675,6 +707,7 @@ test.describe('议题管理工作台', () => {
       await expect(seedCard.getByRole('button', { name: '报名参加' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '完成归档' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: new RegExp(`^删除 ${archivedSeed.title}$`) })).toHaveCount(0);
       const archivedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: sessionHeaders() });
       expect(archivedMeeting.status()).toBe(409);
       expect(await archivedMeeting.text()).not.toContain('http');
@@ -697,6 +730,7 @@ test.describe('议题管理工作台', () => {
       await expect(seedCard.getByRole('button', { name: '加入会议' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '生成海报' })).toHaveCount(0);
       await expect(seedCard.getByRole('button', { name: '取消排期' })).toHaveCount(0);
+      await expect(seedCard.getByRole('button', { name: new RegExp(`^删除 ${archivedSeed.title}$`) })).toHaveCount(0);
       const endedMeeting = await request.get(`/api/topics/${archivedSeed.id}/meeting-access`, { headers: sessionHeaders() });
       expect(endedMeeting.status()).toBe(409);
       expect(await endedMeeting.text()).not.toContain('http');
@@ -1442,48 +1476,195 @@ test.describe('议题管理工作台', () => {
     await deleteLatestTopic(request, topic.id);
   });
 
-  test('陈旧删除拒绝抹掉新报名，并要求重新确认', async ({ page, request }, testInfo) => {
+  test('陈旧删除同步同状态更新，并要求基于最新版重新确认', async ({ page, request }, testInfo) => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
-    const title = `陈旧删除报名保护-${marker}`;
-    const participantName = `新报名伙伴-${marker}`;
+    const title = `陈旧删除内容保护-${marker}`;
+    const remoteSummary = `另一位协作者刚补充的简介-${marker}`;
     const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
-      title, summary: '删除确认期间的新报名必须被完整保留。', proposer: '删除测试', presenter: '删除测试', tags: ['报名'],
+      title, summary: '删除确认期间的同状态内容更新必须保留。', proposer: '删除测试', tags: ['并发'],
     } });
     const topic = await created.json() as { id: number; revision: number };
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    const deleteButton = card.getByRole('button', { name: `删除 ${title}`, exact: true });
+    await deleteButton.click();
+    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
+    const edited = await request.patch(`/api/topics/${topic.id}`, {
+      headers: revisionHeaders(topic.revision),
+      data: { summary: remoteSummary },
+    });
+    expect(edited.status()).toBe(200);
+    await page.getByRole('button', { name: '确认永久删除' }).click();
+
+    await expect(page.getByText(/议题已被其他协作者更新/)).toBeVisible();
+    await expect(card).toContainText(remoteSummary);
+    await expect(deleteButton).toBeFocused();
+    await deleteButton.click();
+    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
+    await Promise.all([
+      page.waitForResponse((response) => response.url().endsWith(`/api/topics/${topic.id}`)
+        && response.request().method() === 'DELETE' && response.status() === 204),
+      page.getByRole('button', { name: '确认永久删除' }).click(),
+    ]);
+    await expect(card).toHaveCount(0);
+  });
+
+  test('已排期报名不能直接删除，必须先取消活动再明确永久删除', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `成熟删除保护-${marker}`;
+    const participantName = `报名伙伴-${marker}`;
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title, summary: '生命周期必须先于永久删除。', proposer: '删除协调者', presenter: '分享人', tags: ['删除保护'],
+    } });
+    const topic = await created.json() as { id: number; revision: number };
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
     const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, {
       headers: revisionHeaders(topic.revision),
       data: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 40, room: '版本测试会议室', meetingUrl: '' },
     });
     expect(scheduled.status()).toBe(200);
+    const joined = await request.post(`/api/topics/${topic.id}/participants`, {
+      headers: sessionHeaders(), data: { name: participantName },
+    });
+    expect(joined.status()).toBe(201);
+    await page.getByRole('button', { name: '确认永久删除' }).click();
+
+    await expect(page.getByText(/议题已被其他协作者更新/)).toBeVisible();
+    await expect(card).toContainText('1 人报名');
+    await expect(card.getByRole('button', { name: `删除 ${title}`, exact: true })).toHaveCount(0);
+    await expect(card).toBeFocused();
+    const latest = await readPhaseTopic(request, topic.id);
+    const rejected = await request.delete(`/api/topics/${topic.id}`, { headers: revisionHeaders(latest.revision) });
+    expect(rejected.status()).toBe(409);
+    expect(await rejected.json()).toEqual(expect.objectContaining({
+      code: 'TOPIC_DELETE_STATE_CONFLICT', currentStatus: 'SCHEDULED', currentRevision: latest.revision,
+    }));
+    const participants = await request.get(`/api/topics/${topic.id}/participants`, { headers: sessionHeaders() });
+    expect((await participants.json()).map((participant: { name: string }) => participant.name)).toEqual([participantName]);
+
+    await card.getByRole('button', { name: '取消排期' }).click();
+    await expect(page.getByRole('dialog')).toContainText('现有报名会被移除');
+    await page.getByRole('button', { name: '确认取消排期' }).click();
+    await expect(card).toContainText('已被认领');
+    await expect(card).toContainText('分享 · 分享人');
+    const deleteButton = card.getByRole('button', { name: `删除 ${title}`, exact: true });
+    await expect(deleteButton).toBeVisible();
+    await deleteButton.click();
+    await expect(page.getByRole('dialog')).toContainText('分享人 分享人 已认领');
+    await expect(page.getByRole('dialog')).toContainText('系统不会自动通知分享人');
+    await page.getByRole('button', { name: '确认永久删除' }).click();
+    await expect(card).toHaveCount(0);
+  });
+
+  test('异常早期快照带成熟依赖时不展示不可执行的删除入口', async ({ page, request }, testInfo) => {
+    const title = `异常早期删除入口-${testInfo.project.name}-${Date.now()}`;
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title, summary: '公开快照若显示残留报名，页面必须失败关闭。', proposer: '异常测试', presenter: '异常测试', tags: [],
+    } });
+    const topic = await created.json() as PhaseTopic;
+    await page.route(/\/api\/topics\?sort=/, async (route) => {
+      const response = await route.fetch();
+      const list = await response.json() as PhaseTopic[];
+      await route.fulfill({ response, json: list.map((item) => item.id === topic.id ? { ...item, participantCount: 1 } : item) });
+    });
+
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    await expect(card).toContainText('已被认领');
+    await expect(card.getByRole('button', { name: `删除 ${title}`, exact: true })).toHaveCount(0);
+    await expect(card.getByRole('button', { name: `编辑 ${title}`, exact: true })).toBeVisible();
+
+    await page.unroute(/\/api\/topics\?sort=/);
+    await deleteLatestTopic(request, topic.id);
+  });
+
+  test('删除确认收到状态 409 后同步异常依赖、移除入口并聚焦卡片', async ({ page, request }, testInfo) => {
+    const title = `删除状态冲突恢复-${testInfo.project.name}-${Date.now()}`;
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title, summary: '确认期间服务端发现成熟依赖。', proposer: '状态冲突测试', presenter: '状态冲突测试', tags: [],
+    } });
+    const topic = await created.json() as PhaseTopic;
+    let stateConflict = false;
+    await page.route(/\/api\/topics\?sort=/, async (route) => {
+      const response = await route.fetch();
+      if (!stateConflict) return route.fulfill({ response });
+      const list = await response.json() as PhaseTopic[];
+      await route.fulfill({ response, json: list.map((item) => item.id === topic.id ? { ...item, participantCount: 1 } : item) });
+    });
+    await page.route(`**/api/topics/${topic.id}`, async (route) => {
+      if (route.request().method() !== 'DELETE') return route.continue();
+      stateConflict = true;
+      await route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({
+        code: 'TOPIC_DELETE_STATE_CONFLICT', message: '这个议题包含排期、报名或归档信息，不能直接永久删除',
+        currentRevision: topic.revision, currentStatus: 'CLAIMED',
+      }) });
+    });
 
     await page.goto('/');
     const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
     await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
-    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
-    const joined = await request.post(`/api/topics/${topic.id}/participants`, {
-      headers: sessionHeaders(),
-      data: { name: participantName },
-    });
-    expect(joined.status()).toBe(201);
-    await page.getByRole('button', { name: '确认删除' }).click();
+    await page.getByRole('button', { name: '确认永久删除' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.getByText(/不能直接永久删除/)).toBeVisible();
+    await expect(card.getByRole('button', { name: `删除 ${title}`, exact: true })).toHaveCount(0);
+    await expect(card).toBeFocused();
 
-    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toHaveCount(0);
-    await expect(page.getByText(/议题已被其他协作者更新/)).toBeVisible();
-    await expect(card).toBeVisible();
-    await expect(card).toContainText('1 人报名');
-    await card.getByRole('button', { name: /报名参加/ }).click();
-    const participantsDialog = page.getByRole('dialog');
-    await expect(participantsDialog.getByText(participantName)).toBeVisible();
-    await participantsDialog.getByRole('button', { name: '关闭' }).click();
+    await page.unroute(`**/api/topics/${topic.id}`);
+    await page.unroute(/\/api\/topics\?sort=/);
+    await deleteLatestTopic(request, topic.id);
+  });
 
+  test('删除确认期间议题已不存在时关闭陈旧界面并聚焦议题广场', async ({ page, request }, testInfo) => {
+    const title = `删除缺失恢复-${testInfo.project.name}-${Date.now()}`;
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title, summary: '另一位协调者先完成删除。', proposer: '缺失测试', tags: [],
+    } });
+    const topic = await created.json() as { id: number; revision: number };
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
     await card.getByRole('button', { name: `删除 ${title}`, exact: true }).click();
-    await expect(page.getByRole('heading', { name: '删除这个议题？' })).toBeVisible();
-    await Promise.all([
-      page.waitForResponse((response) => response.url().endsWith(`/api/topics/${topic.id}`)
-        && response.request().method() === 'DELETE' && response.status() === 204),
-      page.getByRole('button', { name: '确认删除' }).click(),
-    ]);
+    const remoteDelete = await request.delete(`/api/topics/${topic.id}`, { headers: revisionHeaders(topic.revision) });
+    expect(remoteDelete.status()).toBe(204);
+    await page.getByRole('button', { name: '确认永久删除' }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(card).toHaveCount(0);
+    await expect(page.getByText(/已由其他协作者删除，无需重复操作/)).toBeVisible();
+    await expect(page.locator('#topics h2')).toBeFocused();
+  });
+
+  test('极限连续标题与分享人不会撑宽删除弹窗，Esc 和遮罩均恢复焦点', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}${Date.now().toString(36)}`;
+    const title = `${'W'.repeat(80 - marker.length)}${marker}`;
+    const presenter = 'M'.repeat(30);
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title, summary: '验证合法极限连续文本的删除确认布局。', proposer: '极限布局测试', presenter, tags: [],
+    } });
+    const topic = await created.json() as { id: number };
+    await page.goto('/');
+    const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+    const deleteButton = card.getByRole('button', { name: `删除 ${title}`, exact: true });
+    await deleteButton.click();
+    let dialog = page.getByRole('dialog');
+    const dimensions = await dialog.evaluate((element) => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth }));
+    expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    for (const name of ['取消', '确认永久删除']) {
+      const button = dialog.getByRole('button', { name, exact: true });
+      await expect(button).toBeVisible();
+      await expect.poll(async () => (await button.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+    await page.keyboard.press('Escape');
+    await expect(deleteButton).toBeFocused();
+
+    await deleteButton.click();
+    dialog = page.getByRole('dialog');
+    await page.locator('.modal-backdrop').click({ position: { x: 2, y: 2 } });
+    await expect(dialog).toHaveCount(0);
+    await expect(deleteButton).toBeFocused();
+    await deleteLatestTopic(request, topic.id);
   });
 
   test('未来排期一键生成脱敏的 1080×1440 PNG 海报并恢复焦点', async ({ page, request }, testInfo) => {
@@ -1683,7 +1864,7 @@ test.describe('议题管理工作台', () => {
     await deleteLatestTopic(request, topic.id);
   });
 
-  test('海报拒绝陈旧的取消排期与删除快照并同步页面', async ({ page, request }, testInfo) => {
+  test('海报拒绝陈旧的取消排期快照并同步页面', async ({ page, request }, testInfo) => {
     const marker = `${testInfo.project.name}-${Date.now()}`;
     const future = new Date(Date.now() + 2 * 86_400_000).toISOString();
     const createScheduled = async (title: string) => {
@@ -1698,9 +1879,7 @@ test.describe('议题管理工作台', () => {
       return { id: topic.id, ...await scheduled.json() as { revision: number } };
     };
     const cancelledTitle = `海报取消排期-${marker}`;
-    const deletedTitle = `海报删除议题-${marker}`;
     const cancelledTopic = await createScheduled(cancelledTitle);
-    const deletedTopic = await createScheduled(deletedTitle);
 
     await page.goto('/');
     const cancelledCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: cancelledTitle, exact: true }) });
@@ -1711,25 +1890,13 @@ test.describe('议题管理工作台', () => {
     });
     expect(unscheduled.ok()).toBe(true);
     await cancelledButton.click();
-    let dialog = page.getByRole('dialog');
+    const dialog = page.getByRole('dialog');
     await expect(dialog.getByRole('alert')).toContainText('取消排期或状态已变化');
     await expect(dialog.getByRole('img')).toHaveCount(0);
     await expect(dialog.getByRole('button', { name: '下载 PNG' })).toHaveCount(0);
     await expect(cancelledCard).toContainText('已被认领');
     await dialog.getByRole('button', { name: '返回议题广场' }).click();
     await expect(cancelledCard).toBeFocused();
-
-    const deletedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: deletedTitle, exact: true }) });
-    const deletedButton = deletedCard.getByRole('button', { name: '生成海报' });
-    await expect(deletedButton).toBeVisible();
-    const deleted = await request.delete(`/api/topics/${deletedTopic.id}`, { headers: revisionHeaders(deletedTopic.revision) });
-    expect(deleted.status()).toBe(204);
-    await deletedButton.click();
-    dialog = page.getByRole('dialog');
-    await expect(dialog.getByRole('alert')).toContainText('议题已被删除');
-    await expect(deletedCard).toHaveCount(0);
-    await dialog.getByRole('button', { name: '返回议题广场' }).click();
-    await expect(page.getByRole('heading', { name: '炉边正在发生什么' })).toBeFocused();
 
     await deleteLatestTopic(request, cancelledTopic.id);
   });

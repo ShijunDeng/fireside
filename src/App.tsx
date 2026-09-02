@@ -96,6 +96,18 @@ function canAttendPhase(phase: ActivityPhase | null) {
   return phase === 'UPCOMING' || phase === 'LIVE';
 }
 
+function canDeleteTopic(topic: Topic) {
+  return (topic.status === 'OPEN' || topic.status === 'CLAIMED')
+    && topic.scheduledAt === null
+    && topic.duration === null
+    && topic.room === null
+    && !topic.hasMeetingUrl
+    && topic.takeaway === null
+    && topic.materialUrl === null
+    && topic.archivedAt === null
+    && topic.participantCount === 0;
+}
+
 function formatDate(value: string, withYear = false) {
   return new Intl.DateTimeFormat('zh-CN', {
     ...(withYear ? { year: 'numeric' } : {}),
@@ -254,6 +266,7 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCo
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
+      data-topic-id={topic.id}
       data-focus-return={`poster-${topic.id}`}
       tabIndex={-1}
       onDragOver={(event) => draggable && !reordering && event.preventDefault()}
@@ -322,7 +335,7 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCo
       </div>
       {canCollaborate && <div className="card-maintenance" aria-label="议题维护">
         <button onClick={() => onAction('edit', topic)} aria-label={`编辑 ${topic.title}`}><Pencil size={14} />编辑</button>
-        <button className="danger" onClick={() => onAction('delete', topic)} aria-label={`删除 ${topic.title}`}><Trash2 size={14} />删除</button>
+        {canDeleteTopic(topic) && <button data-delete-topic-id={topic.id} className="danger" onClick={() => onAction('delete', topic)} aria-label={`删除 ${topic.title}`}><Trash2 size={14} />删除</button>}
       </div>}
     </article>
   );
@@ -1010,7 +1023,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
   topic: Topic | null;
   onClose: () => void;
   onComplete: (message: string) => void;
-  onConflict?: (message: string) => void;
+  onConflict?: (message: string, topicMissing?: boolean) => void;
   now: Date;
 }) {
   const [submitting, setSubmitting] = useState(false);
@@ -1074,7 +1087,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
       : { eyebrow: 'CHANGE OF PLAN', title: '取消这次排期？', intro: '议题会回到准备中，可以稍后重新安排时间。' },
     unarchive: { eyebrow: 'RESTORE THE FIRE', title: '撤销这次归档？', intro: '议题会恢复为已排期，原排期保留，归档内容将被清空。' },
     edit: { eyebrow: 'TEND THE FIRE', title: '编辑议题', intro: '更新议题信息，让每一位围炉伙伴看到准确的线索。' },
-    delete: { eyebrow: 'REMOVE A SPARK', title: '删除这个议题？', intro: '删除后，相关的认领、排期与归档信息也会永久消失。' },
+    delete: { eyebrow: 'REMOVE A SPARK', title: '删除这个议题？', intro: '永久删除只用于误建、测试或重复议题。' },
   }[kind];
 
   useEffect(() => {
@@ -1309,6 +1322,10 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
         onConflict(err.message);
         return;
       }
+      if (kind === 'delete' && err instanceof ApiError && err.status === 404 && onConflict) {
+        onConflict('议题已由其他协作者删除，无需重复操作', true);
+        return;
+      }
       setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
       setSubmitting(false);
     }
@@ -1388,16 +1405,24 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
               <label>资料链接（选填）<input name="materialUrl" type="url" defaultValue={editDraft?.materialUrl ?? topic.materialUrl ?? ''} placeholder="https://" /></label>
             </>}
           </>}
-          {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>此操作不可撤销，请确认是否继续。</span></p></div>}
+          {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>{topic.status === 'CLAIMED'
+            ? `分享人 ${topic.presenter ?? ''} 已认领；议题内容和分享人署名都会永久移除，系统不会自动通知分享人。若只是不再分享，请取消并选择“重新开放”。`
+            : '删除只适用于误建或重复议题。议题内容将永久移除，此操作不可撤销。'}</span></p></div>}
           {kind === 'release' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>分享人署名会被清空，议题内容继续保留。</span></p></div>}
           {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>{endedReset ? '该操作会清空旧报名、排期、地点与会议入口；分享人和议题内容保留，随后可重新排期。' : '日历事件与现有报名会被移除，分享人和议题内容继续保留。'}</span></p></div>}
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
           {revisionConflict && <div ref={revisionConflictRef} className="form-error" role="alert" tabIndex={-1}>{revisionConflict}</div>}
           {error && <div className="form-error" role="alert">{error}</div>}
-          <button ref={kind === 'edit' ? editSubmitRef : undefined} className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
-            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? endedReset ? '确认未举行 / 重新排期' : '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? revisionConflict ? '基于最新版再次保存' : '保存修改' : '确认删除'}
+          {kind === 'delete' ? <div className="delete-actions">
+            <button type="button" className="btn" data-initial-focus onClick={closeModal} disabled={submitting}>取消</button>
+            <button className="submit-btn delete-submit" disabled={submitting} type="submit">
+              {submitting ? '正在永久删除…' : '确认永久删除'}
+              {!submitting && <ChevronRight size={17} />}
+            </button>
+          </div> : <button ref={kind === 'edit' ? editSubmitRef : undefined} className="submit-btn" disabled={submitting} type="submit">
+            {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? endedReset ? '确认未举行 / 重新排期' : '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : revisionConflict ? '基于最新版再次保存' : '保存修改'}
             {!submitting && <ChevronRight size={17} />}
-          </button>
+          </button>}
         </form>
       </div>
     </div>
@@ -1664,15 +1689,28 @@ export default function App() {
       }
     }
   }, [mergeTopic]);
-  async function complete(message: string) {
+  async function complete(message: string, kind?: ModalKind) {
     setModal(null);
     setToast(message);
     await load();
+    if (kind === 'delete') scheduleDestinationFocus('#topics h2');
   }
-  async function resolveConflict(message: string) {
+  async function resolveConflict(message: string, kind?: ModalKind, topicId?: number, topicMissing = false) {
     setModal(null);
     setToast(`${message}，已同步最新状态`);
     await load();
+    if (kind === 'delete' && topicId) {
+      if (topicMissing) {
+        scheduleDestinationFocus('#topics h2');
+        return;
+      }
+      scheduleDestinationFocus(`[data-delete-topic-id="${topicId}"]`);
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        if (!document.querySelector(`[data-delete-topic-id="${topicId}"]`)) {
+          focusDestination(`[data-topic-id="${topicId}"]`);
+        }
+      }));
+    }
   }
   async function resolveParticipantConflict(message: string) {
     const changedId = participantsTopic?.id;
@@ -1969,7 +2007,7 @@ export default function App() {
 
     {mobileNavOpen && <MobileNavigation active={activeDestination} onClose={() => setMobileNavOpen(false)} onNavigate={navigate} accessReady={accessReady} accessEnabled={accessEnabled} canCollaborate={canCollaborate} onAccess={() => { setMobileNavOpen(false); window.requestAnimationFrame(openAccess); }} />}
     {activityTopic && <ActivityDetailsModal topic={activityTopic} onClose={() => setActivityTopic(null)} onTopicSync={mergeTopic} onPageSync={() => void load()} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onAction={openAction} now={now} />}
-    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message)} onConflict={(message) => void resolveConflict(message)} now={now} />}
+    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message, modal.kind)} onConflict={(message, topicMissing) => void resolveConflict(message, modal.kind, modal.topic?.id, topicMissing)} now={now} />}
     {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} now={now} />}
     {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} onSync={() => void load()} />}
     {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} onConflict={(message) => void resolveMeetingConflict(message)} unlockVersion={unlockVersion} now={now} />}

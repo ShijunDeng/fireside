@@ -91,6 +91,7 @@ type AppOptions = {
   };
   beforeTopicUpdate?: () => Promise<void>;
   afterTopicRowsRead?: () => Promise<void>;
+  afterTopicDeleteCommit?: () => Promise<void>;
   businessWritesAllowed?: () => boolean;
   releaseCommit?: string;
 };
@@ -119,7 +120,7 @@ export function buildApp(options: AppOptions = {}) {
   const expectedRevisions = new WeakMap<FastifyRequest, number>();
   const validatedSessions = new WeakMap<FastifyRequest, { expiresAt: string }>();
   const readOrderVersion = () => (db.prepare('SELECT version FROM topic_order_state WHERE id = 1').get() as { version: number }).version;
-  const bumpOrderVersion = () => db.prepare('UPDATE topic_order_state SET version = version + 1 WHERE id = 1').run();
+  const bumpOrderVersion = () => (db.prepare('UPDATE topic_order_state SET version = version + 1 WHERE id = 1 RETURNING version').get() as { version: number }).version;
   const setPositions = (orderedIds: number[]) => {
     const update = db.prepare('UPDATE topics SET position = ? WHERE id = ?');
     orderedIds.forEach((id, index) => update.run(-(index + 1), id));
@@ -401,21 +402,80 @@ export function buildApp(options: AppOptions = {}) {
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const revision = expectedRevision(request);
     const outcome = db.transaction(() => {
-      const result = db.prepare('DELETE FROM topics WHERE id = ? AND revision = ?').run(params.data.id, revision);
-      if (result.changes === 0) {
-        const latest = db.prepare('SELECT revision FROM topics WHERE id = ?').get(params.data.id) as { revision: number } | undefined;
-        return latest ? { status: 'conflict' as const, currentRevision: latest.revision } : { status: 'missing' as const };
+      const current = db.prepare(`
+        SELECT revision, status, scheduled_at, duration, room, meeting_url,
+          takeaway, material_url, archived_at,
+          (SELECT COUNT(*) FROM topic_participants WHERE topic_id = topics.id) AS participant_count
+        FROM topics WHERE id = ?
+      `).get(params.data.id) as {
+        revision: number;
+        status: 'OPEN' | 'CLAIMED' | 'SCHEDULED' | 'ARCHIVED';
+        scheduled_at: string | null;
+        duration: number | null;
+        room: string | null;
+        meeting_url: string | null;
+        takeaway: string | null;
+        material_url: string | null;
+        archived_at: string | null;
+        participant_count: number;
+      } | undefined;
+      if (!current) return { status: 'missing' as const };
+      if (current.revision !== revision) {
+        return { status: 'conflict' as const, currentRevision: current.revision };
+      }
+      const hasMatureDependency = current.scheduled_at !== null
+        || current.duration !== null
+        || current.room !== null
+        || current.meeting_url !== null
+        || current.takeaway !== null
+        || current.material_url !== null
+        || current.archived_at !== null
+        || current.participant_count > 0;
+      if (!['OPEN', 'CLAIMED'].includes(current.status) || hasMatureDependency) {
+        return {
+          status: 'state-conflict' as const,
+          currentRevision: current.revision,
+          currentStatus: current.status,
+        };
+      }
+      const result = db.prepare(`
+        DELETE FROM topics
+        WHERE id = ? AND revision = ? AND status IN ('OPEN', 'CLAIMED')
+          AND scheduled_at IS NULL AND duration IS NULL AND room IS NULL
+          AND meeting_url IS NULL AND takeaway IS NULL AND material_url IS NULL
+          AND archived_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM topic_participants WHERE topic_id = topics.id)
+      `).run(params.data.id, revision);
+      if (result.changes !== 1) {
+        return {
+          status: 'state-conflict' as const,
+          currentRevision: current.revision,
+          currentStatus: current.status,
+        };
       }
       const remainingIds = (db.prepare('SELECT id FROM topics ORDER BY position ASC, id ASC').all() as { id: number }[]).map(({ id }) => id);
       setPositions(remainingIds);
-      bumpOrderVersion();
-      return { status: 'deleted' as const };
+      return { status: 'deleted' as const, orderVersion: bumpOrderVersion() };
     }).immediate();
     if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
     if (outcome.status === 'conflict') {
       return reply.code(412).send({ code: 'TOPIC_REVISION_CONFLICT', message: '议题已被其他协作者更新，本次未删除', currentRevision: outcome.currentRevision });
     }
-    reply.header('X-Order-Version', String(readOrderVersion()));
+    if (outcome.status === 'state-conflict') {
+      const message = outcome.currentStatus === 'ARCHIVED'
+        ? '归档记录不能直接删除；如为误归档，请先撤销归档'
+        : outcome.currentStatus === 'SCHEDULED'
+          ? '已排期议题不能直接删除，请先按活动实际情况取消排期或标记未举行'
+          : '这个议题包含排期、报名或归档信息，不能直接永久删除';
+      return reply.code(409).send({
+        code: 'TOPIC_DELETE_STATE_CONFLICT',
+        message,
+        currentRevision: outcome.currentRevision,
+        currentStatus: outcome.currentStatus,
+      });
+    }
+    await options.afterTopicDeleteCommit?.();
+    reply.header('X-Order-Version', String(outcome.orderVersion));
     return reply.code(204).send();
   });
 
@@ -430,8 +490,7 @@ export function buildApp(options: AppOptions = {}) {
         return { status: 'invalid' as const, version: currentVersion };
       }
       setPositions(body.data.orderedIds);
-      bumpOrderVersion();
-      return { status: 'ok' as const, version: currentVersion + 1 };
+      return { status: 'ok' as const, version: bumpOrderVersion() };
     }).immediate();
     reply.header('X-Order-Version', String(outcome.version));
     if (outcome.status === 'conflict') {

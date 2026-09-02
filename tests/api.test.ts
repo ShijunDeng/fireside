@@ -15,6 +15,24 @@ const readTopic = async (instance: FastifyInstance, id: number) => {
   return response.json() as { id: number; revision: number; [key: string]: unknown };
 };
 
+const deleteTopicThroughLifecycle = async (instance: FastifyInstance, id: number) => {
+  let topic = await readTopic(instance, id) as { id: number; revision: number; status: string; [key: string]: unknown };
+  if (topic.status === 'ARCHIVED') {
+    const unarchived = await instance.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(topic.revision), payload: {} });
+    assert.equal(unarchived.statusCode, 200);
+    topic = unarchived.json();
+  }
+  if (topic.status === 'SCHEDULED') {
+    const unscheduled = await instance.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(topic.revision), payload: {} });
+    assert.equal(unscheduled.statusCode, 200);
+    topic = unscheduled.json();
+  }
+  assert.ok(topic.status === 'OPEN' || topic.status === 'CLAIMED');
+  const deleted = await instance.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(topic.revision) });
+  assert.equal(deleted.statusCode, 204);
+  return deleted;
+};
+
 const issueSession = async (instance: FastifyInstance, writeKey: string, remoteAddress = '127.0.0.1') => {
   const response = await instance.inject({
     method: 'POST',
@@ -1000,7 +1018,7 @@ describe('围炉夜话 API', () => {
       assert.equal(response.statusCode, 400, room);
       assert.equal(response.json().code, 'SENSITIVE_ROOM_CONTENT', room);
     }
-    await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(revision) });
+    await deleteTopicThroughLifecycle(app, id);
   });
 
   it('拒绝缺少关键信息的议题', async () => {
@@ -1039,6 +1057,249 @@ describe('围炉夜话 API', () => {
     assert.equal(duplicate.statusCode, 404);
     const topics = await app.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(topics.json().some((topic: { id: number }) => topic.id === id), false);
+  });
+
+  it('只允许早期议题永久删除，并让成熟状态沿真实生命周期回退', async () => {
+    appNow = new Date('2026-09-02T10:00:00.000Z');
+    const open = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '误建的开放议题', summary: '只用于验证早期永久删除。', proposer: '协调者', tags: [] },
+    });
+    const claimed = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '误建的准备议题', summary: '认领署名会随议题删除。', proposer: '协调者', presenter: '分享者', tags: [] },
+    });
+    const beforeEarlyDeletes = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeEarlyTopics = beforeEarlyDeletes.json() as { id: number; revision: number; updatedAt: string }[];
+    const earlyVersion = Number(beforeEarlyDeletes.headers['x-order-version']);
+    const deletedOpen = await app.inject({ method: 'DELETE', url: `/api/topics/${open.json().id}`, headers: ifMatch(open.json().revision) });
+    assert.equal(deletedOpen.statusCode, 204);
+    assert.equal(Number(deletedOpen.headers['x-order-version']), earlyVersion + 1);
+    const deletedClaimed = await app.inject({ method: 'DELETE', url: `/api/topics/${claimed.json().id}`, headers: ifMatch(claimed.json().revision) });
+    assert.equal(deletedClaimed.statusCode, 204);
+    assert.equal(Number(deletedClaimed.headers['x-order-version']), earlyVersion + 2);
+    const afterEarlyDeletes = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.deepEqual((afterEarlyDeletes.json() as { position: number }[]).map(({ position }) => position),
+      Array.from({ length: afterEarlyDeletes.json().length }, (_, index) => index + 1));
+    const removedIds = new Set([open.json().id, claimed.json().id]);
+    assert.deepEqual(
+      (afterEarlyDeletes.json() as { id: number; revision: number; updatedAt: string }[]).map(({ id, revision, updatedAt }) => ({ id, revision, updatedAt })),
+      beforeEarlyTopics.filter(({ id }) => !removedIds.has(id)).map(({ id, revision, updatedAt }) => ({ id, revision, updatedAt })),
+    );
+
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '成熟议题删除保护', summary: '排期、报名和沉淀不能被一步抹掉。', proposer: '协调者', presenter: '分享者', tags: ['保护'] },
+    });
+    const id = created.json().id as number;
+    const scheduledAt = new Date(appNow.getTime() + 60 * 60_000).toISOString();
+    const scheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: ifMatch(created.json().revision),
+      payload: { scheduledAt, duration: 40, room: '成熟状态会议室', meetingUrl: 'https://meet.example.test/protected' },
+    });
+    const joined = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '报名伙伴' } });
+    assert.equal(joined.statusCode, 201);
+    const scheduledLatest = await readTopic(app, id);
+    assert.equal(scheduledLatest.revision, scheduled.json().revision + 1);
+    const rejectDeleteWithoutMutation = async (requestRevision: number, expectedStatus: 409 | 412) => {
+      const beforeTopic = await app.inject({ method: 'GET', url: `/api/topics/${id}` });
+      const beforeList = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+      const beforeParticipants = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+      const response = await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(requestRevision) });
+      assert.equal(response.statusCode, expectedStatus);
+      const afterTopic = await app.inject({ method: 'GET', url: `/api/topics/${id}` });
+      const afterList = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+      const afterParticipants = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+      assert.equal(afterTopic.body, beforeTopic.body);
+      assert.equal(afterList.body, beforeList.body);
+      assert.equal(afterList.headers['x-order-version'], beforeList.headers['x-order-version']);
+      assert.equal(afterParticipants.body, beforeParticipants.body);
+      return response;
+    };
+
+    const staleDelete = await rejectDeleteWithoutMutation(scheduled.json().revision, 412);
+    assert.equal(staleDelete.statusCode, 412);
+    assert.equal(staleDelete.json().currentRevision, scheduledLatest.revision);
+    const upcomingDelete = await rejectDeleteWithoutMutation(scheduledLatest.revision, 409);
+    assert.deepEqual(upcomingDelete.json(), {
+      code: 'TOPIC_DELETE_STATE_CONFLICT',
+      message: '已排期议题不能直接删除，请先按活动实际情况取消排期或标记未举行',
+      currentRevision: scheduledLatest.revision,
+      currentStatus: 'SCHEDULED',
+    });
+
+    appNow = new Date(new Date(scheduledAt).getTime() + 60_000);
+    await rejectDeleteWithoutMutation(scheduledLatest.revision, 409);
+    const liveUnschedule = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(scheduledLatest.revision), payload: {} });
+    assert.equal(liveUnschedule.statusCode, 409);
+    assert.equal(liveUnschedule.json().phase, 'LIVE');
+
+    appNow = new Date(new Date(scheduledAt).getTime() + 40 * 60_000);
+    await rejectDeleteWithoutMutation(scheduledLatest.revision, 409);
+    const archived = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/archive`, headers: ifMatch(scheduledLatest.revision),
+      payload: { takeaway: '报名伙伴与沉淀都必须保留。', materialUrl: 'https://example.test/material' },
+    });
+    assert.equal(archived.statusCode, 200);
+    const archivedDelete = await rejectDeleteWithoutMutation(archived.json().revision, 409);
+    assert.equal(archivedDelete.json().code, 'TOPIC_DELETE_STATE_CONFLICT');
+    assert.equal(archivedDelete.json().currentStatus, 'ARCHIVED');
+    const retainedArchive = await readTopic(app, id);
+    assert.equal(retainedArchive.takeaway, '报名伙伴与沉淀都必须保留。');
+    assert.equal(retainedArchive.materialUrl, 'https://example.test/material');
+    assert.equal(retainedArchive.participantCount, 1);
+    assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['报名伙伴']);
+    const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(archived.json().revision), payload: {} });
+    assert.equal(unarchived.statusCode, 200);
+    await rejectDeleteWithoutMutation(unarchived.json().revision, 409);
+    const reset = await app.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(unarchived.json().revision), payload: {} });
+    assert.equal(reset.statusCode, 200);
+    assert.equal(reset.json().status, 'CLAIMED');
+    assert.equal(reset.json().participantCount, 0);
+    const deletedAfterReset = await app.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(reset.json().revision) });
+    assert.equal(deletedAfterReset.statusCode, 204);
+  });
+
+  it('拒绝带成熟依赖的异常早期议题且不级联清理', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-abnormal-delete-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const abnormalApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await abnormalApp.ready();
+    const directDb = new Database(databasePath);
+    const dependencies = [
+      ['scheduled_at', '2026-09-03T10:00:00.000Z'],
+      ['duration', 40],
+      ['room', '异常残留会议室'],
+      ['meeting_url', 'https://meet.example.test/abnormal-hidden'],
+      ['takeaway', '异常残留收获'],
+      ['material_url', 'https://example.test/abnormal-material'],
+      ['archived_at', '2026-09-02T10:00:00.000Z'],
+    ] as const;
+    const abnormalTopics: { id: number; revision: number; column: string }[] = [];
+    for (const [column, value] of dependencies) {
+      const created = await abnormalApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title: `异常准备中-${column}`, summary: '状态早期但意外残留成熟字段。', proposer: '协调者', presenter: '分享者', tags: [] },
+      });
+      const id = created.json().id as number;
+      directDb.prepare(`UPDATE topics SET ${column} = ? WHERE id = ?`).run(value, id);
+      abnormalTopics.push({ id, revision: created.json().revision, column });
+    }
+    const participantTopic = await abnormalApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '异常准备中-participant', summary: '状态早期但意外残留报名。', proposer: '协调者', presenter: '分享者', tags: [] },
+    });
+    const participantId = participantTopic.json().id as number;
+    directDb.prepare('INSERT INTO topic_participants (topic_id, name, normalized_name, created_at) VALUES (?, ?, ?, ?)')
+      .run(participantId, '残留伙伴', '残留伙伴', new Date().toISOString());
+    directDb.close();
+    const before = await abnormalApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeVersion = before.headers['x-order-version'];
+    assert.equal((before.json() as { id: number; participantCount: number }[]).find(({ id }) => id === participantId)?.participantCount, 1);
+    const meetingTopic = (before.json() as { id: number; hasMeetingUrl: boolean; meetingUrl: string | null }[])
+      .find(({ id }) => id === abnormalTopics.find(({ column }) => column === 'meeting_url')!.id)!;
+    assert.equal(meetingTopic.hasMeetingUrl, true);
+    assert.equal(meetingTopic.meetingUrl, null);
+
+    for (const topic of abnormalTopics) {
+      const rejected = await abnormalApp.inject({ method: 'DELETE', url: `/api/topics/${topic.id}`, headers: ifMatch(topic.revision) });
+      assert.equal(rejected.statusCode, 409, topic.column);
+      assert.equal(rejected.json().code, 'TOPIC_DELETE_STATE_CONFLICT', topic.column);
+      assert.equal(rejected.json().currentStatus, 'CLAIMED', topic.column);
+    }
+    const participantRejected = await abnormalApp.inject({
+      method: 'DELETE', url: `/api/topics/${participantId}`, headers: ifMatch(participantTopic.json().revision),
+    });
+    assert.equal(participantRejected.statusCode, 409);
+    const after = await abnormalApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(after.headers['x-order-version'], beforeVersion);
+    assert.equal(after.body, before.body);
+    assert.deepEqual((await abnormalApp.inject({ method: 'GET', url: `/api/topics/${participantId}/participants` })).json().map(({ name }: { name: string }) => name), ['残留伙伴']);
+
+    await abnormalApp.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('删除响应返回自身事务产生的精确排序版本', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-delete-order-version-'));
+    const databasePath = path.join(directory, 'shared.db');
+    let signalCommitted!: () => void;
+    let releaseResponse!: () => void;
+    const committed = new Promise<void>((resolve) => { signalCommitted = resolve; });
+    const responseReleased = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    const deletingApp = buildApp({
+      databasePath, seed: false, serveStatic: false,
+      afterTopicDeleteCommit: async () => { signalCommitted(); await responseReleased; },
+    });
+    await deletingApp.ready();
+    const writingApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await writingApp.ready();
+    const target = await writingApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '精确版本删除目标', summary: '响应暂停后发生另一笔成员变化。', proposer: '并发测试', tags: [] },
+    });
+    await writingApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '精确版本保留议题', summary: '用于保持列表非空。', proposer: '并发测试', tags: [] },
+    });
+    const before = await writingApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeVersion = Number(before.headers['x-order-version']);
+
+    const pendingDelete = deletingApp.inject({ method: 'DELETE', url: `/api/topics/${target.json().id}`, headers: ifMatch(target.json().revision) });
+    await committed;
+    const laterCreate = await writingApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '删除提交后的新成员', summary: '不得污染删除响应头。', proposer: '并发测试', tags: [] },
+    });
+    assert.equal(laterCreate.statusCode, 201);
+    releaseResponse();
+    const deleted = await pendingDelete;
+    assert.equal(deleted.statusCode, 204);
+    assert.equal(Number(deleted.headers['x-order-version']), beforeVersion + 1);
+    const latest = await writingApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(Number(latest.headers['x-order-version']), beforeVersion + 2);
+
+    await Promise.all([deletingApp.close(), writingApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('双连接读取后排期与报名会使陈旧删除 412 且最新版删除 409', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-delete-lifecycle-race-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const deletingApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await deletingApp.ready();
+    const lifecycleApp = buildApp({ databasePath, seed: false, serveStatic: false });
+    await lifecycleApp.ready();
+    const created = await lifecycleApp.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '双连接成熟状态竞态', summary: '读取确认后另一连接推进生命周期。', proposer: '协调者', presenter: '分享者', tags: [] },
+    });
+    const id = created.json().id as number;
+    const staleSnapshot = await readTopic(deletingApp, id);
+    const scheduled = await lifecycleApp.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: ifMatch(staleSnapshot.revision),
+      payload: { scheduledAt: new Date(Date.now() + 86_400_000).toISOString(), duration: 40, room: '双连接会议室', meetingUrl: '' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    const joined = await lifecycleApp.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '并发报名伙伴' } });
+    assert.equal(joined.statusCode, 201);
+
+    const staleDelete = await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(staleSnapshot.revision) });
+    assert.equal(staleDelete.statusCode, 412);
+    const latest = await readTopic(deletingApp, id);
+    assert.equal(staleDelete.json().currentRevision, latest.revision);
+    assert.equal(latest.status, 'SCHEDULED');
+    assert.equal(latest.participantCount, 1);
+    const freshDelete = await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(latest.revision) });
+    assert.equal(freshDelete.statusCode, 409);
+    assert.equal(freshDelete.json().code, 'TOPIC_DELETE_STATE_CONFLICT');
+    assert.deepEqual((await lifecycleApp.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['并发报名伙伴']);
+
+    const reset = await lifecycleApp.inject({ method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(latest.revision), payload: {} });
+    assert.equal(reset.statusCode, 200);
+    assert.equal((await deletingApp.inject({ method: 'DELETE', url: `/api/topics/${id}`, headers: ifMatch(reset.json().revision) })).statusCode, 204);
+    await Promise.all([deletingApp.close(), lifecycleApp.close()]);
+    await rm(directory, { recursive: true, force: true });
   });
 
   it('要求所有议题命令携带强 If-Match 并拒绝非法格式', async () => {
@@ -1287,10 +1548,7 @@ describe('数据库兼容性与并发', () => {
     await firstStart.ready();
     const seeded = await firstStart.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(seeded.json().length, 4);
-    for (const topic of seeded.json() as { id: number; revision: number }[]) {
-      const deleted = await firstStart.inject({ method: 'DELETE', url: `/api/topics/${topic.id}`, headers: ifMatch(topic.revision) });
-      assert.equal(deleted.statusCode, 204);
-    }
+    for (const topic of seeded.json() as { id: number }[]) await deleteTopicThroughLifecycle(firstStart, topic.id);
     await firstStart.close();
 
     const restarted = buildApp({ databasePath, seed: true, serveStatic: false });
