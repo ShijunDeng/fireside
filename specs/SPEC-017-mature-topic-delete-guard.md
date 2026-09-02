@@ -149,3 +149,4 @@
 - 150 项 `npm run check` 测试、TypeScript 与生产构建通过；API 36/36，覆盖七个成熟字段加参与记录的异常矩阵、完整零副作用快照、剩余顺序/revision/updatedAt、精确排序版本及双连接 `读取 → 排期/报名 → 412 → 409`。
 - 桌面 Chrome 与 Pixel 7 在 `--retries=0` 下 76 项通过，4 项按设备职责跳过；覆盖删除状态矩阵、合法回退、活动详情无删除、409/404、极限布局、Esc/遮罩、44px 控件与焦点恢复。
 - 生命周期、API 和 UX 三路独立复审最终均为 clean，无发布阻断。
+- 实现提交 `4480475` 已通过不可变候选安装并受控提升；生产 `current=4480475`、`previous=33fc1bf`、journal clean，socket/service 均 active 且监听 `0.0.0.0:80`。本机与公网 health、首页以及版本化 `fireside` 口令验证均为 200，近十分钟服务日志无 warning。
