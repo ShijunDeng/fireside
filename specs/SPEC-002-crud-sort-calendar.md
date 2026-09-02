@@ -31,6 +31,7 @@
 - 任意状态的议题均可修改标题、简介、发起人与标签。
 - 非 `OPEN` 议题可修改分享人。
 - `SCHEDULED` 与 `ARCHIVED` 可修改时间、时长和地点。
+- `ARCHIVED` 的历史时间纠错必须满足活动结束不晚于该次 `archivedAt`，完整门禁见 SPEC-033。
 - `SCHEDULED` 与 `ARCHIVED` 可修改独立的 http/https 会议链接；旧 room URL 按 SPEC-004 兼容读取。
 - `ARCHIVED` 可修改收获摘要和资料链接。
 - 更新不得绕过 SPEC-001 的状态机。

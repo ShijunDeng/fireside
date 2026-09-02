@@ -10,3 +10,13 @@ coverage/
 test-results/
 playwright-report/
 blob-report/
+
+# TLS private keys and operator-provided certificate material must stay outside Git.
+*.key
+*.pem
+*.crt
+*.cer
+*.csr
+*.cir
+*.p12
+*.pfx

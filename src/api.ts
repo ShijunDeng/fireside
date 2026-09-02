@@ -1,5 +1,22 @@
 import type { ActivityPhase, Participant, Stats, Topic, TopicSort } from './types';
 
+export type ScheduleConflict = Pick<Topic, 'id' | 'title' | 'scheduledAt' | 'duration'> & {
+  scheduledAt: string;
+  duration: number;
+};
+
+export type ParticipantMutation<T = void> = {
+  result: T;
+  topicRevision: number;
+  participantCount: number;
+};
+
+export type ParticipantRead = {
+  participants: Participant[];
+  topicRevision: number;
+  participantCount: number;
+};
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -7,6 +24,7 @@ export class ApiError extends Error {
     public code?: string,
     public phase?: ActivityPhase,
     public retryAfter?: number,
+    public conflicts?: ScheduleConflict[],
   ) {
     super(message);
   }
@@ -45,6 +63,7 @@ async function readBody<T>(response: Response, notifyUnauthorized = true): Promi
     code?: string;
     phase?: ActivityPhase;
     retryAfterSeconds?: number;
+    conflicts?: ScheduleConflict[];
   };
   if (!response.ok) {
     if (response.status === 401 && body.code === 'ACCESS_SESSION_REQUIRED' && notifyUnauthorized) {
@@ -56,7 +75,7 @@ async function readBody<T>(response: Response, notifyUnauthorized = true): Promi
     const retryAfter = Number.isFinite(retryAfterCandidate) && retryAfterCandidate > 0
       ? Math.ceil(retryAfterCandidate)
       : undefined;
-    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code, body.phase, retryAfter);
+    throw new ApiError(body.message ?? '请求失败，请稍后再试', response.status, body.code, body.phase, retryAfter, body.conflicts);
   }
   return body as T;
 }
@@ -73,6 +92,32 @@ async function request<T>(url: string, options?: RequestInit, requiresAccess = o
     headers,
   });
   return readBody<T>(response);
+}
+
+async function participantMutationRequest<T>(url: string, options: RequestInit): Promise<ParticipantMutation<T>> {
+  const headers = new Headers(options.headers);
+  if (options.body) headers.set('Content-Type', 'application/json');
+  const session = getCollaborationSession();
+  if (session) headers.set('X-Fireside-Session', session);
+  const response = await fetch(url, { ...options, headers });
+  const result = await readBody<T>(response);
+  const projection = participantProjectionHeaders(response);
+  if (!projection) {
+    throw new ApiError('报名已经提交，但服务器未返回完整同步版本；请刷新页面确认结果', 502, 'INVALID_PARTICIPANT_MUTATION_METADATA');
+  }
+  return { result, ...projection };
+}
+
+function participantProjectionHeaders(response: Response) {
+  const revisionMatch = response.headers.get('ETag')?.match(/^"([1-9]\d*)"$/);
+  const participantCountText = response.headers.get('X-Fireside-Participant-Count');
+  const topicRevision = revisionMatch ? Number(revisionMatch[1]) : Number.NaN;
+  const participantCount = participantCountText !== null && /^(0|[1-9]\d*)$/.test(participantCountText)
+    ? Number(participantCountText)
+    : Number.NaN;
+  return Number.isSafeInteger(topicRevision) && Number.isSafeInteger(participantCount)
+    ? { topicRevision, participantCount }
+    : null;
 }
 
 function revisionHeaders(revision: number) {
@@ -142,8 +187,32 @@ export const api = {
   archive: (id: number, revision: number, data: { takeaway: string; materialUrl: string }) =>
     request<Topic>(`/api/topics/${id}/archive`, { method: 'POST', headers: revisionHeaders(revision), body: JSON.stringify(data) }),
   unarchive: (id: number, revision: number) => request<Topic>(`/api/topics/${id}/unarchive`, { method: 'POST', headers: revisionHeaders(revision), body: JSON.stringify({}) }),
-  meetingAccess: (id: number) => request<{ meetingUrl: string }>(`/api/topics/${id}/meeting-access`, undefined, true),
-  participants: (id: number) => request<Participant[]>(`/api/topics/${id}/participants`, undefined, true),
-  join: (id: number, name: string) => request<Participant>(`/api/topics/${id}/participants`, { method: 'POST', body: JSON.stringify({ name }) }),
-  leave: (id: number, participantId: number) => request<void>(`/api/topics/${id}/participants/${participantId}`, { method: 'DELETE' }),
+  meetingAccess: async (id: number) => {
+    const headers = new Headers();
+    const session = getCollaborationSession();
+    if (session) headers.set('X-Fireside-Session', session);
+    const response = await fetch(`/api/topics/${id}/meeting-access`, { headers, cache: 'no-store' });
+    const result = await readBody<{ meetingUrl: string }>(response);
+    const revisionMatch = response.headers.get('ETag')?.match(/^"([1-9]\d*)"$/);
+    const topicRevision = revisionMatch ? Number(revisionMatch[1]) : Number.NaN;
+    if (!Number.isSafeInteger(topicRevision)) {
+      throw new ApiError('会议入口已读取，但服务器未返回一致的议题版本；请重新读取会议入口', 502, 'INVALID_MEETING_ACCESS_METADATA');
+    }
+    return { ...result, topicRevision };
+  },
+  unscheduleImpact: (id: number) => request<{ topic: Topic; participants: Participant[] }>(`/api/topics/${id}/unschedule-impact`, undefined, true),
+  participants: async (id: number): Promise<ParticipantRead> => {
+    const headers = new Headers();
+    const session = getCollaborationSession();
+    if (session) headers.set('X-Fireside-Session', session);
+    const response = await fetch(`/api/topics/${id}/participants`, { headers, cache: 'no-store' });
+    const participants = await readBody<Participant[]>(response);
+    const projection = participantProjectionHeaders(response);
+    if (!projection || projection.participantCount !== participants.length) {
+      throw new ApiError('名单已读取，但服务器未返回一致的议题版本；请重新读取名单', 502, 'INVALID_PARTICIPANT_READ_METADATA');
+    }
+    return { participants, ...projection };
+  },
+  join: (id: number, name: string) => participantMutationRequest<Participant>(`/api/topics/${id}/participants`, { method: 'POST', body: JSON.stringify({ name }) }),
+  leave: (id: number, participantId: number) => participantMutationRequest<void>(`/api/topics/${id}/participants/${participantId}`, { method: 'DELETE' }),
 };

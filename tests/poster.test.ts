@@ -7,6 +7,7 @@ import {
   isPosterEligible,
   posterFilename,
   posterLocation,
+  posterProgramLabel,
   sanitizePosterText,
   wrapPosterText,
 } from '../src/poster';
@@ -49,11 +50,36 @@ describe('宣讲海报模型', () => {
 
   it('按北京时间生成日期、时间与文件名', () => {
     const model = buildPosterModel(topic(), 'https://fireside.test/', new Date('2026-09-01T00:00:00.000Z'));
+    assert.equal(model.topicId, 1);
     assert.equal(model.dateKey, '20260902');
+    assert.equal(model.timeKey, '0030');
     assert.match(model.date, /2026年9月2日.*星期三/);
     assert.equal(model.time, '00:30 北京时间');
+    assert.equal(model.programLabel, '即将开讲');
     assert.equal(model.source, 'fireside.test');
-    assert.match(model.filename, /^围炉夜话-20260902-/);
+    assert.equal(model.filename, '围炉夜话-20260902-0030-1-把好奇举成一支火炬.png');
+  });
+
+  it('只在已确认的同日多场上下文显示稳定场次', () => {
+    const now = new Date('2026-09-01T00:00:00.000Z');
+    const single = buildPosterModel(topic({ id: 23 }), 'https://fireside.test', now, { position: 1, total: 1 });
+    assert.equal(single.programLabel, '即将开讲');
+    assert.equal(single.topicId, 23);
+
+    const program = buildPosterModel(topic({ id: 23 }), 'https://fireside.test', now, { position: 2, total: 4 });
+    assert.equal(program.programLabel, '当日第 2 / 4 场');
+    assert.equal(program.topicId, 23);
+    assert.equal(program.filename, '围炉夜话-20260902-0030-23-把好奇举成一支火炬.png');
+
+    for (const context of [
+      undefined,
+      { position: 0, total: 4 },
+      { position: 5, total: 4 },
+      { position: 1.5, total: 4 },
+      { position: 1, total: Number.POSITIVE_INFINITY },
+    ]) {
+      assert.equal(posterProgramLabel(context), '即将开讲');
+    }
   });
 
   it('所有可绘制用户字段都会移除链接与明显会议凭证', () => {
@@ -125,7 +151,7 @@ describe('宣讲海报模型', () => {
       '标题火炬', 'summaryOmega', '分享密语', '111', '222', '333', 'tagPin', '444', '555', '666', 'secret.test', 'urlSecret',
     ]) assert.equal(rendered.includes(secret), false, secret);
 
-    const filename = posterFilename('20260902', '会议号：777 888 999 pwd=filenameSecret');
+    const filename = posterFilename('20260902', '0030', 17, '会议号：777 888 999 pwd=filenameSecret');
     for (const secret of ['777', '888', '999', 'filenameSecret']) assert.equal(filename.includes(secret), false, secret);
   });
 
@@ -147,6 +173,8 @@ describe('宣讲海报模型', () => {
 
     const filename = posterFilename(
       '20260902',
+      '0030',
+      17,
       '宣讲 入会码（文件火炬） https://meet.example/join/(filename-room)?pwd=filenameSecret',
     );
     for (const secret of ['文件火炬', 'meet.example', 'filename-room', 'filenameSecret']) {
@@ -199,6 +227,12 @@ describe('宣讲海报模型', () => {
       assert.ok(bottom(layout.tagRegion) + 20 <= layout.footer.y, failureContext);
       assert.ok(bottom(layout.footer) <= 1440, failureContext);
       assert.ok(measure(25, layout.presenterText) <= layout.presenterMaxWidth, failureContext);
+      assert.equal(layout.program.labelText, '即将开讲', failureContext);
+      assert.equal(layout.program.topicText, '议题 #001', failureContext);
+      assert.ok(
+        measure(layout.program.labelFontSize, layout.program.labelText) <= layout.program.labelMaxWidth,
+        failureContext,
+      );
 
       assert.equal(layout.tags.length, 5, failureContext);
       for (const [index, tag] of layout.tags.entries()) {
@@ -217,9 +251,36 @@ describe('宣讲海报模型', () => {
     assert.deepEqual(Object.fromEntries(observedRegressionSizes), { 45: 72, 55: 64, 60: 64 });
   });
 
+  it('三位数同日场次徽标和 Topic 编号都保持在画布预算内', () => {
+    const measure = (fontSize: number, value: string) => Array.from(value).length * fontSize;
+    const model = buildPosterModel(
+      topic({ id: 123 }),
+      'https://fireside.test',
+      new Date('2026-09-01T00:00:00.000Z'),
+      { position: 123, total: 144 },
+    );
+    const layout = buildPosterLayout(model, measure);
+    assert.equal(layout.program.labelText, '当日第 123 / 144 场');
+    assert.doesNotMatch(layout.program.labelText, /…/);
+    assert.ok(measure(layout.program.labelFontSize, layout.program.labelText) <= layout.program.labelMaxWidth);
+    assert.equal(layout.program.topicText, '议题 #123');
+    assert.ok(layout.program.bounds.y + layout.program.bounds.height < layout.title.bounds.y);
+  });
+
+  it('同日同名海报以北京时间时分和 Topic ID 保持唯一', () => {
+    const first = buildPosterModel(topic({ id: 8 }), 'https://fireside.test', new Date('2026-09-01T00:00:00.000Z'));
+    const second = buildPosterModel(topic({ id: 9 }), 'https://fireside.test', new Date('2026-09-01T00:00:00.000Z'));
+    const later = buildPosterModel(topic({ id: 8, scheduledAt: '2026-09-01T17:30:00.000Z' }), 'https://fireside.test', new Date('2026-09-01T00:00:00.000Z'));
+    assert.notEqual(first.filename, second.filename);
+    assert.notEqual(first.filename, later.filename);
+    assert.match(first.filename, /^围炉夜话-20260902-0030-8-/);
+    assert.match(second.filename, /^围炉夜话-20260902-0030-9-/);
+    assert.match(later.filename, /^围炉夜话-20260902-0130-8-/);
+  });
+
   it('下载文件名移除系统非法字符并限制长度', () => {
-    const filename = posterFilename('20260902', 'A/B:C*D?E"F<G>H|I\u0001'.repeat(10));
+    const filename = posterFilename('20260902', '0030', 17, 'A/B:C*D?E"F<G>H|I\u0001'.repeat(10));
     assert.doesNotMatch(filename, /[\\/:*?"<>|\u0000-\u001f]/);
-    assert.ok(Array.from(filename.replace(/^围炉夜话-20260902-/, '').replace(/\.png$/, '')).length <= 36);
+    assert.ok(Array.from(filename.replace(/^围炉夜话-20260902-0030-17-/, '').replace(/\.png$/, '')).length <= 36);
   });
 });

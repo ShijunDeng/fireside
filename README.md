@@ -6,15 +6,15 @@
 
 - 创建议题：记录标题、简介、发起人与标签
 - 认领议题：分享人接过火炬，进入准备阶段
-- 议题排期：设置日期、时间、分享时长和地点
+- 议题排期：设置北京时间、分享时长和地点；单轨活动原子拒绝时间重叠，同日可首尾相接联场
 - 议题归档：沉淀核心收获与外部资料链接
 - 围炉报名：排期后报名、查看或取消参与，结束后保留只读名单
 - 线上会议：公开页面隐藏真实入口，协作会话解锁后才能加入
-- 宣讲海报：未来排期一键生成脱敏的 1080×1440 PNG，可下载或系统分享
+- 宣讲海报：未来排期一键生成脱敏的 1080×1440 PNG；同日多场标明第 N/M 场、时间与 Topic ID
 - 完整管理：编辑各状态允许的字段；仅误建/重复的待认领或准备中议题可二次确认永久删除
 - 流程纠错：支持退出认领、取消排期、未举行后重新排期和撤销归档
 - 灵活排序：手动拖拽、上移/下移，以及按创建、排期和状态排序
-- 日历规划：列表、月历和周历三种视图，点击事件直接编辑
+- 日历规划：列表、月历和周历三种视图；每日有界预览三场，更多场次进入完整当日日程
 - 议题广场：按状态筛选，支持全文搜索
 - 数据看板：展示待认领、已排期和已归档数据
 - 协作保护：共享口令只用于换取 8 小时当前标签页会话，验证带来源/全局限流
@@ -93,7 +93,57 @@ npm run test:e2e
 
 生产环境不从 Git 工作树运行，也不使用 npm、tsx 或 esbuild 启动服务。构建产物安装到版本化的只读 release，Node 由固定的 `fireside` 系统账户直接运行；`fireside.socket` 由 systemd 持有公网 80 端口并把名为 `fireside` 的 fd 3 交给应用。
 
-### 首次准备
+HTTPS 使用独立的 `fireside-https.service` 和完整 Nginx 主配置，只监听 443 并反向代理到回环 80；不会加载系统默认站点，也不会替代或重定向现有 HTTP。证书链与私钥分别安装为 `/etc/fireside-tls/fullchain.pem`（0644）和 `/etc/fireside-tls/privkey.pem`（0600），不得提交 Git。详细边界、验收和 DNS 前置条件见 [SPEC-020](./specs/SPEC-020-https-edge.md)。
+
+### 主机安装器（首次安装主路径）
+
+安装与部署分为两个固定入口：`fireside-host-install` 只准备账户、目录、控制器、systemd 与 HTTPS 布局；`fireside-release` 只安装、提升和回滚已经提交到 GitHub `main` 的业务 commit。两者都从 root-owned `/usr/local` 运行，不以 root 执行工作树脚本。
+
+先由普通用户构建无敏感内容、带 manifest 的主机 bundle，再一次性复制到固定目录。以下 bootstrap 仅用于首次信任或经审阅的安装器升级；目标已存在时不要覆盖，应在维护窗口用同样流程创建新目录、核对 manifest 后原子替换：
+
+```bash
+host_bundle_parent=$(mktemp -d)
+node ops/host-installer/build-bundle.mjs --output "${host_bundle_parent}/bundle"
+sudo test ! -e /usr/local/libexec/fireside-host-installer
+sudo cp -a -- "${host_bundle_parent}/bundle" /usr/local/libexec/fireside-host-installer
+sudo chown -R root:root /usr/local/libexec/fireside-host-installer
+sudo chmod 0755 /usr/local/libexec/fireside-host-installer
+sudo install -o root -g root -m 0755 \
+  /usr/local/libexec/fireside-host-installer/dispatcher.sh \
+  /usr/local/sbin/fireside-host-install
+sudo /usr/local/sbin/fireside-host-install check
+sudo /usr/local/sbin/fireside-host-install apply base
+sudo /usr/local/sbin/fireside-host-install apply https-layout
+```
+
+`apply` 是收敛式布局安装：相同健康状态再次执行不改变 release、数据库、证书或服务运行态；遇到异常 owner、mode、链接或既有账户定义会失败关闭。HTTPS profile 同时安装独立的 `/usr/local/sbin/fireside-tls-install`，但绝不搜索或复制 TLS 材料。
+
+共享口令仍由操作者使用 `sudoedit /etc/fireside.env` 写入，并保持 `root:root 0600`。仓库只读 deploy key 必须先在普通用户可读的临时目录生成并向 GitHub 登记公钥，再把材料安装到 root-only 目录，不能从 0700 的 `/etc/fireside-release` 直接调用普通用户 `gh`：
+
+```bash
+deploy_key_stage=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C fireside-production-readonly \
+  -f "${deploy_key_stage}/github_readonly_ed25519"
+gh repo deploy-key add "${deploy_key_stage}/github_readonly_ed25519.pub" \
+  --repo ShijunDeng/fireside --title fireside-production-readonly
+sudo install -o root -g root -m 0600 \
+  "${deploy_key_stage}/github_readonly_ed25519" \
+  /etc/fireside-release/github_readonly_ed25519
+sudo /usr/local/sbin/fireside-host-install verify base
+```
+
+证书由操作者明确指定，安装器不会自动猜测 home 文件。材料必须是 root-owned 普通单链接文件，私钥源权限 0600；成功后服务只依赖规范名称，源文件可以删除：
+
+```bash
+sudo /usr/local/sbin/fireside-tls-install \
+  /absolute/staging/fullchain.pem /absolute/staging/privkey.pem
+curl --resolve firesidechat.cn:443:127.0.0.1 \
+  https://firesidechat.cn/api/health
+```
+
+TLS 安装器固定校验 `firesidechat.cn` SAN、有效期、系统信任链、公私钥匹配和 Nginx 配置；随后原子替换 `/etc/fireside-tls/fullchain.pem` 与 `privkey.pem`、重启并有限重试本机健康检查，任何失败恢复旧材料。`www.firesidechat.cn` 308 跳到裸域名；弃用的 `fireside.show` 与其他 Host 返回 421。公网发布还必须把 `firesidechat.cn` A 记录指向实际入口并开放 80/443。
+
+### 手工布局参考（仅用于故障审计）
 
 创建无登录权限的固定账户和四个相互隔离的目录：
 
@@ -128,14 +178,14 @@ sudo chmod 0600 /etc/fireside.env
 为生产 controller 创建仓库专属的只读 deploy key，并用 GitHub CLI 添加到本仓库；不要复用个人写 key。主机公钥 pin 来自 GitHub 官方公布的 ED25519 key，并作为已审阅 controller asset 安装，不能用 `accept-new` 或单独信任现场 `ssh-keyscan`：
 
 ```bash
-sudo ssh-keygen -q -t ed25519 -N '' \
-  -C fireside-production-readonly \
-  -f /etc/fireside-release/github_readonly_ed25519
-gh repo deploy-key add /etc/fireside-release/github_readonly_ed25519.pub \
+deploy_key_stage=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C fireside-production-readonly \
+  -f "${deploy_key_stage}/github_readonly_ed25519"
+gh repo deploy-key add "${deploy_key_stage}/github_readonly_ed25519.pub" \
   --repo ShijunDeng/fireside --title fireside-production-readonly
-sudo install -o root -g root -m 0600 ops/controller-assets/github_known_hosts \
-  /etc/fireside-release/github_known_hosts
-sudo chmod 0600 /etc/fireside-release/github_readonly_ed25519
+sudo install -o root -g root -m 0600 \
+  "${deploy_key_stage}/github_readonly_ed25519" \
+  /etc/fireside-release/github_readonly_ed25519
 ```
 
 命令不得增加 `--allow-write`。GitHub 仓库设置中须复核该 deploy key 为只读；私钥、host pin 或其父目录元数据异常时，controller 必须在联网与候选构建前失败关闭。

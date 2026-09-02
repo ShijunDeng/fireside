@@ -14,6 +14,7 @@ import {
 import { createDatabase, rowToTopic } from './db.js';
 import { analyzeMeetingRoom } from './meeting.js';
 import { activityPhase, type ActivityPhase } from '../shared/activity.js';
+import { findScheduleConflicts, scheduleBounds } from '../shared/schedule.js';
 import type { Topic } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -69,7 +70,7 @@ const archiveSchema = z.object({
   takeaway: nonEmptyText('本期收获', 1000),
   materialUrl: z.union([
     z.literal(''),
-    z.string().url('资料链接格式不正确').refine((value) => /^https?:\/\//i.test(value), '资料链接仅支持 http 或 https'),
+    z.string().max(2048, '资料链接不能超过 2048 个字符').url('资料链接格式不正确').refine((value) => /^https?:\/\//i.test(value), '资料链接仅支持 http 或 https'),
   ]).default(''),
 });
 const editTopicSchema = z.object({
@@ -88,7 +89,7 @@ const editTopicSchema = z.object({
   takeaway: nonEmptyText('本期收获', 1000).optional(),
   materialUrl: z.union([
     z.literal(''),
-    z.string().url('资料链接格式不正确').refine((value) => /^https?:\/\//i.test(value), '资料链接仅支持 http 或 https'),
+    z.string().max(2048, '资料链接不能超过 2048 个字符').url('资料链接格式不正确').refine((value) => /^https?:\/\//i.test(value), '资料链接仅支持 http 或 https'),
   ]).optional(),
 }).refine((value) => Object.keys(value).length > 0, '至少需要修改一项内容');
 const reorderSchema = z.object({
@@ -100,6 +101,20 @@ const sensitiveRoomMessage = '地点中不能填写会议链接、会议号或�
 const stateRestrictedEditFields = new Set([
   'presenter', 'scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl',
 ]);
+
+type ScheduleConflict = {
+  id: number;
+  title: string;
+  scheduledAt: string;
+  duration: number;
+};
+
+type ScheduledIntervalRow = {
+  id: number;
+  title: string;
+  scheduled_at: string | null;
+  duration: number | null;
+};
 
 type AppOptions = {
   databasePath?: string;
@@ -155,6 +170,26 @@ export function buildApp(options: AppOptions = {}) {
     orderedIds.forEach((id, index) => update.run(-(index + 1), id));
     orderedIds.forEach((id, index) => update.run(index + 1, id));
   };
+  const scheduledIntervals = db.prepare(`
+    SELECT id, title, scheduled_at, duration
+    FROM topics
+    WHERE status = 'SCHEDULED' AND id <> ?
+  `);
+  const readScheduleConflicts = (topicId: number, scheduledAt: string, duration: number): ScheduleConflict[] => {
+    const existing = (scheduledIntervals.all(topicId) as ScheduledIntervalRow[]).flatMap((row) => (
+      row.scheduled_at && row.duration
+        ? [{ id: row.id, title: row.title, scheduledAt: row.scheduled_at, duration: row.duration }]
+        : []
+    ));
+    return findScheduleConflicts({ id: topicId, scheduledAt, duration }, existing);
+  };
+  const scheduleOverlapResponse = (reply: FastifyReply, conflicts: ScheduleConflict[]) => (
+    reply.code(409).send({
+      code: 'ACTIVITY_SCHEDULE_OVERLAP',
+      message: '该时段与已排期议题重叠，请调整时间后重试',
+      conflicts,
+    })
+  );
 
   app.addHook('onClose', async () => db.close());
 
@@ -175,6 +210,7 @@ export function buildApp(options: AppOptions = {}) {
     const sensitiveRead = ['GET', 'HEAD'].includes(request.method) && (
       routePattern === '/api/access/session'
       || routePattern === '/api/topics/:id/participants'
+      || routePattern === '/api/topics/:id/unschedule-impact'
       || routePattern === '/api/topics/:id/meeting-access'
     );
     const businessWrite = ['POST', 'PATCH', 'DELETE'].includes(request.method)
@@ -281,6 +317,9 @@ export function buildApp(options: AppOptions = {}) {
   });
 
   const toPublicTopic = (row: Parameters<typeof rowToTopic>[0]) => {
+    if (!Number.isSafeInteger(row.participant_count) || row.participant_count! < 0) {
+      throw new Error('public Topic snapshot requires participant_count');
+    }
     const topic = rowToTopic(row);
     const legacyMeeting = analyzeMeetingRoom(topic.room);
     return {
@@ -290,6 +329,12 @@ export function buildApp(options: AppOptions = {}) {
       hasMeetingUrl: Boolean(topic.meetingUrl || legacyMeeting.meetingUrl),
     };
   };
+
+  const readTopicWithCount = (id: number) => db.prepare(`
+    SELECT topics.*,
+      (SELECT COUNT(*) FROM topic_participants WHERE topic_id = topics.id) AS participant_count
+    FROM topics WHERE id = ?
+  `).get(id) as Parameters<typeof rowToTopic>[0] | undefined;
 
   app.get('/api/topics', async (request, reply) => {
     const parsed = z.object({
@@ -301,7 +346,7 @@ export function buildApp(options: AppOptions = {}) {
       manual: 'position ASC, id ASC',
       newest: 'created_at DESC, id DESC',
       oldest: 'created_at ASC, id ASC',
-      schedule: 'scheduled_at IS NULL, scheduled_at ASC, created_at DESC',
+      schedule: 'julianday(scheduled_at) IS NULL, julianday(scheduled_at) ASC, id ASC',
       status: "CASE status WHEN 'SCHEDULED' THEN 0 WHEN 'OPEN' THEN 1 WHEN 'CLAIMED' THEN 2 ELSE 3 END, position ASC",
     }[parsed.data.sort];
     const where = parsed.data.status ? ' WHERE status = ?' : '';
@@ -329,11 +374,7 @@ export function buildApp(options: AppOptions = {}) {
   app.get('/api/topics/:id', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const row = db.prepare(`
-      SELECT topics.*,
-        (SELECT COUNT(*) FROM topic_participants WHERE topic_id = topics.id) AS participant_count
-      FROM topics WHERE id = ?
-    `).get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+    const row = readTopicWithCount(params.data.id);
     return row
       ? toPublicTopic(row)
       : reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
@@ -342,7 +383,14 @@ export function buildApp(options: AppOptions = {}) {
   app.get('/api/stats', async () => {
     const grouped = db.prepare('SELECT status, COUNT(*) AS count FROM topics GROUP BY status').all() as { status: string; count: number }[];
     const counts = Object.fromEntries(grouped.map(({ status, count }) => [status, count]));
-    const next = db.prepare("SELECT * FROM topics WHERE status = 'SCHEDULED' AND scheduled_at >= ? ORDER BY scheduled_at ASC LIMIT 1").get(new Date().toISOString());
+    const next = db.prepare(`
+      SELECT topics.*,
+        (SELECT COUNT(*) FROM topic_participants WHERE topic_id = topics.id) AS participant_count
+      FROM topics
+      WHERE status = 'SCHEDULED' AND julianday(scheduled_at) >= julianday(?)
+      ORDER BY julianday(scheduled_at) ASC, id ASC
+      LIMIT 1
+    `).get(captureNow().toISOString());
     return {
       open: counts.OPEN ?? 0,
       claimed: counts.CLAIMED ?? 0,
@@ -364,7 +412,7 @@ export function buildApp(options: AppOptions = {}) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(nextPosition, parsed.data.title, parsed.data.summary, parsed.data.proposer, parsed.data.presenter ?? null, JSON.stringify(parsed.data.tags), status, now, now);
       bumpOrderVersion();
-      return db.prepare('SELECT * FROM topics WHERE id = ?').get(result.lastInsertRowid);
+      return readTopicWithCount(Number(result.lastInsertRowid));
     }).immediate();
     reply.header('X-Order-Version', String(readOrderVersion()));
     return reply.code(201).send(toPublicTopic(topic as Parameters<typeof rowToTopic>[0]));
@@ -372,62 +420,138 @@ export function buildApp(options: AppOptions = {}) {
 
   app.patch('/api/topics/:id', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
-    const body = editTopicSchema.safeParse(request.body);
-    if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
-    const actionNow = captureNow();
-    if (body.data.room !== undefined && analyzeMeetingRoom(body.data.room).sensitive) {
-      return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
-    }
-    const row = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!row) return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
-    const current = rowToTopic(row);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const revision = expectedRevision(request);
-    if (current.revision !== revision) {
-      return topicCommandFailure(reply, params.data.id, revision, '当前状态不能修改这些字段，请按议题流程操作');
-    }
     const fieldsByStatus = {
       OPEN: ['presenter', 'scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl'],
       CLAIMED: ['scheduledAt', 'duration', 'room', 'meetingUrl', 'takeaway', 'materialUrl'],
       SCHEDULED: ['takeaway', 'materialUrl'],
       ARCHIVED: [],
     } as const;
-    if (fieldsByStatus[current.status].some((field) => field in body.data)) {
+    const rawFieldNames = request.body !== null && typeof request.body === 'object' && !Array.isArray(request.body)
+      ? Object.keys(request.body as Record<string, unknown>)
+      : [];
+
+    // Target identity, revision and lifecycle own the error priority. Inspect
+    // only raw own-key presence here; validate candidate values afterwards.
+    const row = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!row) return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    const current = rowToTopic(row);
+    if (current.revision !== revision) {
+      return topicCommandFailure(reply, params.data.id, revision, '当前状态不能修改这些字段，请按议题流程操作');
+    }
+    if (fieldsByStatus[current.status].some((field) => rawFieldNames.includes(field))) {
       return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '当前状态不能修改这些字段，请按议题流程操作' });
     }
-    if (current.status === 'SCHEDULED' && ('scheduledAt' in body.data || 'duration' in body.data)) {
-      const phase = activityPhase(current.scheduledAt, current.duration, actionNow);
+    if (current.status === 'SCHEDULED' && rawFieldNames.some((field) => field === 'scheduledAt' || field === 'duration')) {
+      const phase = activityPhase(current.scheduledAt, current.duration, captureNow());
       if (!phase) return activityTimeInvalid(reply, '当前活动排期数据不完整，暂时不能改期');
       if (phase !== 'UPCOMING') {
         return activityTimeConflict(reply, phase === 'LIVE' ? '活动进行中，不能改期或更改时长' : '分享已结束，不能直接改期或更改时长', phase);
       }
-      const nextScheduledAt = body.data.scheduledAt ?? current.scheduledAt;
-      const nextStart = nextScheduledAt ? new Date(nextScheduledAt).getTime() : Number.NaN;
-      if (!Number.isFinite(nextStart) || !Number.isFinite(actionNow.getTime()) || nextStart <= actionNow.getTime()) {
-        return activityTimeInvalid(reply, '新的分享时间必须晚于当前时间');
-      }
     }
+
+    const body = editTopicSchema.safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ message: validationMessage(body.error) });
+    if (body.data.room !== undefined && analyzeMeetingRoom(body.data.room).sensitive) {
+      return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
+    }
+    const validateTimeChange = (current: Topic, actionNow: Date) => {
+      const changesTime = 'scheduledAt' in body.data || 'duration' in body.data;
+      if (!changesTime || (current.status !== 'SCHEDULED' && current.status !== 'ARCHIVED')) {
+        return { status: 'ok' as const };
+      }
+      const nextScheduledAt = body.data.scheduledAt ?? current.scheduledAt;
+      const nextDuration = body.data.duration ?? current.duration;
+      const interval = scheduleBounds({ id: current.id, scheduledAt: nextScheduledAt, duration: nextDuration });
+      if (!interval) return { status: 'invalid-time' as const, message: '当前活动排期数据不完整，暂时不能修改时间' };
+      if (current.status === 'ARCHIVED') {
+        const archivedEpoch = Date.parse(current.archivedAt ?? '');
+        if (!Number.isFinite(archivedEpoch)) {
+          return { status: 'invalid-time' as const, message: '当前归档时间数据不完整，暂时不能修正历史排期' };
+        }
+        if (interval.endEpoch > archivedEpoch) {
+          return { status: 'time-conflict' as const, message: '历史活动必须在归档时间之前结束' };
+        }
+        return { status: 'ok' as const, interval, nextScheduledAt: nextScheduledAt!, nextDuration: nextDuration! };
+      }
+      const phase = activityPhase(current.scheduledAt, current.duration, actionNow);
+      if (!phase) return { status: 'invalid-time' as const, message: '当前活动排期数据不完整，暂时不能改期' };
+      if (phase !== 'UPCOMING') {
+        return {
+          status: 'time-conflict' as const,
+          phase,
+          message: phase === 'LIVE' ? '活动进行中，不能改期或更改时长' : '分享已结束，不能直接改期或更改时长',
+        };
+      }
+      if (!Number.isFinite(actionNow.getTime()) || interval.startEpoch <= actionNow.getTime()) {
+        return { status: 'invalid-time' as const, message: '新的分享时间必须晚于当前时间' };
+      }
+      return { status: 'ok' as const, interval, nextScheduledAt: nextScheduledAt!, nextDuration: nextDuration! };
+    };
+
+    // Preserve the established error priority and do not invoke the test/concurrency
+    // hook for requests that are already invalid. The authoritative checks are
+    // repeated inside the write transaction after the hook.
+    const preliminaryTime = validateTimeChange(current, captureNow());
+    if (preliminaryTime.status === 'invalid-time') return activityTimeInvalid(reply, preliminaryTime.message);
+    if (preliminaryTime.status === 'time-conflict') return activityTimeConflict(reply, preliminaryTime.message, preliminaryTime.phase);
+
     await options.beforeTopicUpdate?.();
-    const updates: { column: string; value: unknown }[] = [];
-    if (body.data.title !== undefined) updates.push({ column: 'title', value: body.data.title });
-    if (body.data.summary !== undefined) updates.push({ column: 'summary', value: body.data.summary });
-    if (body.data.proposer !== undefined) updates.push({ column: 'proposer', value: body.data.proposer });
-    if (body.data.presenter !== undefined) updates.push({ column: 'presenter', value: body.data.presenter });
-    if (body.data.tags !== undefined) updates.push({ column: 'tags', value: JSON.stringify(body.data.tags) });
-    if (body.data.scheduledAt !== undefined) updates.push({ column: 'scheduled_at', value: body.data.scheduledAt });
-    if (body.data.duration !== undefined) updates.push({ column: 'duration', value: body.data.duration });
-    if (body.data.room !== undefined) updates.push({ column: 'room', value: body.data.room });
-    if (body.data.meetingUrl !== undefined) updates.push({ column: 'meeting_url', value: body.data.meetingUrl || null });
-    if (body.data.takeaway !== undefined) updates.push({ column: 'takeaway', value: body.data.takeaway });
-    if (body.data.materialUrl !== undefined) updates.push({ column: 'material_url', value: body.data.materialUrl || null });
-    updates.push({ column: 'updated_at', value: actionNow.toISOString() });
     const requiresStateMatch = Object.keys(body.data).some((field) => stateRestrictedEditFields.has(field));
-    const updated = db.prepare(`
-      UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')}, revision = revision + 1
-      WHERE id = ? AND revision = ?${requiresStateMatch ? ' AND status = ?' : ''}
-      RETURNING *
-    `).get(...updates.map(({ value }) => value), params.data.id, revision, ...(requiresStateMatch ? [current.status] : [])) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '议题状态已变化，请重新确认后再编辑');
-    return toPublicTopic(updated);
+    const outcome = db.transaction(() => {
+      const latestRow = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+      if (!latestRow) return { status: 'missing' as const };
+      const latest = rowToTopic(latestRow);
+      if (latest.revision !== revision) return { status: 'revision-conflict' as const, currentRevision: latest.revision };
+      if (fieldsByStatus[latest.status].some((field) => field in body.data)) return { status: 'state-conflict' as const };
+
+      const actionNow = captureNow();
+      const timeValidation = validateTimeChange(latest, actionNow);
+      if (timeValidation.status !== 'ok') return timeValidation;
+      const scheduledAtActuallyChanges = body.data.scheduledAt !== undefined
+        && Date.parse(body.data.scheduledAt) !== Date.parse(latest.scheduledAt ?? '');
+      const durationActuallyChanges = body.data.duration !== undefined && body.data.duration !== latest.duration;
+      if (latest.status === 'SCHEDULED' && timeValidation.nextScheduledAt && timeValidation.nextDuration
+        && (scheduledAtActuallyChanges || durationActuallyChanges)) {
+        const conflicts = readScheduleConflicts(latest.id, timeValidation.nextScheduledAt, timeValidation.nextDuration);
+        if (conflicts.length) return { status: 'overlap' as const, conflicts };
+      }
+
+      const updates: { column: string; value: unknown }[] = [];
+      if (body.data.title !== undefined) updates.push({ column: 'title', value: body.data.title });
+      if (body.data.summary !== undefined) updates.push({ column: 'summary', value: body.data.summary });
+      if (body.data.proposer !== undefined) updates.push({ column: 'proposer', value: body.data.proposer });
+      if (body.data.presenter !== undefined) updates.push({ column: 'presenter', value: body.data.presenter });
+      if (body.data.tags !== undefined) updates.push({ column: 'tags', value: JSON.stringify(body.data.tags) });
+      if (body.data.scheduledAt !== undefined) updates.push({ column: 'scheduled_at', value: body.data.scheduledAt });
+      if (body.data.duration !== undefined) updates.push({ column: 'duration', value: body.data.duration });
+      if (body.data.room !== undefined) updates.push({ column: 'room', value: body.data.room });
+      if (body.data.meetingUrl !== undefined) updates.push({ column: 'meeting_url', value: body.data.meetingUrl || null });
+      if (body.data.takeaway !== undefined) updates.push({ column: 'takeaway', value: body.data.takeaway });
+      if (body.data.materialUrl !== undefined) updates.push({ column: 'material_url', value: body.data.materialUrl || null });
+      updates.push({ column: 'updated_at', value: actionNow.toISOString() });
+      const updated = db.prepare(`
+        UPDATE topics SET ${updates.map(({ column }) => `${column} = ?`).join(', ')}, revision = revision + 1
+        WHERE id = ? AND revision = ?${requiresStateMatch ? ' AND status = ?' : ''}
+        RETURNING *
+      `).get(...updates.map(({ value }) => value), params.data.id, revision, ...(requiresStateMatch ? [latest.status] : [])) as Parameters<typeof rowToTopic>[0] | undefined;
+      return updated ? { status: 'ok' as const, topic: readTopicWithCount(params.data.id)! } : { status: 'state-conflict' as const };
+    }).immediate();
+
+    if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (outcome.status === 'revision-conflict') {
+      return reply.code(412).send({
+        code: 'TOPIC_REVISION_CONFLICT',
+        message: '议题已被其他协作者更新，本次操作未执行',
+        currentRevision: outcome.currentRevision,
+      });
+    }
+    if (outcome.status === 'state-conflict') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '议题状态已变化，请重新确认后再编辑' });
+    if (outcome.status === 'invalid-time') return activityTimeInvalid(reply, outcome.message);
+    if (outcome.status === 'time-conflict') return activityTimeConflict(reply, outcome.message, outcome.phase);
+    if (outcome.status === 'overlap') return scheduleOverlapResponse(reply, outcome.conflicts);
+    return toPublicTopic(outcome.topic);
   });
 
   app.delete('/api/topics/:id', async (request, reply) => {
@@ -540,10 +664,13 @@ export function buildApp(options: AppOptions = {}) {
     const body = claimSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
     const revision = expectedRevision(request);
-    const updated = db.prepare(`
-      UPDATE topics SET presenter = ?, status = 'CLAIMED', updated_at = ?, revision = revision + 1
-      WHERE id = ? AND status = 'OPEN' AND revision = ? RETURNING *
-    `).get(body.data.presenter, new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    const updated = db.transaction(() => {
+      const result = db.prepare(`
+        UPDATE topics SET presenter = ?, status = 'CLAIMED', updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'OPEN' AND revision = ? RETURNING id
+      `).get(body.data.presenter, new Date().toISOString(), params.data.id, revision) as { id: number } | undefined;
+      return result ? readTopicWithCount(result.id) : undefined;
+    }).immediate();
     if (!updated) return topicCommandFailure(reply, params.data.id, revision, '这个议题已经被认领或排期');
     return toPublicTopic(updated);
   });
@@ -552,38 +679,68 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const revision = expectedRevision(request);
-    const updated = db.prepare(`
-      UPDATE topics SET presenter = NULL, status = 'OPEN', updated_at = ?, revision = revision + 1
-      WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING *
-    `).get(new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    const updated = db.transaction(() => {
+      const result = db.prepare(`
+        UPDATE topics SET presenter = NULL, status = 'OPEN', updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING id
+      `).get(new Date().toISOString(), params.data.id, revision) as { id: number } | undefined;
+      return result ? readTopicWithCount(result.id) : undefined;
+    }).immediate();
     if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有准备中的议题可以重新开放认领');
     return toPublicTopic(updated);
   });
 
   app.post('/api/topics/:id/schedule', async (request, reply) => {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
-    const body = scheduleSchema.safeParse(request.body);
-    if (!params.success || !body.success) return reply.code(400).send({ message: body.success ? '议题编号不正确' : validationMessage(body.error) });
-    const actionNow = captureNow();
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const revision = expectedRevision(request);
-    const currentRow = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!currentRow || currentRow.revision !== revision || currentRow.status !== 'CLAIMED') {
+    const preliminaryRow = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+    if (!preliminaryRow) return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    const preliminary = rowToTopic(preliminaryRow);
+    if (preliminary.revision !== revision) {
       return topicCommandFailure(reply, params.data.id, revision, '议题需要先被认领，才能安排分享');
     }
-    if (analyzeMeetingRoom(body.data.room).sensitive) {
-      return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
+    if (preliminary.status !== 'CLAIMED') {
+      return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '议题需要先被认领，才能安排分享' });
     }
-    const nextStart = new Date(body.data.scheduledAt).getTime();
-    if (!Number.isFinite(nextStart) || !Number.isFinite(actionNow.getTime()) || nextStart <= actionNow.getTime()) {
-      return activityTimeInvalid(reply, '分享时间必须晚于当前时间');
+    const body = scheduleSchema.safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ message: validationMessage(body.error) });
+    const outcome = db.transaction(() => {
+      const currentRow = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+      if (!currentRow) return { status: 'missing' as const };
+      if (currentRow.revision !== revision) return { status: 'revision-conflict' as const, currentRevision: currentRow.revision };
+      if (currentRow.status !== 'CLAIMED') return { status: 'state-conflict' as const };
+      if (analyzeMeetingRoom(body.data.room).sensitive) return { status: 'sensitive-room' as const };
+
+      const actionNow = captureNow();
+      const interval = scheduleBounds({ id: params.data.id, scheduledAt: body.data.scheduledAt, duration: body.data.duration });
+      if (!interval || !Number.isFinite(actionNow.getTime()) || interval.startEpoch <= actionNow.getTime()) {
+        return { status: 'invalid-time' as const };
+      }
+      const conflicts = readScheduleConflicts(params.data.id, body.data.scheduledAt, body.data.duration);
+      if (conflicts.length) return { status: 'overlap' as const, conflicts };
+
+      const updated = db.prepare(`
+        UPDATE topics
+        SET scheduled_at = ?, duration = ?, room = ?, meeting_url = ?, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING *
+      `).get(body.data.scheduledAt, body.data.duration, body.data.room, body.data.meetingUrl || null, actionNow.toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+      return updated ? { status: 'ok' as const, topic: readTopicWithCount(params.data.id)! } : { status: 'state-conflict' as const };
+    }).immediate();
+
+    if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (outcome.status === 'revision-conflict') {
+      return reply.code(412).send({
+        code: 'TOPIC_REVISION_CONFLICT',
+        message: '议题已被其他协作者更新，本次操作未执行',
+        currentRevision: outcome.currentRevision,
+      });
     }
-    const updated = db.prepare(`
-      UPDATE topics
-      SET scheduled_at = ?, duration = ?, room = ?, meeting_url = ?, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
-      WHERE id = ? AND status = 'CLAIMED' AND revision = ? RETURNING *
-    `).get(body.data.scheduledAt, body.data.duration, body.data.room, body.data.meetingUrl || null, actionNow.toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '议题需要先被认领，才能安排分享');
-    return toPublicTopic(updated);
+    if (outcome.status === 'state-conflict') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '议题需要先被认领，才能安排分享' });
+    if (outcome.status === 'sensitive-room') return reply.code(400).send({ code: 'SENSITIVE_ROOM_CONTENT', message: sensitiveRoomMessage });
+    if (outcome.status === 'invalid-time') return activityTimeInvalid(reply, '分享时间必须晚于当前时间');
+    if (outcome.status === 'overlap') return scheduleOverlapResponse(reply, outcome.conflicts);
+    return toPublicTopic(outcome.topic);
   });
 
   app.post('/api/topics/:id/unschedule', async (request, reply) => {
@@ -608,7 +765,7 @@ export function buildApp(options: AppOptions = {}) {
       `).get(actionNow.toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
       if (!updated) return { status: 'state-conflict' as const };
       db.prepare('DELETE FROM topic_participants WHERE topic_id = ?').run(params.data.id);
-      return { status: 'ok' as const, topic: updated };
+      return { status: 'ok' as const, topic: readTopicWithCount(params.data.id)! };
     }).immediate();
     if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
     if (outcome.status === 'revision-conflict') {
@@ -643,10 +800,13 @@ export function buildApp(options: AppOptions = {}) {
       return activityTimeConflict(reply, phase === 'LIVE' ? '活动仍在进行中，结束后才能归档' : '活动尚未开始，不能提前归档', phase);
     }
     const nowIso = actionNow.toISOString();
-    const updated = db.prepare(`
-      UPDATE topics SET takeaway = ?, material_url = ?, status = 'ARCHIVED', archived_at = ?, updated_at = ?, revision = revision + 1
-      WHERE id = ? AND status = 'SCHEDULED' AND revision = ? RETURNING *
-    `).get(body.data.takeaway, body.data.materialUrl || null, nowIso, nowIso, params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+    const updated = db.transaction(() => {
+      const result = db.prepare(`
+        UPDATE topics SET takeaway = ?, material_url = ?, status = 'ARCHIVED', archived_at = ?, updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'SCHEDULED' AND revision = ? RETURNING id
+      `).get(body.data.takeaway, body.data.materialUrl || null, nowIso, nowIso, params.data.id, revision) as { id: number } | undefined;
+      return result ? readTopicWithCount(result.id) : undefined;
+    }).immediate();
     if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有已结束的排期议题可以归档');
     return toPublicTopic(updated);
   });
@@ -655,13 +815,35 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const revision = expectedRevision(request);
-    const updated = db.prepare(`
-      UPDATE topics
-      SET takeaway = NULL, material_url = NULL, archived_at = NULL, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
-      WHERE id = ? AND status = 'ARCHIVED' AND revision = ? RETURNING *
-    `).get(new Date().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
-    if (!updated) return topicCommandFailure(reply, params.data.id, revision, '只有已归档的议题可以撤销归档');
-    return toPublicTopic(updated);
+    const outcome = db.transaction(() => {
+      const currentRow = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+      if (!currentRow) return { status: 'missing' as const };
+      const current = rowToTopic(currentRow);
+      if (current.revision !== revision) return { status: 'revision-conflict' as const, currentRevision: current.revision };
+      if (current.status !== 'ARCHIVED') return { status: 'state-conflict' as const };
+      const interval = scheduleBounds(current);
+      if (!interval || !current.scheduledAt || !current.duration) return { status: 'invalid-time' as const };
+      const conflicts = readScheduleConflicts(current.id, current.scheduledAt, current.duration);
+      if (conflicts.length) return { status: 'overlap' as const, conflicts };
+      const updated = db.prepare(`
+        UPDATE topics
+        SET takeaway = NULL, material_url = NULL, archived_at = NULL, status = 'SCHEDULED', updated_at = ?, revision = revision + 1
+        WHERE id = ? AND status = 'ARCHIVED' AND revision = ? RETURNING *
+      `).get(captureNow().toISOString(), params.data.id, revision) as Parameters<typeof rowToTopic>[0] | undefined;
+      return updated ? { status: 'ok' as const, topic: readTopicWithCount(params.data.id)! } : { status: 'state-conflict' as const };
+    }).immediate();
+    if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (outcome.status === 'revision-conflict') {
+      return reply.code(412).send({
+        code: 'TOPIC_REVISION_CONFLICT',
+        message: '议题已被其他协作者更新，本次操作未执行',
+        currentRevision: outcome.currentRevision,
+      });
+    }
+    if (outcome.status === 'state-conflict') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '只有已归档的议题可以撤销归档' });
+    if (outcome.status === 'invalid-time') return activityTimeInvalid(reply, '当前归档排期数据不完整，暂时不能撤销归档');
+    if (outcome.status === 'overlap') return scheduleOverlapResponse(reply, outcome.conflicts);
+    return toPublicTopic(outcome.topic);
   });
 
   app.get('/api/topics/:id/meeting-access', async (request, reply) => {
@@ -669,7 +851,8 @@ export function buildApp(options: AppOptions = {}) {
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
     const actionNow = captureNow();
-    const row = db.prepare('SELECT status, scheduled_at, duration, room, meeting_url FROM topics WHERE id = ?').get(params.data.id) as {
+    const row = db.prepare('SELECT revision, status, scheduled_at, duration, room, meeting_url FROM topics WHERE id = ?').get(params.data.id) as {
+      revision: number;
       status: string;
       scheduled_at: string | null;
       duration: number | null;
@@ -682,20 +865,59 @@ export function buildApp(options: AppOptions = {}) {
     if (!phase) return activityTimeInvalid(reply, '当前活动排期数据不完整，无法打开会议入口');
     if (phase === 'ENDED') return activityTimeConflict(reply, '分享已结束，会议入口已经关闭', phase);
     const meetingUrl = row.meeting_url || analyzeMeetingRoom(row.room).meetingUrl;
-    return meetingUrl
-      ? { meetingUrl }
-      : activityTimeConflict(reply, '这个议题没有可用的线上会议入口', phase);
+    if (!meetingUrl) return activityTimeConflict(reply, '这个议题没有可用的线上会议入口', phase);
+    reply.header('ETag', `"${row.revision}"`);
+    return { meetingUrl };
   });
 
   app.get('/api/topics/:id/participants', async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
     const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
     if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
-    const exists = db.prepare('SELECT 1 FROM topics WHERE id = ?').get(params.data.id);
-    if (!exists) return reply.code(404).send({ message: '没有找到这个议题' });
-    const rows = db.prepare('SELECT id, topic_id, name, created_at FROM topic_participants WHERE topic_id = ? ORDER BY id ASC')
-      .all(params.data.id) as { id: number; topic_id: number; name: string; created_at: string }[];
-    return rows.map((row) => ({ id: row.id, topicId: row.topic_id, name: row.name, createdAt: row.created_at }));
+    const snapshot = db.transaction(() => {
+      const topic = db.prepare('SELECT revision FROM topics WHERE id = ?').get(params.data.id) as { revision: number } | undefined;
+      if (!topic) return null;
+      const rows = db.prepare('SELECT id, topic_id, name, created_at FROM topic_participants WHERE topic_id = ? ORDER BY id ASC')
+        .all(params.data.id) as { id: number; topic_id: number; name: string; created_at: string }[];
+      return {
+        revision: topic.revision,
+        participants: rows.map((row) => ({ id: row.id, topicId: row.topic_id, name: row.name, createdAt: row.created_at })),
+      };
+    })();
+    if (!snapshot) return reply.code(404).send({ message: '没有找到这个议题' });
+    reply.header('ETag', `"${snapshot.revision}"`);
+    reply.header('X-Fireside-Participant-Count', String(snapshot.participants.length));
+    return snapshot.participants;
+  });
+
+  app.get('/api/topics/:id/unschedule-impact', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const params = z.object({ id: z.coerce.number().int().positive() }).safeParse(request.params);
+    if (!params.success) return reply.code(400).send({ message: '议题编号不正确' });
+    const outcome = db.transaction(() => {
+      const row = db.prepare('SELECT * FROM topics WHERE id = ?').get(params.data.id) as Parameters<typeof rowToTopic>[0] | undefined;
+      if (!row) return { status: 'missing' as const };
+      const topic = rowToTopic(row);
+      if (topic.status !== 'SCHEDULED') return { status: 'state-conflict' as const };
+      const participantRows = db.prepare('SELECT id, topic_id, name, created_at FROM topic_participants WHERE topic_id = ? ORDER BY id ASC')
+        .all(params.data.id) as { id: number; topic_id: number; name: string; created_at: string }[];
+      const participants = participantRows.map((participant) => ({
+        id: participant.id,
+        topicId: participant.topic_id,
+        name: participant.name,
+        createdAt: participant.created_at,
+      }));
+      return {
+        status: 'ok' as const,
+        topic: toPublicTopic({ ...row, participant_count: participants.length }),
+        participants,
+      };
+    })();
+    if (outcome.status === 'missing') return reply.code(404).send({ code: 'TOPIC_NOT_FOUND', message: '没有找到这个议题' });
+    if (outcome.status === 'state-conflict') {
+      return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '只有已排期的议题可以读取取消影响' });
+    }
+    return { topic: outcome.topic, participants: outcome.participants };
   });
 
   app.post('/api/topics/:id/participants', async (request, reply) => {
@@ -722,13 +944,21 @@ export function buildApp(options: AppOptions = {}) {
       const result = db.prepare('INSERT INTO topic_participants (topic_id, name, normalized_name, created_at) VALUES (?, ?, ?, ?)')
         .run(params.data.id, body.data.name, normalizedName, nowIso);
       db.prepare('UPDATE topics SET revision = revision + 1, updated_at = ? WHERE id = ?').run(nowIso, params.data.id);
-      return { status: 'ok' as const, participant: { id: Number(result.lastInsertRowid), topicId: params.data.id, name: body.data.name, createdAt: nowIso } };
+      const latest = readTopicWithCount(params.data.id)!;
+      return {
+        status: 'ok' as const,
+        participant: { id: Number(result.lastInsertRowid), topicId: params.data.id, name: body.data.name, createdAt: nowIso },
+        topicRevision: latest.revision,
+        participantCount: latest.participant_count!,
+      };
     }).immediate();
     if (outcome.status === 'missing') return reply.code(404).send({ message: '没有找到这个议题' });
     if (outcome.status === 'invalid') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '只有已排期的议题可以报名' });
     if (outcome.status === 'invalid-time') return activityTimeInvalid(reply, '当前活动排期数据不完整，暂时不能报名');
     if (outcome.status === 'time-conflict') return activityTimeConflict(reply, '分享已结束，报名名单已经冻结', outcome.phase);
     if (outcome.status === 'duplicate') return reply.code(409).send({ code: 'PARTICIPANT_DUPLICATE', message: '这个名字已经报名，请勿重复提交' });
+    reply.header('ETag', `"${outcome.topicRevision}"`);
+    reply.header('X-Fireside-Participant-Count', String(outcome.participantCount));
     return reply.code(201).send(outcome.participant);
   });
 
@@ -754,13 +984,19 @@ export function buildApp(options: AppOptions = {}) {
         .run(params.data.participantId, params.data.id);
       if (result.changes !== 1) return 'missing-participant' as const;
       db.prepare('UPDATE topics SET revision = revision + 1, updated_at = ? WHERE id = ?').run(actionNow.toISOString(), params.data.id);
-      return 'ok' as const;
+      const latest = readTopicWithCount(params.data.id)!;
+      return { status: 'ok' as const, topicRevision: latest.revision, participantCount: latest.participant_count! };
     }).immediate();
     if (outcome === 'missing-topic') return reply.code(404).send({ message: '没有找到这个议题' });
     if (outcome === 'invalid') return reply.code(409).send({ code: 'TOPIC_STATE_CONFLICT', message: '活动已结束或取消，不能修改报名' });
     if (outcome === 'invalid-time') return activityTimeInvalid(reply, '当前活动排期数据不完整，暂时不能修改报名');
     if (outcome === 'time-conflict') return activityTimeConflict(reply, '分享已结束，报名名单已经冻结', 'ENDED');
-    if (outcome === 'missing-participant') return reply.code(404).send({ message: '没有找到这条报名记录' });
+    if (outcome === 'missing-participant') return reply.code(404).send({
+      code: 'PARTICIPANT_NOT_FOUND',
+      message: '没有找到这条报名记录',
+    });
+    reply.header('ETag', `"${outcome.topicRevision}"`);
+    reply.header('X-Fireside-Participant-Count', String(outcome.participantCount));
     return reply.code(204).send();
   });
 

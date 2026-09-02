@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "assets": [
+    { "profile": "base", "source": "ops/fireside-release", "bundle": "assets/base/controller/fireside-release", "destination": "/usr/local/sbin/fireside-release", "mode": "0755" },
+    { "profile": "base", "source": "ops/install-release.sh", "bundle": "assets/base/controller/install-release.sh", "destination": "/usr/local/libexec/fireside-release/install-release.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/promote-release.sh", "bundle": "assets/base/controller/promote-release.sh", "destination": "/usr/local/libexec/fireside-release/promote-release.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/rollback-release.sh", "bundle": "assets/base/controller/rollback-release.sh", "destination": "/usr/local/libexec/fireside-release/rollback-release.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/release-status.sh", "bundle": "assets/base/controller/release-status.sh", "destination": "/usr/local/libexec/fireside-release/release-status.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/release-lib.sh", "bundle": "assets/base/controller/release-lib.sh", "destination": "/usr/local/libexec/fireside-release/release-lib.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/guarded-backup.sh", "bundle": "assets/base/controller/guarded-backup.sh", "destination": "/usr/local/libexec/fireside-release/guarded-backup.sh", "mode": "0755" },
+    { "profile": "base", "source": "ops/release-preflight.mjs", "bundle": "assets/base/controller/release-preflight.mjs", "destination": "/usr/local/libexec/fireside-release/release-preflight.mjs", "mode": "0644" },
+    { "profile": "base", "source": "ops/controller-assets/CONTROLLER_PRODUCTION_MODE", "bundle": "assets/base/controller/CONTROLLER_PRODUCTION_MODE", "destination": "/usr/local/libexec/fireside-release/CONTROLLER_PRODUCTION_MODE", "mode": "0444" },
+    { "profile": "base", "source": "ops/controller-assets/github_known_hosts", "bundle": "assets/base/controller/github_known_hosts", "destination": "/etc/fireside-release/github_known_hosts", "mode": "0600" },
+
+    { "profile": "base", "source": "ops/fireside.service", "bundle": "assets/base/systemd/fireside.service", "destination": "/etc/systemd/system/fireside.service", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside.socket", "bundle": "assets/base/systemd/fireside.socket", "destination": "/etc/systemd/system/fireside.socket", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside-backup.service", "bundle": "assets/base/systemd/fireside-backup.service", "destination": "/etc/systemd/system/fireside-backup.service", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside-backup.timer", "bundle": "assets/base/systemd/fireside-backup.timer", "destination": "/etc/systemd/system/fireside-backup.timer", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside-release-recover.service", "bundle": "assets/base/systemd/fireside-release-recover.service", "destination": "/etc/systemd/system/fireside-release-recover.service", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside-runtime-gate.service", "bundle": "assets/base/systemd/fireside-runtime-gate.service", "destination": "/etc/systemd/system/fireside-runtime-gate.service", "mode": "0644", "unit": true },
+    { "profile": "base", "source": "ops/fireside-backup-gate.service", "bundle": "assets/base/systemd/fireside-backup-gate.service", "destination": "/etc/systemd/system/fireside-backup-gate.service", "mode": "0644", "unit": true },
+
+    { "profile": "https-layout", "source": "ops/fireside-https.service", "bundle": "assets/https/systemd/fireside-https.service", "destination": "/etc/systemd/system/fireside-https.service", "mode": "0644", "unit": true },
+    { "profile": "https-layout", "source": "ops/fireside-https.nginx.conf", "bundle": "assets/https/nginx/nginx.conf", "destination": "/etc/fireside-nginx/nginx.conf", "mode": "0644" },
+    { "profile": "https-layout", "source": "ops/tls-installer/install.sh", "bundle": "assets/https/tls-installer/install.sh", "destination": "/usr/local/libexec/fireside-tls-installer/install.sh", "mode": "0555" },
+    { "profile": "https-layout", "source": "ops/tls-installer/dispatcher.sh", "bundle": "assets/https/tls-installer/dispatcher.sh", "destination": "/usr/local/sbin/fireside-tls-install", "mode": "0755" }
+  ]
+}

@@ -1,29 +1,65 @@
+import {
+  businessDateKey,
+  businessDateTimeInputToUtc,
+  businessTodayCursor,
+  compareTopicsBySchedule,
+  findScheduleConflicts,
+  formatBusinessDateTimeInput,
+  formatBusinessTime,
+  scheduleBounds,
+  scheduleIntervalsOverlap,
+  sortTopicsBySchedule,
+} from '../shared/schedule';
+
+export {
+  BUSINESS_TIME_SUFFIX,
+  BUSINESS_TIME_ZONE,
+  businessDateKey,
+  businessDateTimeInputToUtc,
+  businessTodayCursor,
+  compareTopicsBySchedule,
+  findScheduleConflicts,
+  formatBusinessDateTimeInput,
+  formatBusinessTime,
+  scheduleBounds,
+  scheduleIntervalsOverlap,
+  sortTopicsBySchedule,
+} from '../shared/schedule';
+
 export function dateKey(date: Date) {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  return businessDateKey(date);
 }
 
 export function startOfWeek(date: Date) {
-  const result = new Date(date);
-  const day = result.getDay() || 7;
-  result.setDate(result.getDate() - day + 1);
-  result.setHours(0, 0, 0, 0);
+  const [year, month, dayOfMonth] = businessDateKey(date).split('-').map(Number);
+  const result = new Date(Date.UTC(year, month - 1, dayOfMonth, 12));
+  const day = result.getUTCDay() || 7;
+  result.setUTCDate(result.getUTCDate() - day + 1);
   return result;
 }
 
 export function buildMonthDays(cursor: Date) {
-  const monthStart = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+  const [year, month] = businessDateKey(cursor).split('-').map(Number);
+  const monthStart = new Date(Date.UTC(year, month - 1, 1, 12));
   const gridStart = startOfWeek(monthStart);
-  return Array.from({ length: 42 }, (_, index) => new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + index));
+  return Array.from({ length: 42 }, (_, index) => {
+    const result = new Date(gridStart);
+    result.setUTCDate(result.getUTCDate() + index);
+    return result;
+  });
 }
 
 export function buildWeekDays(cursor: Date) {
   const weekStart = startOfWeek(cursor);
-  return Array.from({ length: 7 }, (_, index) => new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + index));
+  return Array.from({ length: 7 }, (_, index) => {
+    const result = new Date(weekStart);
+    result.setUTCDate(result.getUTCDate() + index);
+    return result;
+  });
 }
 
 export function formatDateTimeInput(value: string | null) {
-  if (!value) return '';
-  const date = new Date(value);
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 16);
+  return formatBusinessDateTimeInput(value);
 }
+
+export const dateTimeInputToUtc = businessDateTimeInputToUtc;

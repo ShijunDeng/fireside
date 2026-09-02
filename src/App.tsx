@@ -13,6 +13,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Copy,
   Download,
   Flame,
   GripVertical,
@@ -45,11 +46,23 @@ import {
   onUnauthorized,
   saveCollaborationSession,
 } from './api';
-import { buildMonthDays, buildWeekDays, dateKey, formatDateTimeInput, startOfWeek } from './calendar';
+import {
+  buildMonthDays,
+  buildWeekDays,
+  businessTodayCursor,
+  dateKey,
+  dateTimeInputToUtc,
+  findScheduleConflicts,
+  formatBusinessTime,
+  formatDateTimeInput,
+  sortTopicsBySchedule,
+  startOfWeek,
+} from './calendar';
 import { createDialogToken, dialogStack } from './dialog-stack';
 import { buildPosterModel, isPosterEligible, posterToBlob, renderTopicPoster } from './poster';
 import { activityPhase } from '../shared/activity';
 import type { DialogToken } from './dialog-stack';
+import type { ScheduleConflict } from './api';
 import type { ActivityPhase, Participant, Stats, Topic, TopicSort, TopicStatus } from './types';
 
 type Tab = 'ALL' | TopicStatus;
@@ -58,6 +71,7 @@ type ViewMode = 'list' | 'month' | 'week';
 type PosterPhase = 'checking' | 'generating' | 'ready' | 'read-error' | 'render-error' | 'unavailable';
 type EditDraftField = 'title' | 'summary' | 'proposer' | 'tags' | 'presenter' | 'scheduledAt' | 'duration' | 'room' | 'meetingUrl' | 'takeaway' | 'materialUrl';
 type EditDraft = Record<EditDraftField, string>;
+type TopicExpansionMemory = { summary: string; summaryExpanded: boolean; takeaway: string | null; takeawayExpanded: boolean };
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'ALL', label: '全部议题' },
@@ -73,6 +87,10 @@ const statusMeta: Record<TopicStatus, { label: string; className: string }> = {
   SCHEDULED: { label: '已排期', className: 'scheduled' },
   ARCHIVED: { label: '已经归档', className: 'archived' },
 };
+
+function preferNewerTopic(current: Topic | null | undefined, incoming: Topic) {
+  return current && current.id === incoming.id && current.revision > incoming.revision ? current : incoming;
+}
 
 const phaseMeta: Record<ActivityPhase, { label: string; className: string }> = {
   UPCOMING: { label: '已排期', className: 'scheduled' },
@@ -96,6 +114,16 @@ function canAttendPhase(phase: ActivityPhase | null) {
   return phase === 'UPCOMING' || phase === 'LIVE';
 }
 
+async function verifiedMeetingAccess(topicId: number) {
+  const access = await api.meetingAccess(topicId);
+  const topic = await api.topic(topicId);
+  const valid = topic.revision === access.topicRevision
+    && topic.status === 'SCHEDULED'
+    && topic.hasMeetingUrl
+    && canAttendPhase(topicPhase(topic, new Date()));
+  return { topic, meetingUrl: valid ? access.meetingUrl : null };
+}
+
 function canDeleteTopic(topic: Topic) {
   return (topic.status === 'OPEN' || topic.status === 'CLAIMED')
     && topic.scheduledAt === null
@@ -109,7 +137,8 @@ function canDeleteTopic(topic: Topic) {
 }
 
 function formatDate(value: string, withYear = false) {
-  return new Intl.DateTimeFormat('zh-CN', {
+  const formatted = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
     ...(withYear ? { year: 'numeric' } : {}),
     month: 'long',
     day: 'numeric',
@@ -118,14 +147,39 @@ function formatDate(value: string, withYear = false) {
     minute: '2-digit',
     hour12: false,
   }).format(new Date(value));
+  return `${formatted} 北京时间`;
+}
+
+function isDifferentBusinessYear(value: string, reference: Date) {
+  return dateKey(new Date(value)).slice(0, 4) !== dateKey(reference).slice(0, 4);
+}
+
+function calendarDateLabel(date: Date, withYear = false) {
+  const { year, month, day } = calendarDateParts(date);
+  const weekday = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][date.getUTCDay()];
+  return `${withYear ? `${year}年` : ''}${month}月${day}日（${weekday}）`;
+}
+
+function calendarDateParts(date: Date) {
+  const [year, month, day] = dateKey(date).split('-').map(Number);
+  return { year, month, day };
+}
+
+function topicTimeRange(topic: Topic) {
+  if (!topic.scheduledAt) return '时间待定';
+  const start = new Date(topic.scheduledAt);
+  const end = new Date(start.getTime() + (topic.duration ?? 0) * 60_000);
+  const startLabel = formatBusinessTime(start).replace(' 北京时间', '');
+  const endLabel = formatBusinessTime(end).replace(' 北京时间', '');
+  return `${startLabel}–${endLabel} 北京时间`;
 }
 
 function defaultScheduleTime() {
-  const date = new Date();
-  date.setDate(date.getDate() + ((4 - date.getDay() + 7) % 7 || 7));
-  date.setHours(19, 30, 0, 0);
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 16);
+  const date = businessTodayCursor();
+  const day = date.getUTCDay();
+  date.setUTCDate(date.getUTCDate() + ((4 - day + 7) % 7 || 7));
+  const { year, month, day: dayOfMonth } = calendarDateParts(date);
+  return `${year}-${String(month).padStart(2, '0')}-${String(dayOfMonth).padStart(2, '0')}T19:30`;
 }
 
 function legacyMeetingUrl(room: string | null) {
@@ -148,7 +202,7 @@ function focusReturnTarget() {
     ?? active;
 }
 
-function useDialogA11y(onClose: () => void, label = 'dialog') {
+function useDialogA11y(onClose: () => void, label = 'dialog', suppressFocusRestore?: { readonly current: boolean }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   const tokenRef = useRef<DialogToken | null>(null);
@@ -166,20 +220,24 @@ function useDialogA11y(onClose: () => void, label = 'dialog') {
     return () => {
       const shouldRestoreFocus = dialogStack.isTop(token);
       release();
-      if (!shouldRestoreFocus) return;
+      if (!shouldRestoreFocus || suppressFocusRestore?.current) return;
       let attempts = 0;
       const restoreFocus = () => {
         if (dialogStack.isRegistered(token)) return;
         const original = returnFocusRef.current;
         const fallback = returnFocusKey ? document.querySelector<HTMLElement>(`[data-focus-return="${CSS.escape(returnFocusKey)}"]`) : null;
-        const target = original?.isConnected ? original : fallback;
+        const underlyingDialog = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"]:not([inert])')).at(-1);
+        const dialogFallback = underlyingDialog?.querySelector<HTMLElement>('[data-initial-focus]')
+          ?? underlyingDialog?.querySelector<HTMLElement>(focusableSelector)
+          ?? underlyingDialog;
+        const target = original?.isConnected ? original : fallback ?? dialogFallback;
         if (target && !target.matches(':disabled') && !target.closest('[inert]')) target.focus();
         else if (attempts++ < 30) window.requestAnimationFrame(restoreFocus);
         else document.querySelector<HTMLElement>('#topics h2')?.focus();
       };
       window.requestAnimationFrame(restoreFocus);
     };
-  }, [returnFocusKey, token]);
+  }, [returnFocusKey, suppressFocusRestore, token]);
 
   useLayoutEffect(() => {
     if (!isTop || initialFocusHandledRef.current) return;
@@ -244,7 +302,7 @@ function FireVisual() {
   );
 }
 
-function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCollaborate, draggable, reordering, index, total, onDragStart, onDrop, onMove, now }: {
+function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCollaborate, draggable, reordering, index, total, onDragStart, onDrop, onMove, now, expansionMemory }: {
   topic: Topic;
   onAction: (kind: ModalKind, topic: Topic) => void;
   onParticipants: (topic: Topic) => void;
@@ -259,10 +317,112 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCo
   onDrop: (id: number) => void;
   onMove: (id: number, direction: -1 | 1) => void;
   now: Date;
+  expansionMemory: { current: Map<number, TopicExpansionMemory> };
 }) {
   const phase = topicPhase(topic, now);
   const meta = topicDisplayMeta(topic, now);
   const hasMeetingUrl = topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic));
+  const semanticTakeaway = topic.status === 'ARCHIVED' ? topic.takeaway : null;
+  const rememberedExpansion = expansionMemory.current.get(topic.id);
+  const [summaryExpanded, setSummaryExpanded] = useState(Boolean(rememberedExpansion?.summary === topic.summary && rememberedExpansion.summaryExpanded));
+  const [takeawayExpanded, setTakeawayExpanded] = useState(Boolean(rememberedExpansion?.takeaway === semanticTakeaway && rememberedExpansion.takeawayExpanded));
+  const [summaryCanExpand, setSummaryCanExpand] = useState(false);
+  const [takeawayCanExpand, setTakeawayCanExpand] = useState(false);
+  const summaryTextRef = useRef<HTMLParagraphElement>(null);
+  const takeawayTextRef = useRef<HTMLParagraphElement>(null);
+  const summaryExpanderRef = useRef<HTMLButtonElement>(null);
+  const takeawayExpanderRef = useRef<HTMLButtonElement>(null);
+  const summaryCollapsePending = useRef(false);
+  const takeawayCollapsePending = useRef(false);
+  const summarySemanticRef = useRef(topic.summary);
+  const takeawaySemanticRef = useRef(semanticTakeaway);
+  const summaryId = `topic-summary-${topic.id}`;
+  const takeawayId = `topic-takeaway-${topic.id}`;
+  const measureClampedOverflow = useCallback((element: HTMLParagraphElement | null) => {
+    if (!element?.parentElement || element.clientWidth === 0) return false;
+    const clone = element.cloneNode(true) as HTMLParagraphElement;
+    clone.removeAttribute('id');
+    clone.classList.add('is-clamped');
+    Object.assign(clone.style, {
+      position: 'absolute',
+      left: '-100000px',
+      top: '0',
+      width: `${element.clientWidth}px`,
+      visibility: 'hidden',
+      pointerEvents: 'none',
+    });
+    element.parentElement.appendChild(clone);
+    const overflows = clone.scrollHeight > clone.clientHeight + 1;
+    clone.remove();
+    return overflows;
+  }, []);
+  const rememberExpansion = (kind: 'summary' | 'takeaway', expanded: boolean) => {
+    const previous = expansionMemory.current.get(topic.id);
+    expansionMemory.current.set(topic.id, {
+      summary: topic.summary,
+      summaryExpanded: kind === 'summary' ? expanded : previous?.summary === topic.summary && Boolean(previous.summaryExpanded),
+      takeaway: semanticTakeaway,
+      takeawayExpanded: kind === 'takeaway' ? expanded : previous?.takeaway === semanticTakeaway && Boolean(previous.takeawayExpanded),
+    });
+  };
+  useLayoutEffect(() => {
+    if (topic.summary !== summarySemanticRef.current) {
+      setSummaryExpanded(false);
+      summaryCollapsePending.current = false;
+      summarySemanticRef.current = topic.summary;
+      rememberExpansion('summary', false);
+    }
+  }, [topic.summary]);
+  useLayoutEffect(() => {
+    if (semanticTakeaway !== takeawaySemanticRef.current) {
+      setTakeawayExpanded(false);
+      takeawayCollapsePending.current = false;
+      takeawaySemanticRef.current = semanticTakeaway;
+      rememberExpansion('takeaway', false);
+    }
+  }, [semanticTakeaway]);
+  useLayoutEffect(() => {
+    const element = summaryTextRef.current;
+    if (!element) return;
+    const measure = () => setSummaryCanExpand(measureClampedOverflow(element));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [measureClampedOverflow, topic.summary]);
+  useLayoutEffect(() => {
+    const element = takeawayTextRef.current;
+    if (!element) {
+      setTakeawayCanExpand(false);
+      return;
+    }
+    const measure = () => setTakeawayCanExpand(measureClampedOverflow(element));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [measureClampedOverflow, topic.takeaway]);
+  const keepCollapsedControlVisible = useCallback((button: HTMLButtonElement | null) => {
+    if (!button || document.activeElement !== button) return;
+    const headerBottom = document.querySelector<HTMLElement>('.site-header')?.getBoundingClientRect().bottom ?? 0;
+    const safeTop = headerBottom + 8;
+    const safeBottom = window.innerHeight - 8;
+    const rect = button.getBoundingClientRect();
+    const delta = rect.top < safeTop ? rect.top - safeTop : rect.bottom > safeBottom ? rect.bottom - safeBottom : 0;
+    if (delta !== 0) window.scrollBy({ top: delta, left: 0, behavior: 'auto' });
+  }, []);
+  useLayoutEffect(() => {
+    if (summaryExpanded || !summaryCollapsePending.current) return;
+    summaryCollapsePending.current = false;
+    const frame = requestAnimationFrame(() => keepCollapsedControlVisible(summaryExpanderRef.current));
+    return () => cancelAnimationFrame(frame);
+  }, [keepCollapsedControlVisible, summaryExpanded]);
+  useLayoutEffect(() => {
+    if (takeawayExpanded || !takeawayCollapsePending.current) return;
+    takeawayCollapsePending.current = false;
+    const frame = requestAnimationFrame(() => keepCollapsedControlVisible(takeawayExpanderRef.current));
+    return () => cancelAnimationFrame(frame);
+  }, [keepCollapsedControlVisible, takeawayExpanded]);
   return (
     <article
       className={`topic-card topic-${meta.className} ${draggable ? 'is-draggable' : ''}`}
@@ -287,21 +447,56 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCo
         {topic.tags.map((tag) => <span key={tag}>{tag}</span>)}
       </div>
       <h3>{topic.title}</h3>
-      <p className="topic-summary">{topic.summary}</p>
+      <p
+        ref={summaryTextRef}
+        id={summaryId}
+        className={`topic-summary ${summaryCanExpand ? 'has-expander' : ''} ${!summaryExpanded ? 'is-clamped' : ''}`}
+      >{topic.summary}</p>
+      {summaryCanExpand && <button
+        ref={summaryExpanderRef}
+        className="text-expander summary-expander"
+        type="button"
+        aria-controls={summaryId}
+        aria-expanded={summaryExpanded}
+        onClick={() => {
+          if (summaryExpanded) summaryCollapsePending.current = true;
+          setSummaryExpanded((expanded) => {
+            rememberExpansion('summary', !expanded);
+            return !expanded;
+          });
+        }}
+      >{summaryExpanded ? '收起议题简介' : '展开议题简介'}</button>}
 
-      {topic.status === 'SCHEDULED' && topic.scheduledAt && (
-        <div className="schedule-box">
-          <div><CalendarDays size={16} /><strong>{formatDate(topic.scheduledAt)}</strong></div>
+      {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && topic.scheduledAt && (
+        <div className={`schedule-box ${topic.status === 'ARCHIVED' ? 'archived-schedule' : ''}`}>
+          <div><CalendarDays size={16} /><strong>{formatDate(topic.scheduledAt, topic.status === 'ARCHIVED' || isDifferentBusinessYear(topic.scheduledAt, now))}</strong></div>
           <div><MapPin size={15} /><span>{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room}</span><Clock3 size={15} /><span>{topic.duration} 分钟</span></div>
-          {hasMeetingUrl && canAttendPhase(phase) && <button className="meeting-link" onClick={() => onMeeting(topic)}><LinkIcon size={14} />加入会议</button>}
-          {phase === 'LIVE' && <p className="schedule-phase live">分享正在进行，仍可报名或加入会议。</p>}
-          {phase === 'ENDED' && <p className="schedule-phase ended">分享已结束，等待归档。</p>}
-          {!phase && <p className="schedule-phase ended">排期信息不完整，请编辑议题进行修正。</p>}
+          {topic.status === 'SCHEDULED' && hasMeetingUrl && canAttendPhase(phase) && <button className="meeting-link" onClick={() => onMeeting(topic)}><LinkIcon size={14} />加入会议</button>}
+          {topic.status === 'SCHEDULED' && phase === 'LIVE' && <p className="schedule-phase live">分享正在进行，仍可报名{hasMeetingUrl ? '或加入会议' : '并按地点到场'}。</p>}
+          {topic.status === 'SCHEDULED' && phase === 'ENDED' && <p className="schedule-phase ended">分享已结束，等待归档。</p>}
+          {topic.status === 'SCHEDULED' && !phase && <p className="schedule-phase ended">排期信息不完整，请编辑议题进行修正。</p>}
         </div>
       )}
 
       {topic.status === 'ARCHIVED' && topic.takeaway && (
-        <div className="takeaway"><Lightbulb size={16} /><p><b>炉边余温</b>{topic.takeaway}</p></div>
+        <div className="takeaway"><Lightbulb size={16} /><div className="takeaway-content"><p
+          ref={takeawayTextRef}
+          id={takeawayId}
+          className={!takeawayExpanded ? 'is-clamped' : ''}
+        ><b>炉边余温</b>{topic.takeaway}</p>{takeawayCanExpand && <button
+          ref={takeawayExpanderRef}
+          className="text-expander takeaway-expander"
+          type="button"
+          aria-controls={takeawayId}
+          aria-expanded={takeawayExpanded}
+          onClick={() => {
+            if (takeawayExpanded) takeawayCollapsePending.current = true;
+            setTakeawayExpanded((expanded) => {
+              rememberExpansion('takeaway', !expanded);
+              return !expanded;
+            });
+          }}
+        >{takeawayExpanded ? '收起炉边余温' : '展开炉边余温'}</button>}</div></div>
       )}
 
       <div className="topic-footer">
@@ -334,42 +529,144 @@ function TopicCard({ topic, onAction, onParticipants, onPoster, onMeeting, canCo
         </div>
       </div>
       {canCollaborate && <div className="card-maintenance" aria-label="议题维护">
-        <button onClick={() => onAction('edit', topic)} aria-label={`编辑 ${topic.title}`}><Pencil size={14} />编辑</button>
+        <button data-edit-topic-id={topic.id} onClick={() => onAction('edit', topic)} aria-label={`编辑 ${topic.title}`}><Pencil size={14} />编辑</button>
         {canDeleteTopic(topic) && <button data-delete-topic-id={topic.id} className="danger" onClick={() => onAction('delete', topic)} aria-label={`删除 ${topic.title}`}><Trash2 size={14} />删除</button>}
       </div>}
     </article>
   );
 }
 
-function CalendarView({ topics, mode, cursor, onCursorChange, onOpen, onParticipants, onMeeting, onPoster, onShowOpenTopics, now }: {
+function DayAgendaModal({ date, events, scheduledTopics, now, focusRestoreSuppressed, onClose, onOpen }: {
+  date: Date;
+  events: Topic[];
+  scheduledTopics: Topic[];
+  now: Date;
+  focusRestoreSuppressed: { current: boolean };
+  onClose: () => void;
+  onOpen: (topic: Topic) => void;
+}) {
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'day-agenda', focusRestoreSuppressed);
+  const orderedEvents = sortTopicsBySchedule(events);
+  const dateLabel = calendarDateLabel(date, true);
+  const phases = orderedEvents.map((topic) => ({
+    topic,
+    phase: topicPhase(topic, now),
+    conflicts: topic.status === 'SCHEDULED' ? findScheduleConflicts(topic, scheduledTopics) : [],
+  }));
+  const allArchived = phases.length > 0 && phases.every(({ topic }) => topic.status === 'ARCHIVED');
+  const hasAttendable = phases.some(({ topic, phase }) => topic.status === 'SCHEDULED' && canAttendPhase(phase));
+  const hasMeeting = phases.some(({ topic, phase }) => topic.status === 'SCHEDULED' && canAttendPhase(phase)
+    && (topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic))));
+  const hasPoster = phases.some(({ topic, phase, conflicts }) => topic.status === 'SCHEDULED'
+    && phase === 'UPCOMING' && conflicts.length === 0);
+  const hasHistorical = phases.some(({ topic, phase }) => topic.status === 'ARCHIVED' || phase === 'ENDED');
+  const agendaIntro = allArchived
+    ? '这些活动均已归档。选择一场，可回顾参与伙伴与沉淀内容。'
+    : [
+      '同一天的活动按北京时间顺序进行。',
+      hasAttendable ? '正在进行或即将开始的活动可查看详情与报名。' : '',
+      hasMeeting ? '提供线上入口的活动可直接加入会议。' : '',
+      hasPoster ? '无排期冲突的待开始活动可生成专属海报。' : '',
+      hasHistorical ? '已结束或归档的活动可回顾参与伙伴与沉淀内容。' : '',
+    ].filter(Boolean).join('');
+  return <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
+    <div ref={dialogRef} className="modal day-agenda-modal" role="dialog" aria-modal="true" aria-labelledby="day-agenda-title" tabIndex={-1} inert={!isTop}>
+      <button className="modal-close" onClick={onClose} aria-label="关闭当日议程"><X size={19} /></button>
+      <span className="modal-eyebrow"><CalendarDays size={14} /> DAY AGENDA · 当日议程</span>
+      <h2 id="day-agenda-title" data-initial-focus tabIndex={-1}>{dateLabel} · {orderedEvents.length} 场围炉</h2>
+      <p className="modal-intro">{agendaIntro}</p>
+      <div className="day-agenda-list">
+        {orderedEvents.map((topic, index) => {
+          const meta = topicDisplayMeta(topic, now);
+          const conflicts = topic.status === 'SCHEDULED' ? findScheduleConflicts(topic, scheduledTopics) : [];
+          const itemId = `agenda-${dateKey(date)}-${topic.id}`;
+          return <button
+            key={topic.id}
+            className={`day-agenda-item ${meta.className} ${conflicts.length ? 'overlap' : ''}`}
+            data-focus-return={`agenda-${dateKey(date)}-topic-${topic.id}`}
+            onClick={() => onOpen(topic)}
+            aria-labelledby={`${itemId}-order ${itemId}-time ${itemId}-title`}
+            aria-describedby={`${itemId}-meta ${itemId}-place${conflicts.length ? ` ${itemId}-warning` : ''}`}
+          >
+            <span id={`${itemId}-order`} className="day-agenda-order">第 {index + 1} 场</span>
+            <time id={`${itemId}-time`} dateTime={topic.scheduledAt ?? undefined}>{topicTimeRange(topic)}</time>
+            <strong id={`${itemId}-title`}>{topic.title}</strong>
+            <span id={`${itemId}-meta`} className="day-agenda-meta"><i className={`status-pill ${meta.className}`}>{meta.label}</i><i><UserRound size={13} />{topic.presenter ?? '分享人待定'}</i><i><Users size={13} />{topic.participantCount} 人报名</i></span>
+            <span id={`${itemId}-place`} className="day-agenda-place"><MapPin size={13} />{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '地点待定'}</span>
+            {conflicts.length > 0 && <span id={`${itemId}-warning`} className="day-agenda-warning">历史排期存在重叠，请先调整时间再宣传</span>}
+            <ArrowRight size={17} />
+          </button>;
+        })}
+      </div>
+    </div>
+  </div>;
+}
+
+function CalendarView({ topics, conflictTopics, mode, cursor, onCursorChange, onFocusDestination, onOpen, focusRestoreSuppressed, onParticipants, onMeeting, onPoster, onShowOpenTopics, hasActiveConditions, onClearConditions, now }: {
   topics: Topic[];
+  conflictTopics: Topic[];
   mode: Exclude<ViewMode, 'list'>;
   cursor: Date;
   onCursorChange: (date: Date) => void;
+  onFocusDestination: (selector: string, fallbackSelector?: string, avoidStickyHeader?: boolean) => void;
   onOpen: (topic: Topic) => void;
+  focusRestoreSuppressed: { current: boolean };
   onParticipants: (topic: Topic) => void;
   onMeeting: (topic: Topic) => void;
   onPoster: (topic: Topic) => void;
   onShowOpenTopics: () => void;
+  hasActiveConditions: boolean;
+  onClearConditions: () => void;
   now: Date;
 }) {
-  const today = new Date();
-  const [expandedDays, setExpandedDays] = useState<Set<string>>(() => new Set());
+  const today = businessTodayCursor(now);
+  const [agendaDay, setAgendaDay] = useState<Date | null>(null);
   const [todayFocusVersion, setTodayFocusVersion] = useState(0);
+  const monthScrollRef = useRef<HTMLDivElement>(null);
   const weekScrollRef = useRef<HTMLDivElement>(null);
   const scheduledTopics = topics.filter((topic) => topic.scheduledAt);
+  const activeScheduleTopics = conflictTopics.filter((topic) => topic.status === 'SCHEDULED' && topic.scheduledAt);
   const weekStart = startOfWeek(cursor);
   const days = mode === 'month'
     ? buildMonthDays(cursor)
     : buildWeekDays(cursor);
   const rangeEnd = days.at(-1)!;
+  const cursorParts = calendarDateParts(cursor);
+  const weekStartParts = calendarDateParts(weekStart);
+  const rangeEndParts = calendarDateParts(rangeEnd);
   const title = mode === 'month'
-    ? `${cursor.getFullYear()} 年 ${cursor.getMonth() + 1} 月`
-    : `${weekStart.getMonth() + 1}月${weekStart.getDate()}日 — ${rangeEnd.getMonth() + 1}月${rangeEnd.getDate()}日`;
+    ? `${cursorParts.year} 年 ${cursorParts.month} 月`
+    : weekStartParts.year === rangeEndParts.year
+      ? `${weekStartParts.year}年${weekStartParts.month}月${weekStartParts.day}日 — ${rangeEndParts.month}月${rangeEndParts.day}日`
+      : `${weekStartParts.year}年${weekStartParts.month}月${weekStartParts.day}日 — ${rangeEndParts.year}年${rangeEndParts.month}月${rangeEndParts.day}日`;
   const hasEventsInRange = days.some((day) => scheduledTopics.some((topic) => topic.scheduledAt && dateKey(new Date(topic.scheduledAt)) === dateKey(day)));
-  const nextTopic = scheduledTopics
-    .filter((topic) => topic.scheduledAt && new Date(topic.scheduledAt).getTime() > rangeEnd.getTime() + 86_400_000)
-    .sort((a, b) => new Date(a.scheduledAt!).getTime() - new Date(b.scheduledAt!).getTime())[0];
+  const nextTopic = sortTopicsBySchedule(scheduledTopics.filter((topic) => topicPhase(topic, now) === 'UPCOMING'))
+    .find((topic) => topic.scheduledAt && dateKey(topic.scheduledAt ? new Date(topic.scheduledAt) : now) > dateKey(rangeEnd));
+
+  useLayoutEffect(() => {
+    if (mode !== 'month') return;
+    const frame = window.requestAnimationFrame(() => {
+      const container = monthScrollRef.current;
+      const todayCell = container?.querySelector<HTMLElement>('.calendar-day.today');
+      if (!container) return;
+      const currentMonth = calendarDateParts(today);
+      const viewedMonth = calendarDateParts(cursor);
+      if (!todayCell || currentMonth.year !== viewedMonth.year || currentMonth.month !== viewedMonth.month) {
+        container.scrollTo({ left: 0, behavior: 'auto' });
+        return;
+      }
+      const padding = 12;
+      const cellLeft = todayCell.offsetLeft;
+      const cellRight = cellLeft + todayCell.offsetWidth;
+      const visibleLeft = container.scrollLeft;
+      const visibleRight = visibleLeft + container.clientWidth;
+      let nextLeft = visibleLeft;
+      if (cellLeft < visibleLeft + padding) nextLeft = Math.max(0, cellLeft - padding);
+      else if (cellRight > visibleRight - padding) nextLeft = Math.max(0, cellRight - container.clientWidth + padding);
+      if (nextLeft !== visibleLeft) container.scrollTo({ left: nextLeft, behavior: todayFocusVersion ? 'smooth' : 'auto' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [mode, todayFocusVersion, dateKey(cursor), dateKey(today)]);
 
   useLayoutEffect(() => {
     if (mode !== 'week') return;
@@ -384,25 +681,35 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onOpen, onParticip
 
   function changePeriod(direction: number) {
     const next = new Date(cursor);
-    if (mode === 'month') next.setMonth(next.getMonth() + direction, 1);
-    else next.setDate(next.getDate() + direction * 7);
+    if (mode === 'month') next.setUTCMonth(next.getUTCMonth() + direction, 1);
+    else next.setUTCDate(next.getUTCDate() + direction * 7);
     onCursorChange(next);
     setTodayFocusVersion((version) => version + 1);
   }
 
   function goToday() {
-    onCursorChange(new Date());
+    onCursorChange(businessTodayCursor());
     setTodayFocusVersion((version) => version + 1);
+  }
+
+  function goToNextTopic() {
+    if (!nextTopic?.scheduledAt) return;
+    onCursorChange(new Date(nextTopic.scheduledAt));
+    onFocusDestination(`[data-week-topic-id="${nextTopic.id}"] .week-event-main`, '.calendar-toolbar h3', true);
   }
 
   function eventsForDate(date: Date) {
     const key = dateKey(date);
-    return scheduledTopics
-      .filter((topic) => topic.scheduledAt && dateKey(new Date(topic.scheduledAt)) === key)
-      .sort((a, b) => new Date(a.scheduledAt!).getTime() - new Date(b.scheduledAt!).getTime());
+    return sortTopicsBySchedule(scheduledTopics
+      .filter((topic) => topic.scheduledAt && dateKey(new Date(topic.scheduledAt)) === key));
   }
 
-  return (
+  function openAgenda(date: Date) {
+    focusRestoreSuppressed.current = false;
+    setAgendaDay(date);
+  }
+
+  return <>
     <div className={`calendar-shell ${mode}`}>
       <div className="calendar-toolbar">
         <div className="calendar-nav">
@@ -410,36 +717,34 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onOpen, onParticip
           <button className="today-button" onClick={goToday}>今天</button>
           <button onClick={() => changePeriod(1)} aria-label="下一个周期"><ChevronRight size={16} /></button>
         </div>
-        <h3>{title}</h3>
-        <div className="calendar-legend"><span className="scheduled" />已排期 <span className="live" />进行中 <span className="ended" />待归档 <span className="archived" />已经归档</div>
+        <h3 tabIndex={-1}>{title}</h3>
+        <div className="calendar-legend"><b>时间均为北京时间</b><span className="scheduled" />已排期 <span className="live" />进行中 <span className="ended" />待归档 <span className="archived" />已经归档 <span className="overlap" />排期重叠</div>
       </div>
 
       {mode === 'month' ? (
-        <div className="month-scroll">
+        <div className="month-scroll" ref={monthScrollRef}>
           <div className="month-calendar">
             {['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((day) => <div className="weekday" key={day}>{day}</div>)}
             {days.map((day) => {
               const events = eventsForDate(day);
               const key = dateKey(day);
-              const expanded = expandedDays.has(key);
               const isToday = dateKey(day) === dateKey(today);
-              const outside = day.getMonth() !== cursor.getMonth();
+              const dayParts = calendarDateParts(day);
+              const outside = dayParts.month !== cursorParts.month;
               return <div className={`calendar-day ${isToday ? 'today' : ''} ${outside ? 'outside' : ''}`} key={key}>
-                <span className="day-number">{day.getDate()}</span>
+                <div className="calendar-day-head"><span className="day-number">{dayParts.day}</span>{events.length > 0 && <span className="day-count">{events.length} 场</span>}</div>
                 <div className="day-events">
-                  {events.slice(0, expanded ? events.length : 3).map((topic) => {
+                  {events.slice(0, 3).map((topic) => {
                     const meta = topicDisplayMeta(topic, now);
-                    return <button key={topic.id} className={`calendar-event ${meta.className}`} onClick={() => onOpen(topic)} title={`${meta.label} · ${topic.title}`} aria-label={`查看活动 ${topic.title}`}>
-                      <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
+                    const conflicts = topic.status === 'SCHEDULED' ? findScheduleConflicts(topic, activeScheduleTopics) : [];
+                    const time = formatBusinessTime(topic.scheduledAt!).replace(' 北京时间', '');
+                    return <button key={topic.id} className={`calendar-event ${meta.className} ${conflicts.length ? 'overlap' : ''}`} onClick={() => onOpen(topic)} title={`${meta.label} · ${topic.title}`} aria-label={`查看活动，${time}，${topic.title}${conflicts.length ? '，排期存在重叠' : ''}`}>
+                      <time dateTime={topic.scheduledAt!}>{time}</time>
                       <span>{topic.title}</span>
-                      <i>{topic.participantCount} 人</i>
+                      <i className={conflicts.length ? 'calendar-overlap-note' : undefined}>{conflicts.length ? '排期重叠' : `${topic.participantCount} 人`}</i>
                     </button>;
                   })}
-                  {events.length > 3 && <button className="day-more" onClick={() => setExpandedDays((current) => {
-                    const next = new Set(current);
-                    if (next.has(key)) next.delete(key); else next.add(key);
-                    return next;
-                  })}>{expanded ? '收起' : `还有 ${events.length - 3} 个议题`}</button>}
+                  {events.length > 3 && <button className="day-more" data-focus-return={`agenda-${key}`} aria-haspopup="dialog" aria-label={`${calendarDateLabel(day, true)}共有 ${events.length} 场，查看全部当日议程`} onClick={() => openAgenda(day)}>另有 {events.length - 3} 场</button>}
                 </div>
               </div>;
             })}
@@ -452,85 +757,151 @@ function CalendarView({ topics, mode, cursor, onCursorChange, onOpen, onParticip
               const events = eventsForDate(day);
               const isToday = dateKey(day) === dateKey(today);
               return <div className={`week-day ${isToday ? 'today' : ''}`} key={dateKey(day)}>
-                <div className="week-day-head"><span>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'][day.getDay()]}</span><strong>{day.getDate()}</strong></div>
+                <div className="week-day-head"><span>{['周日', '周一', '周二', '周三', '周四', '周五', '周六'][day.getUTCDay()]}</span><strong>{calendarDateParts(day).day}</strong>{events.length > 0 && <i>{events.length} 场</i>}</div>
                 <div className="week-events">
-                  {events.length ? events.map((topic) => {
+                  {events.length ? events.slice(0, 3).map((topic) => {
                     const phase = topicPhase(topic, now);
                     const meta = topicDisplayMeta(topic, now);
                     const hasMeetingUrl = topic.status === 'SCHEDULED' && canAttendPhase(phase) && (topic.hasMeetingUrl || Boolean(topicMeetingUrl(topic)));
                     const canCreatePoster = phase === 'UPCOMING';
-                    return <div key={topic.id} className={`week-event ${meta.className}`} data-focus-return={`poster-${topic.id}`} tabIndex={-1}>
-                      <button className="week-event-main" onClick={() => onOpen(topic)} aria-label={`查看活动 ${topic.title}`}>
-                        <span className="week-phase">{meta.label}</span>
-                        <time>{new Date(topic.scheduledAt!).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</time>
-                        <strong>{topic.title}</strong>
-                        <span><UserRound size={12} />{topic.presenter ?? '待定'}</span>
-                        <span><MapPin size={12} />{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '地点待定'}</span>
-                        <span><Users size={12} />{topic.participantCount} 人报名</span>
-                        <small>{topic.duration ?? 0} 分钟</small>
+                    const conflicts = topic.status === 'SCHEDULED' ? findScheduleConflicts(topic, activeScheduleTopics) : [];
+                    const time = formatBusinessTime(topic.scheduledAt!).replace(' 北京时间', '');
+                    const itemId = `week-${dateKey(day)}-${topic.id}`;
+                    return <div key={topic.id} className={`week-event ${meta.className} ${conflicts.length ? 'overlap' : ''}`} data-week-topic-id={topic.id} data-focus-return={`poster-${topic.id}`} tabIndex={-1}>
+                      <button className="week-event-main" onClick={() => onOpen(topic)} aria-labelledby={`${itemId}-phase ${itemId}-time ${itemId}-title`} aria-describedby={`${itemId}-presenter ${itemId}-place ${itemId}-participants ${itemId}-duration${conflicts.length ? ` ${itemId}-warning` : ''}`}>
+                        <span id={`${itemId}-phase`} className="week-phase">{meta.label}</span>
+                        <time id={`${itemId}-time`} dateTime={topic.scheduledAt!}>{calendarDateLabel(day, true)} {time} 北京时间</time>
+                        <strong id={`${itemId}-title`}>{topic.title}</strong>
+                        <span id={`${itemId}-presenter`}><UserRound size={12} />{topic.presenter ?? '待定'}</span>
+                        <span id={`${itemId}-place`}><MapPin size={12} />{legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '地点待定'}</span>
+                        <span id={`${itemId}-participants`}><Users size={12} />{topic.participantCount} 人报名</span>
+                        <small id={`${itemId}-duration`}>{topic.duration ?? 0} 分钟</small>
+                        {conflicts.length > 0 && <span id={`${itemId}-warning`} className="week-overlap">排期重叠，请调整</span>}
                       </button>
-                      <button className="week-join" data-focus-return={`participants-${topic.id}`} onClick={() => onParticipants(topic)}><Users size={12} />{canAttendPhase(phase) ? '报名 / 查看参与' : '查看参与'}</button>
-                      {hasMeetingUrl && <button className="week-join" onClick={() => onMeeting(topic)}><LinkIcon size={12} />加入会议</button>}
-                      {canCreatePoster && <button className="week-join" data-focus-return={`poster-${topic.id}`} onClick={() => onPoster(topic)}><ImageDown size={12} />生成海报</button>}
+                      <button className="week-join" aria-label={`${canAttendPhase(phase) ? '报名或查看参与' : '查看参与'}：${time} ${topic.title}`} data-focus-return={`participants-${topic.id}`} onClick={() => onParticipants(topic)}><Users size={12} />{canAttendPhase(phase) ? '报名 / 查看参与' : '查看参与'}</button>
+                      {hasMeetingUrl && <button className="week-join" aria-label={`加入会议：${time} ${topic.title}`} onClick={() => onMeeting(topic)}><LinkIcon size={12} />加入会议</button>}
+                      {canCreatePoster && !conflicts.length && <button className="week-join" aria-label={`生成海报：${time} ${topic.title}`} data-focus-return={`poster-${topic.id}`} onClick={() => onPoster(topic)}><ImageDown size={12} />生成海报</button>}
                     </div>;
                   }) : <p className="no-events">留一晚给未知</p>}
+                  {events.length > 3 && <button className="week-more" data-focus-return={`agenda-${dateKey(day)}`} aria-haspopup="dialog" aria-label={`${calendarDateLabel(day, true)}共有 ${events.length} 场，查看全部当日议程`} onClick={() => openAgenda(day)}>查看当日全部 {events.length} 场</button>}
                 </div>
               </div>;
             })}
           </div>
           {!hasEventsInRange && <div className="calendar-empty-action">
-            <strong>本周还没有围炉活动</strong>
-            <p>{nextTopic ? `下一场是「${nextTopic.title}」` : '可以先认领一簇火种，准备下一场分享。'}</p>
-            <button onClick={() => nextTopic?.scheduledAt ? onCursorChange(new Date(nextTopic.scheduledAt)) : onShowOpenTopics()}>{nextTopic ? '查看下一场' : '查看待认领议题'}</button>
+            <strong>{hasActiveConditions ? '当前条件下，本周没有匹配活动' : '本周还没有围炉活动'}</strong>
+            <p>{hasActiveConditions ? '清除搜索与筛选后，可以继续查看这一周的完整安排。' : nextTopic ? `下一场是「${nextTopic.title}」` : '可以先认领一簇火种，准备下一场分享。'}</p>
+            <button onClick={hasActiveConditions ? onClearConditions : nextTopic ? goToNextTopic : onShowOpenTopics}>{hasActiveConditions ? '清除条件' : nextTopic ? '查看下一场' : '查看待认领议题'}</button>
           </div>}
         </div>
       )}
     </div>
-  );
+    {agendaDay && <DayAgendaModal date={agendaDay} events={eventsForDate(agendaDay)} scheduledTopics={activeScheduleTopics} now={now} focusRestoreSuppressed={focusRestoreSuppressed} onClose={() => setAgendaDay(null)} onOpen={onOpen} />}
+  </>;
 }
 
-function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersion, now }: {
+function ParticipantsModal({ topic, onClose, onChanged, onCountConfirmed, onConflict, focusRestoreSuppressed, unlockVersion, now }: {
   topic: Topic;
   onClose: () => void;
-  onChanged: () => void;
+  onChanged: (topicId: number, result: { revision: number; participantCount: number }) => void;
+  onCountConfirmed: (topicId: number, projection: { revision: number; participantCount: number }) => void;
   onConflict: (message: string) => void;
+  focusRestoreSuppressed: { readonly current: boolean };
   unlockVersion: number;
   now: Date;
 }) {
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const participantsRef = useRef<Participant[]>([]);
+  const [participantsConfirmed, setParticipantsConfirmed] = useState(false);
+  const [participantCount, setParticipantCount] = useState<number | null>(null);
+  const [participantReadFailed, setParticipantReadFailed] = useState(false);
+  const participantReadRequest = useRef(0);
+  const participantSnapshotRevision = useRef(topic.revision);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const errorRef = useRef<HTMLDivElement>(null);
+  const noticeRef = useRef<HTMLDivElement>(null);
   const canJoin = topic.status === 'SCHEDULED' && canAttendPhase(topicPhase(topic, now));
-  const { dialogRef, isTop } = useDialogA11y(onClose, 'participants');
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'participants', focusRestoreSuppressed);
 
-  const loadParticipants = useCallback(async () => {
+  const loadParticipants = useCallback(async (syncFailureMessage?: string) => {
+    const requestId = ++participantReadRequest.current;
     setLoading(true);
+    setParticipantReadFailed(false);
+    setNotice('');
     try {
-      setParticipants(await api.participants(topic.id));
+      const read = await api.participants(topic.id);
+      if (requestId !== participantReadRequest.current) return false;
+      const latest = read.participants;
+      participantSnapshotRevision.current = read.topicRevision;
+      participantsRef.current = latest;
+      setParticipants(latest);
+      setParticipantsConfirmed(true);
+      setParticipantCount(read.participantCount);
+      onCountConfirmed(topic.id, { revision: read.topicRevision, participantCount: read.participantCount });
       setError('');
+      return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : '报名名单加载失败');
+      if (requestId !== participantReadRequest.current) return false;
+      setParticipantReadFailed(true);
+      setError(syncFailureMessage ?? (err instanceof Error ? err.message : '报名名单加载失败'));
+      return false;
     } finally {
-      setLoading(false);
+      if (requestId === participantReadRequest.current) setLoading(false);
     }
-  }, [topic.id, unlockVersion]);
+  }, [topic.id, unlockVersion, onCountConfirmed]);
 
   useEffect(() => { void loadParticipants(); }, [loadParticipants]);
+  useEffect(() => {
+    if (topic.revision <= participantSnapshotRevision.current) return;
+    setParticipantsConfirmed(false);
+    setParticipantCount(null);
+    void loadParticipants('活动信息已经更新，但最新名单读取失败；当前人数暂不可用，请重新读取名单。');
+  }, [loadParticipants, topic.revision, topic.status]);
+  useEffect(() => {
+    if (!error) return;
+    const frame = window.requestAnimationFrame(() => errorRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [error]);
+  useEffect(() => {
+    if (!notice) return;
+    const frame = window.requestAnimationFrame(() => noticeRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [notice]);
 
   async function join(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
     setSubmitting(true);
+    setParticipantReadFailed(false);
     setError('');
+    setNotice('');
     try {
-      await api.join(topic.id, String(data.get('name')));
+      const mutation = await api.join(topic.id, String(data.get('name')));
+      const joined = mutation.result;
+      participantSnapshotRevision.current = mutation.topicRevision;
+      const next = participantsRef.current.some((participant) => participant.id === joined.id)
+        ? participantsRef.current.map((participant) => participant.id === joined.id ? joined : participant)
+        : [...participantsRef.current, joined];
+      participantsRef.current = next;
+      setParticipants(next);
+      setParticipantsConfirmed(true);
+      setParticipantCount(mutation.participantCount);
       form.reset();
-      await loadParticipants();
-      onChanged();
+      onChanged(topic.id, { revision: mutation.topicRevision, participantCount: mutation.participantCount });
+      await loadParticipants('报名已成功，名单同步暂时失败；页面已保留本次结果，可稍后重试。');
     } catch (err) {
       if (err instanceof ApiError && ['TOPIC_STATE_CONFLICT', 'ACTIVITY_TIME_CONFLICT'].includes(err.code ?? '')) return onConflict(err.message);
+      if (err instanceof ApiError && err.code === 'PARTICIPANT_DUPLICATE') {
+        setParticipantsConfirmed(false);
+        setParticipantCount(null);
+        const refreshed = await loadParticipants('这个名字已经报名，但最新名单读取失败；当前人数暂不可用，请重新读取名单。');
+        if (refreshed) setNotice('这个名字已在名单中，已刷新最新名单。');
+        return;
+      }
       setError(err instanceof Error ? err.message : '报名失败，请稍后重试');
     } finally {
       setSubmitting(false);
@@ -539,13 +910,28 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
 
   async function leave(participant: Participant) {
     setSubmitting(true);
+    setParticipantReadFailed(false);
     setError('');
+    setNotice('');
     try {
-      await api.leave(topic.id, participant.id);
-      await loadParticipants();
-      onChanged();
+      const mutation = await api.leave(topic.id, participant.id);
+      participantSnapshotRevision.current = mutation.topicRevision;
+      const next = participantsRef.current.filter((item) => item.id !== participant.id);
+      participantsRef.current = next;
+      setParticipants(next);
+      setParticipantsConfirmed(true);
+      setParticipantCount(mutation.participantCount);
+      onChanged(topic.id, { revision: mutation.topicRevision, participantCount: mutation.participantCount });
+      await loadParticipants('取消报名已成功，名单同步暂时失败；页面已移除该记录，可稍后重试。');
     } catch (err) {
       if (err instanceof ApiError && ['TOPIC_STATE_CONFLICT', 'ACTIVITY_TIME_CONFLICT'].includes(err.code ?? '')) return onConflict(err.message);
+      if (err instanceof ApiError && err.code === 'PARTICIPANT_NOT_FOUND') {
+        setParticipantsConfirmed(false);
+        setParticipantCount(null);
+        const refreshed = await loadParticipants('该报名已由其他协作者取消，但最新名单读取失败；当前人数暂不可用，请重新读取名单。');
+        if (refreshed) setNotice('该报名已由其他协作者取消，名单已刷新。');
+        return;
+      }
       setError(err instanceof Error ? err.message : '取消报名失败，请稍后重试');
     } finally {
       setSubmitting(false);
@@ -557,27 +943,31 @@ function ParticipantsModal({ topic, onClose, onChanged, onConflict, unlockVersio
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
       <span className="modal-eyebrow"><Users size={14} /> FIRESIDE GUESTS</span>
       <h2 id="participants-title">{canJoin ? '报名参加围炉' : '本期参与伙伴'}</h2>
-      <p className="modal-intro">可以来分享，也可以只守着火光坐一会儿。姓名是公开署名，当前不绑定个人账号。</p>
+      <p className="modal-intro">{canJoin
+        ? '可以来分享，也可以只守着火光坐一会儿。姓名仅向已解锁协作者显示；当前不绑定个人账号，协作者可代为取消报名。'
+        : '本期报名已经结束，名单仅供回顾。姓名只向已解锁协作者显示，当前阶段不能新增或取消报名。'}</p>
       <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>
-      {canJoin && <form className="join-form" onSubmit={join}>
+      {canJoin && participantsConfirmed && <form className="join-form" onSubmit={join}>
         <label>你的名字<input name="name" required maxLength={30} placeholder="怎么称呼你" autoFocus data-initial-focus /></label>
         <button className="submit-btn" disabled={submitting} type="submit">{submitting ? '正在处理…' : '确认报名'}{!submitting && <ChevronRight size={17} />}</button>
       </form>}
       <div className="participant-list" aria-live="polite">
-        <div className="participant-list-head"><b>参与名单</b><span>{participants.length} 人</span></div>
-        {loading ? <p>正在靠近炉火…</p> : participants.length === 0 ? <p>还没有人报名，成为第一位围炉伙伴吧。</p> : participants.map((participant) => <div className="participant-row" key={participant.id}>
+        <div className="participant-list-head"><b>参与名单</b><span>{participantCount === null ? '暂不可用' : `${participantCount} 人`}</span></div>
+        {loading ? <p>正在靠近炉火…</p> : !participantsConfirmed ? <p>名单暂时无法读取，不能据此判断是否无人报名；重新读取完整名单后才可报名。</p> : participants.length === 0 ? <p>{canJoin ? '还没有人报名，成为第一位围炉伙伴吧。' : '本期暂无参与记录。'}</p> : participants.map((participant) => <div className="participant-row" key={participant.id}>
           <span><UserRound size={14} />{participant.name}</span>
           {canJoin && <button disabled={submitting} onClick={() => void leave(participant)} aria-label={`取消 ${participant.name} 的报名`}>取消报名</button>}
         </div>)}
       </div>
-      {error && <div className="form-error">{error}</div>}
+      {notice && <div ref={noticeRef} className="participant-sync-notice" role="status" tabIndex={-1}>{notice}</div>}
+      {error && <div ref={errorRef} className="form-error" role="alert" tabIndex={-1}><span>{error}</span>{participantReadFailed && <button type="button" onClick={() => void loadParticipants()}>重新读取名单</button>}</div>}
     </div>
   </div>;
 }
 
-function ActivityDetailsModal({ topic, onClose, onTopicSync, onPageSync, onParticipants, onMeeting, onPoster, onAction, now }: {
+function ActivityDetailsModal({ topic, onClose, focusRestoreSuppressed, onTopicSync, onPageSync, onParticipants, onMeeting, onPoster, onAction, now }: {
   topic: Topic;
   onClose: () => void;
+  focusRestoreSuppressed: { readonly current: boolean };
   onTopicSync: (topic: Topic) => void;
   onPageSync: () => void;
   onParticipants: (topic: Topic) => void;
@@ -590,13 +980,13 @@ function ActivityDetailsModal({ topic, onClose, onTopicSync, onPageSync, onParti
   const [checking, setChecking] = useState(true);
   const [error, setError] = useState('');
   const [deleted, setDeleted] = useState(false);
-  const { dialogRef, isTop } = useDialogA11y(onClose, 'activity-details');
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'activity-details', focusRestoreSuppressed);
   const onTopicSyncRef = useRef(onTopicSync);
   const onPageSyncRef = useRef(onPageSync);
   onTopicSyncRef.current = onTopicSync;
   onPageSyncRef.current = onPageSync;
 
-  useEffect(() => setCurrentTopic(topic), [topic]);
+  useEffect(() => setCurrentTopic((current) => preferNewerTopic(current, topic)), [topic]);
 
   const refresh = useCallback(async () => {
     setChecking(true);
@@ -604,7 +994,7 @@ function ActivityDetailsModal({ topic, onClose, onTopicSync, onPageSync, onParti
     setDeleted(false);
     try {
       const latest = await api.topic(topic.id);
-      setCurrentTopic(latest);
+      setCurrentTopic((current) => preferNewerTopic(current, latest));
       onTopicSyncRef.current(latest);
     } catch (refreshError) {
       if (refreshError instanceof ApiError && refreshError.status === 404) {
@@ -630,9 +1020,9 @@ function ActivityDetailsModal({ topic, onClose, onTopicSync, onPageSync, onParti
   const phaseDescription = currentTopic.status === 'ARCHIVED'
     ? '本期已经归档，仍可查看参与伙伴与沉淀资料。'
     : phase === 'UPCOMING'
-      ? '活动尚未开始，可以报名、邀请伙伴或加入线上会议。'
+      ? `活动尚未开始，可以报名、邀请伙伴${hasMeetingUrl ? '或加入线上会议' : '并按地点到场'}。`
       : phase === 'LIVE'
-        ? '活动正在进行，仍可报名或加入线上会议。'
+        ? `活动正在进行，仍可报名${hasMeetingUrl ? '或加入线上会议' : '并按地点到场'}。`
         : phase === 'ENDED'
           ? '活动已经结束，请查看参与并完成归档，或标记未举行后重新排期。'
           : '活动排期已变化，请返回议题广场查看最新状态。';
@@ -655,6 +1045,8 @@ function ActivityDetailsModal({ topic, onClose, onTopicSync, onPageSync, onParti
         <div><UserRound size={16} /><span>分享人</span><strong>{currentTopic.presenter ?? '待定'}</strong></div>
         <div><MapPin size={16} /><span>地点</span><strong>{legacyMeetingUrl(currentTopic.room) ? '线上会议' : currentTopic.room ?? '地点待定'}</strong></div>
       </div> : <div className="activity-unavailable"><CalendarX2 size={18} /><span>{deleted ? '这场活动已被删除。' : '这场活动已取消排期或状态已经变化。'}</span></div>}
+
+      {currentTopic.status === 'ARCHIVED' && currentTopic.takeaway && <section className="activity-takeaway" aria-label="本期收获"><Lightbulb size={18} /><div><span>本期收获</span><p>{currentTopic.takeaway}</p></div></section>}
 
       <p className="activity-phase-copy">{phaseDescription}</p>
       {checking && <p className="activity-refresh-note" aria-live="polite">正在确认最新活动信息…</p>}
@@ -761,9 +1153,36 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
         return;
       }
 
+      let sameDayPrograms: Topic[] | null = null;
+      try {
+        const publicSnapshot = await api.topics('schedule');
+        const targetDate = dateKey(new Date(latest.scheduledAt!));
+        const activePrograms = sortTopicsBySchedule([
+          ...publicSnapshot.topics.filter((candidate) => candidate.id !== latest.id
+            && candidate.status === 'SCHEDULED'
+            && candidate.scheduledAt),
+          latest,
+        ]);
+        const conflicts = findScheduleConflicts(latest, activePrograms);
+        if (conflicts.length > 0) {
+          setError(`历史排期与「${conflicts[0].title}」存在重叠，请先调整时间再生成海报。`);
+          setPhase('unavailable');
+          onSyncRef.current();
+          return;
+        }
+        sameDayPrograms = activePrograms.filter((candidate) => candidate.scheduledAt
+          && dateKey(new Date(candidate.scheduledAt)) === targetDate);
+      } catch {
+        // The target resource is authoritative. If the public collection cannot
+        // be refreshed, safely generate a single-session poster without an N/M label.
+      }
+
       let latestModel: ReturnType<typeof buildPosterModel>;
       try {
-        latestModel = buildPosterModel(latest, window.location.origin);
+        const position = sameDayPrograms?.findIndex((candidate) => candidate.id === latest.id) ?? -1;
+        latestModel = buildPosterModel(latest, window.location.origin, new Date(), position >= 0 && sameDayPrograms
+          ? { position: position + 1, total: sameDayPrograms.length }
+          : undefined);
       } catch (err) {
         setError(err instanceof Error ? err.message : '最新议题信息不完整，无法生成海报');
         setPhase('unavailable');
@@ -785,7 +1204,10 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
         setPosterUrl(objectUrl);
         setCanShare(Boolean(navigator.canShare?.({ files: [file] })));
         setPhase('ready');
-        setNotice(sourceUpdated ? '检测到议题已更新，海报已按刚刚确认的最新排期生成。' : '');
+        setNotice([
+          sourceUpdated ? '检测到议题已更新，海报已按刚刚确认的最新排期生成。' : '',
+          sameDayPrograms === null ? '未能读取当日完整议程，已安全生成不含场次编号的单议题海报。' : '',
+        ].filter(Boolean).join(' '));
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : '海报生成失败，请重试');
@@ -842,14 +1264,14 @@ function PosterModal({ topic, onClose, onSync }: { topic: Topic; onClose: () => 
         <div className="poster-preview" aria-live="polite">
           <canvas ref={canvasRef} className="poster-canvas-source" aria-hidden="true" />
           {busy && <div className="poster-status"><Flame className="loading-flame" /><span>{phase === 'checking' ? '正在确认最新议题与排期…' : '正在举起火炬…'}</span></div>}
-          {phase === 'ready' && posterUrl && model && <img src={posterUrl} alt={`围炉夜话宣讲海报：${model.title}，${model.date} ${model.time}`} />}
+          {phase === 'ready' && posterUrl && model && <img src={posterUrl} alt={`围炉夜话宣讲海报：${model.programLabel}，议题 #${String(model.topicId).padStart(3, '0')}，${model.title}，${model.date} ${model.time}`} />}
           {!busy && phase !== 'ready' && error && <div ref={errorRef} className="poster-status error" role="alert" tabIndex={-1}><span>{error}</span>{retryable
             ? <button onClick={() => setAttempt((value) => value + 1)}>重新读取并生成</button>
             : <button onClick={onClose}>返回议题广场</button>}</div>}
         </div>
         <div className="poster-side">
           {model && <div className="poster-summary">
-            <span>即将开讲</span>
+            <span>{model.programLabel} · 议题 #{String(model.topicId).padStart(3, '0')}</span>
             <strong>{model.title}</strong>
             <p>{model.date}<br />{model.time}</p>
             <p>分享人 · {model.presenter}<br />{model.location}</p>
@@ -965,16 +1387,20 @@ function AccessModal({ message, rateLimitedUntil, onClose, onRateLimited, onUnlo
   </div>;
 }
 
-function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
+function MeetingModal({ topic, onClose, onConflict, focusRestoreSuppressed, unlockVersion, now }: {
   topic: Topic;
   onClose: () => void;
-  onConflict: (message: string) => void;
+  onConflict: (message: string, latestTopic?: Topic, topicMissing?: boolean) => void;
+  focusRestoreSuppressed: { readonly current: boolean };
   unlockVersion: number;
   now: Date;
 }) {
-  const { dialogRef, isTop } = useDialogA11y(onClose, 'meeting');
+  const { dialogRef, isTop } = useDialogA11y(onClose, 'meeting', focusRestoreSuppressed);
   const [meetingUrl, setMeetingUrl] = useState('');
   const [error, setError] = useState('');
+  const [readAttempt, setReadAttempt] = useState(0);
+  const retryRef = useRef<HTMLButtonElement>(null);
+  const meetingLinkRef = useRef<HTMLAnchorElement>(null);
   const phase = topicPhase(topic, now);
   const phaseHandled = useRef(false);
   const onConflictRef = useRef(onConflict);
@@ -989,19 +1415,33 @@ function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
     let active = true;
     setMeetingUrl('');
     setError('');
-    void api.meetingAccess(topic.id)
-      .then(({ meetingUrl: value }) => { if (active) setMeetingUrl(value); })
-      .catch((err) => {
+    void verifiedMeetingAccess(topic.id)
+      .then(({ meetingUrl: value, topic: latest }) => {
         if (!active) return;
-        if (err instanceof ApiError && err.code === 'ACTIVITY_TIME_CONFLICT') {
+        if (!value) {
           phaseHandled.current = true;
-          onConflictRef.current(err.message);
+          onConflictRef.current('会议入口对应的议题已更新，旧地址未显示', latest);
           return;
         }
-        setError(err instanceof Error ? err.message : '会议入口加载失败');
+        setMeetingUrl(value);
+      })
+      .catch((err) => {
+        if (!active) return;
+        if (err instanceof ApiError && (err.code === 'ACTIVITY_TIME_CONFLICT' || err.status === 404)) {
+          phaseHandled.current = true;
+          onConflictRef.current(err.message, undefined, err.status === 404);
+          return;
+        }
+        setError(err instanceof Error ? err.message : '会议入口加载失败；旧地址未显示');
       });
     return () => { active = false; };
-  }, [phase, topic.id, unlockVersion]);
+  }, [phase, readAttempt, topic.id, unlockVersion]);
+  useEffect(() => {
+    if (error) retryRef.current?.focus();
+  }, [error]);
+  useEffect(() => {
+    if (meetingUrl) meetingLinkRef.current?.focus();
+  }, [meetingUrl]);
   return <div className="modal-backdrop" onMouseDown={(event) => isTop && event.target === event.currentTarget && onClose()}>
     <div ref={dialogRef} className="modal meeting-modal" role="dialog" aria-modal="true" aria-labelledby="meeting-title" tabIndex={-1} inert={!isTop}>
       <button className="modal-close" onClick={onClose} aria-label="关闭"><X size={19} /></button>
@@ -1011,25 +1451,36 @@ function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
       <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>
       <div className="meeting-access-panel" aria-live="polite">
         {!meetingUrl && !error && <p>正在准备会议入口…</p>}
-        {meetingUrl && <a className="submit-btn" href={meetingUrl} target="_blank" rel="noreferrer" data-initial-focus>进入线上会议 <ArrowRight size={16} /></a>}
-        {error && <div className="form-error">{error}</div>}
+        {meetingUrl && <a ref={meetingLinkRef} className="submit-btn" href={meetingUrl} target="_blank" rel="noreferrer" data-initial-focus>进入线上会议 <ArrowRight size={16} /></a>}
+        {error && <div className="form-error meeting-access-error" role="alert"><span>{error}</span><button
+          ref={retryRef}
+          type="button"
+          onClick={() => {
+            setMeetingUrl('');
+            setError('');
+            setReadAttempt((attempt) => attempt + 1);
+          }}
+        >重新读取会议入口</button></div>}
       </div>
     </div>
   </div>;
 }
 
-function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, canCollaborate, now }: {
+function Modal({ kind, topic, transitionNote, onClose, onComplete, onConflict, onTopicSync, onRequireAccess, canCollaborate, now }: {
   kind: ModalKind;
   topic: Topic | null;
+  transitionNote?: string;
   onClose: () => void;
-  onComplete: (message: string) => void;
+  onComplete: (message: string, completedTopic?: Topic, transitionNote?: string, affectedTopicId?: number) => void;
   onConflict?: (message: string, topicMissing?: boolean) => void;
+  onTopicSync: (topic: Topic) => void;
   onRequireAccess: (kind: ModalKind) => void;
   canCollaborate: boolean;
   now: Date;
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [scheduleConflicts, setScheduleConflicts] = useState<ScheduleConflict[]>([]);
   const [editRevision, setEditRevision] = useState(topic?.revision ?? 1);
   const [editBase, setEditBase] = useState(topic);
   const [editDraft, setEditDraft] = useState<EditDraft | null>(() => topic ? topicToEditDraft(topic) : null);
@@ -1041,19 +1492,36 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
   } | null>(null);
   const [revisionConflict, setRevisionConflict] = useState('');
   const [revisionConflictAttempt, setRevisionConflictAttempt] = useState(0);
+  const [unscheduleImpact, setUnscheduleImpact] = useState<{ topic: Topic; participants: Participant[] } | null>(null);
+  const [unscheduleImpactLoading, setUnscheduleImpactLoading] = useState(kind === 'unschedule');
+  const [unscheduleImpactError, setUnscheduleImpactError] = useState('');
+  const [unscheduleImpactNotice, setUnscheduleImpactNotice] = useState('');
+  const [participantsNotified, setParticipantsNotified] = useState(false);
+  const [copyNotice, setCopyNotice] = useState('');
   const revisionConflictRef = useRef<HTMLDivElement>(null);
+  const unscheduleImpactNoticeRef = useRef<HTMLDivElement>(null);
+  const unscheduleImpactRequest = useRef(0);
   const rescheduleConfirmRef = useRef<HTMLHeadingElement>(null);
   const submissionErrorRef = useRef<HTMLDivElement>(null);
   const editSubmitRef = useRef<HTMLButtonElement>(null);
   const editFormRef = useRef<HTMLFormElement>(null);
+  const activeRef = useRef(true);
   const conflictCloseHandled = useRef(false);
+  const openedFromDialog = useRef(Boolean(document.activeElement instanceof HTMLElement && document.activeElement.closest('[role="dialog"]')));
+  const suppressFocusRestore = useRef(kind === 'schedule' && Boolean(transitionNote));
   const phase = topic ? topicPhase(topic, now) : null;
-  const endedReset = kind === 'unschedule' && phase === 'ENDED';
+  const impactPhase = unscheduleImpact ? topicPhase(unscheduleImpact.topic, now) : phase;
+  const selectedTopic = kind === 'schedule' ? editBase ?? topic : topic;
+  const endedReset = kind === 'unschedule' && impactPhase === 'ENDED';
   const timeLocked = kind === 'edit' && (phase === 'LIVE' || phase === 'ENDED');
   const minimumScheduleAt = formatDateTimeInput(new Date(now.getTime() + 60_000).toISOString());
   const editScheduleMinimum = topic?.scheduledAt && new Date(topic.scheduledAt).getTime() < now.getTime() + 60_000
     ? formatDateTimeInput(topic.scheduledAt)
     : minimumScheduleAt;
+  useEffect(() => {
+    activeRef.current = true;
+    return () => { activeRef.current = false; };
+  }, []);
   function topicToEditDraft(source: Topic): EditDraft {
     return {
       title: source.title,
@@ -1073,12 +1541,37 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     if (kind === 'edit' && revisionConflict && onConflict) {
       if (conflictCloseHandled.current) return;
       conflictCloseHandled.current = true;
+      suppressFocusRestore.current = true;
       onConflict('已放弃本地草稿');
       return;
     }
     onClose();
   }
-  const { dialogRef, isTop } = useDialogA11y(closeModal, kind);
+  function completeAction(message: string, completedTopic?: Topic, nextTransitionNote?: string, affectedTopicId?: number) {
+    if (!openedFromDialog.current || (kind === 'unschedule' && completedTopic?.status === 'CLAIMED')) {
+      suppressFocusRestore.current = true;
+    }
+    onComplete(message, completedTopic, nextTransitionNote, affectedTopicId);
+  }
+  function conflictAction(message: string, topicMissing = false) {
+    suppressFocusRestore.current = true;
+    onConflict?.(message, topicMissing);
+  }
+  const { dialogRef, isTop } = useDialogA11y(closeModal, kind, suppressFocusRestore);
+  useEffect(() => {
+    if (kind !== 'schedule' || !transitionNote) return;
+    let focusFrame = 0;
+    const settleFrame = window.requestAnimationFrame(() => {
+      focusFrame = window.requestAnimationFrame(() => {
+        const dialog = dialogRef.current;
+        if (dialog && !dialog.hasAttribute('inert')) dialog.querySelector<HTMLElement>('[data-initial-focus]')?.focus();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(settleFrame);
+      window.cancelAnimationFrame(focusFrame);
+    };
+  }, [dialogRef, kind, transitionNote]);
   const copy = {
     create: { eyebrow: 'ADD A SPARK', title: '发起一个新议题', intro: '不必是完整答案，一个真实的问题就足够成为火种。' },
     claim: { eyebrow: 'PICK UP THE TORCH', title: '认领这个议题', intro: '认领不是承诺成为专家，只是愿意比昨晚多探索一点。' },
@@ -1098,6 +1591,44 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     const frame = window.requestAnimationFrame(() => revisionConflictRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [revisionConflict, revisionConflictAttempt]);
+
+  async function loadUnscheduleImpact(notice = '') {
+    if (kind !== 'unschedule' || !topic) return;
+    const requestId = ++unscheduleImpactRequest.current;
+    setUnscheduleImpactLoading(true);
+    setUnscheduleImpactError('');
+    setUnscheduleImpactNotice('');
+    setParticipantsNotified(false);
+    setCopyNotice('');
+    try {
+      const impact = await api.unscheduleImpact(topic.id);
+      if (requestId !== unscheduleImpactRequest.current) return;
+      setUnscheduleImpact(impact);
+      setUnscheduleImpactNotice(notice);
+    } catch (impactError) {
+      if (requestId !== unscheduleImpactRequest.current) return;
+      if (impactError instanceof ApiError && onConflict && (impactError.status === 404 || (impactError.status === 409 && impactError.code === 'TOPIC_STATE_CONFLICT'))) {
+        conflictAction(impactError.status === 404 ? '议题已被删除，本次操作无需继续' : `${impactError.message}，本次取消确认已失效`, impactError.status === 404);
+        return;
+      }
+      setUnscheduleImpact(null);
+      setUnscheduleImpactError(impactError instanceof Error ? impactError.message : '报名影响读取失败，请重试');
+    } finally {
+      if (requestId === unscheduleImpactRequest.current) setUnscheduleImpactLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (kind !== 'unschedule' || !topic) return;
+    void loadUnscheduleImpact();
+    return () => { unscheduleImpactRequest.current += 1; };
+  }, [kind, topic?.id]);
+
+  useEffect(() => {
+    if (!unscheduleImpactNotice) return;
+    const frame = window.requestAnimationFrame(() => unscheduleImpactNoticeRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [unscheduleImpactNotice]);
 
   useEffect(() => {
     if (!pendingEdit) return;
@@ -1122,6 +1653,24 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     return message;
   }
 
+  function retainScheduleOverlap(err: unknown) {
+    if (!(err instanceof ApiError) || err.code !== 'ACTIVITY_SCHEDULE_OVERLAP') return false;
+    setScheduleConflicts(err.conflicts ?? []);
+    setError(`${err.message}；当前填写内容已保留，未提交`);
+    setSubmitting(false);
+    return true;
+  }
+
+  function scheduleConflictDetails() {
+    if (!scheduleConflicts.length) return null;
+    return <ul className="schedule-conflicts">
+      {scheduleConflicts.map((conflict) => <li key={conflict.id}>
+        <strong>{conflict.title}</strong>
+        <span>{formatDate(conflict.scheduledAt, true)} · {conflict.duration} 分钟</span>
+      </li>)}
+    </ul>;
+  }
+
   function editPayload(data: FormData) {
     const base = editBase ?? topic;
     if (!base) return {} as Parameters<typeof api.update>[2];
@@ -1144,7 +1693,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     if (data.has('presenter')) setTextIfChanged('presenter', base.presenter);
     if (data.has('scheduledAt')) {
       const value = text('scheduledAt');
-      if (value !== formatDateTimeInput(base.scheduledAt)) payload.scheduledAt = new Date(value).toISOString();
+      if (value !== formatDateTimeInput(base.scheduledAt)) payload.scheduledAt = dateTimeInputToUtc(value);
     }
     if (data.has('duration')) {
       const value = Number(data.get('duration'));
@@ -1204,21 +1753,31 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     }
     try {
       let latest = await api.topic(topic.id);
+      if (!activeRef.current) return;
       if (latest.status !== topic.status) {
-        onConflict('议题状态已变化，本次修改未执行');
+        conflictAction('议题状态已变化，本次修改未执行');
         return;
       }
+      let editableLatest = latest;
       if (latest.hasMeetingUrl && canAttendPhase(topicPhase(latest, now))) {
         try {
-          const { meetingUrl } = await api.meetingAccess(latest.id);
-          latest = { ...latest, meetingUrl };
+          const verified = await verifiedMeetingAccess(latest.id);
+          if (!activeRef.current) return;
+          latest = verified.topic;
+          if (latest.status !== topic.status) {
+            conflictAction('议题状态已变化，本次修改未执行');
+            return;
+          }
+          editableLatest = verified.meetingUrl ? { ...latest, meetingUrl: verified.meetingUrl } : latest;
         } catch {
           // The latest public snapshot is still authoritative; a hidden meeting
           // value remains untouched unless the collaborator edits that field.
         }
       }
-      mergeLatestIntoUntouchedDraft(latest, attemptedPayload);
-      setEditBase(latest);
+      if (!activeRef.current) return;
+      mergeLatestIntoUntouchedDraft(editableLatest, attemptedPayload);
+      onTopicSync(latest);
+      setEditBase(editableLatest);
       setEditRevision(latest.revision);
       setRevisionConflict(`${conflict.message}。你的表单内容仍然保留；再次保存会基于最新版重试，关闭则放弃草稿并同步最新版。`);
       setRevisionConflictAttempt((attempt) => attempt + 1);
@@ -1226,10 +1785,39 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
       setSubmitting(false);
     } catch (latestError) {
       if (latestError instanceof ApiError && latestError.status === 404) {
-        onConflict('议题已被删除，本次修改未执行');
+        conflictAction('议题已被删除，本次修改未执行', true);
         return;
       }
       setError(latestError instanceof Error ? `已检测到版本冲突，但读取最新版失败：${latestError.message}` : '已检测到版本冲突，但读取最新版失败，请稍后重试');
+      setSubmitting(false);
+    }
+  }
+
+  async function recoverScheduleConflict(conflict: ApiError) {
+    if (!topic || !onConflict) {
+      setError('议题版本已变化；排期草稿仍保留，请稍后重试');
+      setSubmitting(false);
+      return;
+    }
+    try {
+      const latest = await api.topic(topic.id);
+      if (latest.status !== 'CLAIMED') {
+        conflictAction('议题状态已变化，本次排期未执行');
+        return;
+      }
+      onTopicSync(latest);
+      setEditBase(latest);
+      setEditRevision(latest.revision);
+      setError(`${conflict.message}。排期草稿仍然保留且尚未提交；请核对后基于最新版再次确认。`);
+      setSubmitting(false);
+    } catch (latestError) {
+      if (latestError instanceof ApiError && latestError.status === 404) {
+        conflictAction('议题已被删除，本次排期未执行', true);
+        return;
+      }
+      setError(latestError instanceof Error
+        ? `已检测到版本冲突，但读取最新版失败：${latestError.message}；排期草稿仍保留，未提交`
+        : '已检测到版本冲突，但读取最新版失败；排期草稿仍保留，未提交');
       setSubmitting(false);
     }
   }
@@ -1239,10 +1827,12 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     const confirmation = pendingEdit;
     setSubmitting(true);
     setError('');
+    setScheduleConflicts([]);
     try {
-      await api.update(topic.id, editRevision, confirmation.payload);
-      onComplete(`改期已保存，${confirmation.participantCount} 位伙伴仍保留报名，请另行通知`);
+      const updated = await api.update(topic.id, editRevision, confirmation.payload);
+      completeAction(`改期已保存，${confirmation.participantCount} 位伙伴仍保留报名，请另行通知`, updated);
     } catch (err) {
+      if (retainScheduleOverlap(err)) return;
       if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
         setPendingEdit(null);
         await recoverEditConflict(err, confirmation.payload);
@@ -1250,7 +1840,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
       }
       if (err instanceof ApiError && err.status === 409 && onConflict) {
         setPendingEdit(null);
-        onConflict(err.message);
+        conflictAction(err.message);
         return;
       }
       setError(submissionErrorMessage(err));
@@ -1263,6 +1853,44 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     window.requestAnimationFrame(() => editSubmitRef.current?.focus());
   }
 
+  function unscheduleNoticeText() {
+    if (!unscheduleImpact) return '';
+    const action = topicPhase(unscheduleImpact.topic, now) === 'ENDED' ? '标记未举行 / 重新排期' : '取消排期';
+    return [
+      `围炉夜话排期变更通知名单`,
+      `议题：${unscheduleImpact.topic.title}`,
+      `原时间：${formatDate(unscheduleImpact.topic.scheduledAt!, true)}`,
+      `动作：${action}`,
+      `受影响伙伴：${unscheduleImpact.participants.length} 人`,
+      ...unscheduleImpact.participants.map((participant) => `- ${participant.name}`),
+    ].join('\n');
+  }
+
+  async function copyUnscheduleNotice() {
+    const text = unscheduleNoticeText();
+    if (!text) return;
+    let copied = false;
+    try {
+      await navigator.clipboard?.writeText(text);
+      copied = Boolean(navigator.clipboard);
+    } catch {
+      // HTTP deployments may not expose the async clipboard API. The legacy
+      // fallback keeps this explicit user gesture useful until HTTPS is public.
+    }
+    if (!copied) {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+      document.body.append(textarea);
+      textarea.select();
+      copied = document.execCommand('copy');
+      textarea.remove();
+    }
+    setCopyNotice(copied ? '通知名单已复制' : '自动复制失败，请在下方名单中手动选择复制');
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!canCollaborate) {
@@ -1271,46 +1899,77 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
     }
     setSubmitting(true);
     setError('');
+    setScheduleConflicts([]);
     const data = new FormData(event.currentTarget);
     let attemptedEditPayload: Parameters<typeof api.update>[2] = {};
     try {
       if (kind === 'create') {
         const proposer = String(data.get('proposer'));
         const selfPresent = data.get('publishIntent') === 'self';
-        await api.create({
+        const created = await api.create({
           title: String(data.get('title')),
           summary: String(data.get('summary')),
           proposer,
           ...(selfPresent ? { presenter: proposer } : {}),
           tags: String(data.get('tags')).split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
         });
-        onComplete(selfPresent ? '议题已发布并由你分享，接下来可以安排时间' : '新火种已放到炉边，等待同伴认领');
+        completeAction(
+          selfPresent ? '议题已发布并由你分享' : '新火种已放到炉边，等待同伴认领',
+          created,
+          selfPresent ? '议题已发布并由你分享。现在可以安排时间；如果时间未定，可关闭后从“准备中”继续。' : undefined,
+        );
       } else if (kind === 'claim' && topic) {
-        await api.claim(topic.id, topic.revision, String(data.get('presenter')));
-        onComplete('认领成功，期待你把好奇变成一次分享');
+        const claimed = await api.claim(topic.id, topic.revision, String(data.get('presenter')));
+        completeAction(
+          '认领成功，期待你把好奇变成一次分享',
+          claimed,
+          '认领已经保存。现在可以安排时间；如果还需要准备，可关闭后从“准备中”继续。',
+        );
       } else if (kind === 'schedule' && topic) {
-        await api.schedule(topic.id, topic.revision, {
-          scheduledAt: new Date(String(data.get('scheduledAt'))).toISOString(),
+        const scheduled = await api.schedule(topic.id, editRevision, {
+          scheduledAt: dateTimeInputToUtc(String(data.get('scheduledAt'))),
           duration: Number(data.get('duration')),
           room: String(data.get('room')),
           meetingUrl: String(data.get('meetingUrl')),
         });
-        onComplete('排期完成，炉边已经为这次分享留好位置');
+        completeAction('排期完成，炉边已经为这次分享留好位置', scheduled);
       } else if (kind === 'archive' && topic) {
-        await api.archive(topic.id, topic.revision, {
+        const archived = await api.archive(topic.id, topic.revision, {
           takeaway: String(data.get('takeaway')),
           materialUrl: String(data.get('materialUrl')),
         });
-        onComplete('议题已归档，这簇火光被好好保存了');
+        completeAction('议题已归档，这簇火光被好好保存了', archived);
       } else if (kind === 'release' && topic) {
-        await api.release(topic.id, topic.revision);
-        onComplete('议题已重新开放认领');
+        const released = await api.release(topic.id, topic.revision);
+        completeAction('议题已重新开放认领', released);
       } else if (kind === 'unschedule' && topic) {
-        await api.unschedule(topic.id, topic.revision);
-        onComplete(endedReset ? '已标记为未举行，议题可重新排期' : '排期已取消，议题回到准备中');
+        if (!unscheduleImpact) {
+          setError('请先读取最新报名影响，再确认操作');
+          setSubmitting(false);
+          return;
+        }
+        if (unscheduleImpact.participants.length > 0 && !participantsNotified) {
+          setError('请先确认已另行通知报名伙伴');
+          setSubmitting(false);
+          return;
+        }
+        const unscheduled = await api.unschedule(topic.id, unscheduleImpact.topic.revision);
+        const participantCount = unscheduleImpact.participants.length;
+        const completionMessage = endedReset
+          ? participantCount > 0
+            ? `已标记为未举行并移除 ${participantCount} 位报名；你已确认另行通知，议题可重新排期`
+            : '已标记为未举行；本期没有报名伙伴需要通知，议题可重新排期'
+          : participantCount > 0
+            ? `排期已取消并移除 ${participantCount} 位报名；你已确认另行通知`
+            : '排期已取消；本期没有报名伙伴需要通知，议题回到准备中';
+        completeAction(
+          completionMessage,
+          unscheduled,
+          endedReset ? '未举行状态已保存，旧报名已经清理。现在可以重新安排时间；如果时间未定，可关闭后从“准备中”继续。' : undefined,
+        );
       } else if (kind === 'unarchive' && topic) {
-        await api.unarchive(topic.id, topic.revision);
-        onComplete('归档已撤销，议题恢复为已排期');
+        const unarchived = await api.unarchive(topic.id, topic.revision);
+        completeAction('归档已撤销，议题恢复为已排期', unarchived);
       } else if (kind === 'edit' && topic) {
         const payload = editPayload(data);
         attemptedEditPayload = payload;
@@ -1326,29 +1985,39 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
           setSubmitting(false);
           return;
         }
-        await api.update(topic.id, editRevision, payload);
-        onComplete('议题信息已更新');
+        const updated = await api.update(topic.id, editRevision, payload);
+        completeAction('议题信息已更新', updated);
       } else if (kind === 'delete' && topic) {
         await api.remove(topic.id, topic.revision);
-        onComplete('议题已删除');
+        completeAction('议题已删除', undefined, undefined, topic.id);
       }
     } catch (err) {
+      if (retainScheduleOverlap(err)) return;
+      if (kind === 'unschedule' && err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
+        setSubmitting(false);
+        await loadUnscheduleImpact(`${err.message}。报名名单已刷新，请重新核对并确认通知。`);
+        return;
+      }
       if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
+        if (kind === 'schedule') {
+          await recoverScheduleConflict(err);
+          return;
+        }
         if (kind === 'edit') {
           await recoverEditConflict(err, attemptedEditPayload);
           return;
         }
         if (onConflict) {
-          onConflict(err.message);
+          conflictAction(err.message);
           return;
         }
       }
       if (err instanceof ApiError && err.status === 409 && onConflict) {
-        onConflict(err.message);
+        conflictAction(err.message);
         return;
       }
       if (kind === 'delete' && err instanceof ApiError && err.status === 404 && onConflict) {
-        onConflict('议题已由其他协作者删除，无需重复操作', true);
+        conflictAction('议题已由其他协作者删除，无需重复操作', true);
         return;
       }
       setError(submissionErrorMessage(err));
@@ -1363,7 +2032,8 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
         <span className="modal-eyebrow"><Sparkles size={14} />{copy.eyebrow}</span>
         <h2 id="modal-title" ref={rescheduleConfirmRef} tabIndex={pendingEdit ? -1 : undefined}>{pendingEdit ? '确认通知报名伙伴？' : copy.title}</h2>
         <p className="modal-intro">{pendingEdit ? '活动安排发生变化，请先确认受影响范围。' : copy.intro}</p>
-        {topic && <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>}
+        {selectedTopic && <div className="selected-topic"><span>本次议题</span><strong>{selectedTopic.title}</strong></div>}
+        {kind === 'schedule' && transitionNote && <div className="phase-lock-note transition-note" role="status">{transitionNote}</div>}
 
         {pendingEdit && <section className="reschedule-confirm" aria-labelledby="modal-title">
           <div className="reschedule-impact"><Users size={20} /><p><strong>{pendingEdit.participantCount} 位伙伴已报名</strong><span>确认后报名会保留，但他们不会收到系统通知。</span></p></div>
@@ -1374,7 +2044,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
             </div>)}
           </dl>
           <p className="reschedule-notice" role="note">系统不会自动通知报名伙伴，请确认已通过其他方式通知。</p>
-          {error && <div ref={submissionErrorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
+          {error && <div ref={submissionErrorRef} className="form-error schedule-conflict-error" role="alert" tabIndex={-1}><span>{error}</span>{scheduleConflictDetails()}</div>}
           <div className="reschedule-actions">
             <button type="button" className="btn" onClick={returnToEdit} disabled={submitting}>返回修改</button>
             <button type="button" className="submit-btn" onClick={() => void confirmReschedule()} disabled={submitting}>{submitting ? '正在保存…' : '确认保存并另行通知'}{!submitting && <ChevronRight size={17} />}</button>
@@ -1398,7 +2068,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
           </>}
           {kind === 'claim' && <label>认领人<input name="presenter" required maxLength={30} placeholder="你的名字" autoFocus data-initial-focus /></label>}
           {kind === 'schedule' && <>
-            <label>分享时间<input name="scheduledAt" type="datetime-local" required min={minimumScheduleAt} defaultValue={defaultScheduleTime()} autoFocus data-initial-focus /></label>
+            <label>分享时间（北京时间）<input name="scheduledAt" type="datetime-local" required min={minimumScheduleAt} defaultValue={defaultScheduleTime()} autoFocus data-initial-focus /></label>
             <div className="form-row">
               <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} defaultValue={40} /></label>
               <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue="围炉会议室" /></label>
@@ -1407,7 +2077,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
           </>}
           {kind === 'archive' && <>
             <label>本期最值得留下的收获<textarea name="takeaway" required maxLength={1000} rows={5} placeholder="用几句话记下结论、共识或仍待探索的问题……" autoFocus data-initial-focus /></label>
-            <label>资料链接（选填）<input name="materialUrl" type="url" placeholder="https://" /></label>
+            <label>资料链接（选填）<input name="materialUrl" type="url" maxLength={2048} placeholder="https://" /></label>
           </>}
           {kind === 'edit' && topic && <>
             <label>议题标题<input name="title" required maxLength={80} defaultValue={editDraft?.title ?? topic.title} autoFocus data-initial-focus /></label>
@@ -1419,7 +2089,8 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
             {topic.status !== 'OPEN' && <label>分享人<input name="presenter" required maxLength={30} defaultValue={editDraft?.presenter ?? topic.presenter ?? ''} /></label>}
             {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && <>
               {timeLocked && <div className="phase-lock-note" role="status">{phase === 'LIVE' ? '活动进行中，排期已锁定。' : '分享已结束，排期与时长不再可修改。'} 仍可修正地点和会议链接。</div>}
-              <label>分享时间<input name="scheduledAt" type="datetime-local" required min={phase === 'UPCOMING' ? editScheduleMinimum : undefined} disabled={timeLocked} defaultValue={editDraft?.scheduledAt ?? formatDateTimeInput(topic.scheduledAt)} /></label>
+              {topic.status === 'ARCHIVED' && topic.archivedAt && <div className="phase-lock-note" role="status">可修正历史时间与时长；活动必须在归档时间 {formatDate(topic.archivedAt, true)} 之前结束。</div>}
+              <label>分享时间（北京时间）<input name="scheduledAt" type="datetime-local" required min={phase === 'UPCOMING' ? editScheduleMinimum : undefined} disabled={timeLocked} defaultValue={editDraft?.scheduledAt ?? formatDateTimeInput(topic.scheduledAt)} /></label>
               <div className="form-row">
                 <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} disabled={timeLocked} defaultValue={editDraft?.duration ?? topic.duration ?? 40} /></label>
                 <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue={editDraft?.room ?? (legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '')} /></label>
@@ -1428,24 +2099,52 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
             </>}
             {topic.status === 'ARCHIVED' && <>
               <label>本期收获<textarea name="takeaway" required maxLength={1000} rows={4} defaultValue={editDraft?.takeaway ?? topic.takeaway ?? ''} /></label>
-              <label>资料链接（选填）<input name="materialUrl" type="url" defaultValue={editDraft?.materialUrl ?? topic.materialUrl ?? ''} placeholder="https://" /></label>
+              <label>资料链接（选填）<input name="materialUrl" type="url" maxLength={2048} defaultValue={editDraft?.materialUrl ?? topic.materialUrl ?? ''} placeholder="https://" /></label>
             </>}
           </>}
           {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>{topic.status === 'CLAIMED'
             ? `分享人 ${topic.presenter ?? ''} 已认领；议题内容和分享人署名都会永久移除，系统不会自动通知分享人。若只是不再分享，请取消并选择“重新开放”。`
             : '删除只适用于误建或重复议题。议题内容将永久移除，此操作不可撤销。'}</span></p></div>}
           {kind === 'release' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>分享人署名会被清空，议题内容继续保留。</span></p></div>}
-          {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>{endedReset ? '该操作会清空旧报名、排期、地点与会议入口；分享人和议题内容保留，随后可重新排期。' : '日历事件与现有报名会被移除，分享人和议题内容继续保留。'}</span></p></div>}
+          {kind === 'unschedule' && topic && <>
+            <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>{endedReset ? '该操作会清空排期、地点、会议入口和报名；请先核对并通知下方伙伴。分享人和议题内容保留，随后可重新排期。' : '日历事件与报名会被移除；请先核对并通知下方伙伴。分享人和议题内容继续保留。'}</span></p></div>
+            <section className="unschedule-impact" aria-label="取消排期影响">
+              {unscheduleImpactLoading && <p className="unschedule-impact-loading" role="status">正在读取最新报名影响…</p>}
+              {!unscheduleImpactLoading && unscheduleImpactError && <div className="form-error unschedule-impact-error" role="alert">
+                <span>{unscheduleImpactError}；为避免丢失联系人，本次操作已锁定。</span>
+                <button type="button" onClick={() => void loadUnscheduleImpact()}>重新读取名单</button>
+              </div>}
+              {!unscheduleImpactLoading && unscheduleImpact && <>
+                {unscheduleImpactNotice && <div ref={unscheduleImpactNoticeRef} className="form-error" role="alert" tabIndex={-1}>{unscheduleImpactNotice}</div>}
+                <div className="unschedule-impact-summary">
+                  <span>原排期（北京时间）</span>
+                  <strong>{formatDate(unscheduleImpact.topic.scheduledAt!, true)}</strong>
+                  <b>{unscheduleImpact.participants.length} 位伙伴将失去报名</b>
+                </div>
+                {unscheduleImpact.participants.length > 0 ? <>
+                  <div className="unschedule-copy-row">
+                    <button type="button" onClick={() => void copyUnscheduleNotice()}><Copy size={15} />复制通知名单</button>
+                    {copyNotice && <span role="status">{copyNotice}</span>}
+                  </div>
+                  <textarea className="unschedule-notice-list" aria-label="报名通知名单" readOnly value={unscheduleNoticeText()} rows={Math.min(8, 5 + unscheduleImpact.participants.length)} onFocus={(event) => event.currentTarget.select()} />
+                  <label className="unschedule-notice-confirm">
+                    <input type="checkbox" checked={participantsNotified} onChange={(event) => setParticipantsNotified(event.target.checked)} />
+                    <span>我已通过其他方式通知以上伙伴排期变化；我理解系统不会自动发送消息。</span>
+                  </label>
+                </> : <p className="unschedule-no-participants">当前没有报名伙伴，无需执行通知步骤。</p>}
+              </>}
+            </section>
+          </>}
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
           {revisionConflict && <div ref={revisionConflictRef} className="form-error" role="alert" tabIndex={-1}>{revisionConflict}</div>}
-          {error && !pendingEdit && <div ref={submissionErrorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
+          {error && !pendingEdit && <div ref={submissionErrorRef} className="form-error schedule-conflict-error" role="alert" tabIndex={-1}><span>{error}</span>{scheduleConflictDetails()}</div>}
           {kind === 'delete' ? <div className="delete-actions">
             <button type="button" className="btn" data-initial-focus onClick={closeModal} disabled={submitting}>取消</button>
             <button className="submit-btn delete-submit" disabled={submitting} type="submit">
               {submitting ? '正在永久删除…' : '确认永久删除'}
               {!submitting && <ChevronRight size={17} />}
             </button>
-          </div> : <button ref={kind === 'edit' ? editSubmitRef : undefined} className="submit-btn" disabled={submitting} type="submit">
+          </div> : <button ref={kind === 'edit' ? editSubmitRef : undefined} className="submit-btn" disabled={submitting || (kind === 'unschedule' && (unscheduleImpactLoading || !unscheduleImpact || (unscheduleImpact.participants.length > 0 && !participantsNotified)))} type="submit">
             {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? endedReset ? '确认未举行 / 重新排期' : '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : revisionConflict ? '基于最新版再次保存' : '保存修改'}
             {!submitting && <ChevronRight size={17} />}
           </button>}
@@ -1457,6 +2156,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, 
 
 export default function App() {
   const [now, setNow] = useState(() => new Date());
+  const topicExpansionMemory = useRef(new Map<number, TopicExpansionMemory>());
   const [topics, setTopics] = useState<Topic[]>([]);
   const [stats, setStats] = useState<Stats>({ open: 0, claimed: 0, scheduled: 0, archived: 0, nextTopic: null });
   const [loading, setLoading] = useState(true);
@@ -1473,14 +2173,17 @@ export default function App() {
   const statsRequestId = useRef(0);
   const activeSort = useRef<TopicSort>('manual');
   const [view, setView] = useState<ViewMode>('list');
-  const [calendarCursor, setCalendarCursor] = useState(new Date());
+  const [calendarCursor, setCalendarCursor] = useState(() => businessTodayCursor());
   const [draggedId, setDraggedId] = useState<number | null>(null);
   const [liveMessage, setLiveMessage] = useState('');
-  const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null } | null>(null);
+  const [modal, setModal] = useState<{ kind: ModalKind; topic: Topic | null; transitionNote?: string } | null>(null);
   const [participantsTopic, setParticipantsTopic] = useState<Topic | null>(null);
+  const participantsFocusRestoreSuppressed = useRef(false);
   const [activityTopic, setActivityTopic] = useState<Topic | null>(null);
+  const activityFocusRestoreSuppressed = useRef(false);
   const [posterTopic, setPosterTopic] = useState<Topic | null>(null);
   const [meetingTopic, setMeetingTopic] = useState<Topic | null>(null);
+  const meetingFocusRestoreSuppressed = useRef(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [activeAnchor, setActiveAnchor] = useState<'how' | null>(null);
   const focusRequest = useRef(0);
@@ -1494,27 +2197,59 @@ export default function App() {
   const pendingAccessAction = useRef<(() => void | Promise<void>) | null>(null);
   const accessEpoch = useRef(0);
   const [toast, setToast] = useState('');
+  useEffect(() => {
+    if (!participantsTopic || ['SCHEDULED', 'ARCHIVED'].includes(participantsTopic.status)) return;
+    const changedId = participantsTopic.id;
+    participantsFocusRestoreSuppressed.current = true;
+    setParticipantsTopic(null);
+    setActiveAnchor(null);
+    setTab(participantsTopic.status);
+    setPhaseFilter(null);
+    setSearch('');
+    setView('list');
+    setToast('活动排期已取消，报名名单已清空');
+    scheduleDestinationFocus(`[data-topic-id="${changedId}"]`);
+  }, [participantsTopic?.id, participantsTopic?.revision, participantsTopic?.status]);
+  const nextUpcomingTopic = useMemo(() => sortTopicsBySchedule(topics.filter((topic) => topic.status === 'SCHEDULED' && topicPhase(topic, now) === 'UPCOMING'))[0] ?? null, [now, topics]);
+  const nextUpcomingDayTotal = nextUpcomingTopic?.scheduledAt
+    ? topics.filter((topic) => topic.status === 'SCHEDULED'
+      && topic.scheduledAt
+      && dateKey(new Date(topic.scheduledAt)) === dateKey(new Date(nextUpcomingTopic.scheduledAt!))).length
+    : 0;
 
-  const loadTopics = useCallback(async (requestedSort: TopicSort) => {
+  const loadTopics = useCallback(async (requestedSort: TopicSort, preserveExisting = false) => {
     const requestId = ++topicRequestId.current;
-    setLoading(true);
-    setLoadedSort(null);
+    if (!preserveExisting) {
+      setLoading(true);
+      setLoadedSort(null);
+    }
     try {
       const topicData = await api.topics(requestedSort);
       if (requestId !== topicRequestId.current || requestedSort !== activeSort.current) return false;
-      setTopics(topicData.topics);
-      setActivityTopic((current) => current ? topicData.topics.find((topic) => topic.id === current.id) ?? current : null);
-      setParticipantsTopic((current) => current ? topicData.topics.find((topic) => topic.id === current.id) ?? current : null);
+      setTopics((current) => {
+        const currentById = new Map(current.map((topic) => [topic.id, topic]));
+        return topicData.topics.map((topic) => preferNewerTopic(currentById.get(topic.id), topic));
+      });
+      setActivityTopic((current) => {
+        if (!current) return null;
+        const incoming = topicData.topics.find((topic) => topic.id === current.id);
+        return incoming ? preferNewerTopic(current, incoming) : null;
+      });
+      setParticipantsTopic((current) => {
+        if (!current) return null;
+        const incoming = topicData.topics.find((topic) => topic.id === current.id);
+        return incoming ? preferNewerTopic(current, incoming) : null;
+      });
       setOrderVersion(topicData.orderVersion);
       setLoadedSort(requestedSort);
       setLoadError('');
       return true;
     } catch (error) {
       if (requestId !== topicRequestId.current || requestedSort !== activeSort.current) return false;
-      setLoadError(error instanceof Error ? error.message : '炉火暂时熄灭了');
+      if (!preserveExisting) setLoadError(error instanceof Error ? error.message : '炉火暂时熄灭了');
       return false;
     } finally {
-      if (requestId === topicRequestId.current && requestedSort === activeSort.current) setLoading(false);
+      if (!preserveExisting && requestId === topicRequestId.current && requestedSort === activeSort.current) setLoading(false);
     }
   }, []);
 
@@ -1529,7 +2264,13 @@ export default function App() {
   }, []);
 
   const load = useCallback(async () => {
-    await Promise.all([loadTopics(sort), loadStats()]);
+    const [topicsSynced] = await Promise.all([loadTopics(sort), loadStats()]);
+    return topicsSynced;
+  }, [loadStats, loadTopics, sort]);
+
+  const refreshAfterMutation = useCallback(async () => {
+    const [topicsSynced] = await Promise.all([loadTopics(sort, true), loadStats()]);
+    return topicsSynced;
   }, [loadStats, loadTopics, sort]);
 
   useEffect(() => { void load(); }, [load]);
@@ -1689,15 +2430,24 @@ export default function App() {
       const phase = topic ? topicPhase(topic, now) : null;
       if (kind === 'edit' && topic?.hasMeetingUrl && canAttendPhase(phase)) {
         try {
-          const { meetingUrl } = await api.meetingAccess(topic.id);
+          const verified = await verifiedMeetingAccess(topic.id);
           if (requestEpoch !== accessEpoch.current) return;
-          editableTopic = { ...topic, meetingUrl };
+          mergeTopic(verified.topic);
+          editableTopic = verified.meetingUrl ? { ...verified.topic, meetingUrl: verified.meetingUrl } : verified.topic;
+          if (!verified.meetingUrl) setToast('议题已被其他协作者更新，旧会议地址未载入');
         } catch (error) {
           if (requestEpoch !== accessEpoch.current) return;
           if (error instanceof ApiError && error.code === 'ACTIVITY_TIME_CONFLICT') {
-            setToast(`${error.message}；仍可修改议题内容和参与说明`);
-            setModal({ kind, topic });
-            void load();
+            try {
+              const latest = await api.topic(topic.id);
+              if (requestEpoch !== accessEpoch.current) return;
+              mergeTopic(latest);
+              setToast(`${error.message}；仍可修改议题内容和参与说明`);
+              setModal({ kind, topic: latest });
+            } catch (latestError) {
+              if (requestEpoch !== accessEpoch.current) return;
+              setToast(latestError instanceof Error ? latestError.message : '议题最新状态读取失败');
+            }
             return;
           }
           setToast(error instanceof Error ? error.message : '会议入口加载失败');
@@ -1709,17 +2459,21 @@ export default function App() {
     });
   }
   function openParticipants(topic: Topic) {
+    participantsFocusRestoreSuppressed.current = false;
     requireAccess(() => setParticipantsTopic(topic), '报名姓名属于团队协作信息，请先输入围炉口令。');
   }
   function openMeeting(topic: Topic) {
+    meetingFocusRestoreSuppressed.current = false;
     requireAccess(() => setMeetingTopic(topic), '真实会议入口受保护，请先输入围炉口令。');
   }
   const mergeTopic = useCallback((latest: Topic) => {
-    setTopics((current) => current.map((item) => item.id === latest.id ? latest : item));
-    setActivityTopic((current) => current?.id === latest.id ? latest : current);
-    setParticipantsTopic((current) => current?.id === latest.id ? latest : current);
-    setPosterTopic((current) => current?.id === latest.id ? latest : current);
-    setMeetingTopic((current) => current?.id === latest.id ? latest : current);
+    setTopics((current) => current.some((item) => item.id === latest.id)
+      ? current.map((item) => item.id === latest.id ? preferNewerTopic(item, latest) : item)
+      : [...current, latest]);
+    setActivityTopic((current) => current?.id === latest.id ? preferNewerTopic(current, latest) : current);
+    setParticipantsTopic((current) => current?.id === latest.id ? preferNewerTopic(current, latest) : current);
+    setPosterTopic((current) => current?.id === latest.id ? preferNewerTopic(current, latest) : current);
+    setMeetingTopic((current) => current?.id === latest.id ? preferNewerTopic(current, latest) : current);
   }, []);
   const syncTopic = useCallback(async (id: number) => {
     try {
@@ -1730,28 +2484,162 @@ export default function App() {
       }
     }
   }, [mergeTopic]);
-  async function complete(message: string, kind?: ModalKind) {
-    setModal(null);
+  const reflectParticipantProjection = useCallback((id: number, projection: { revision?: number; participantCount: number }) => {
+    const withProjection = (topic: Topic) => topic.id === id
+      && (projection.revision === undefined || projection.revision >= topic.revision)
+      ? { ...topic, ...projection }
+      : topic;
+    setTopics((current) => current.map(withProjection));
+    setActivityTopic((current) => current ? withProjection(current) : current);
+    setParticipantsTopic((current) => current ? withProjection(current) : current);
+    setPosterTopic((current) => current ? withProjection(current) : current);
+    setMeetingTopic((current) => current ? withProjection(current) : current);
+  }, []);
+  const reflectParticipantRead = useCallback((id: number, projection: { revision: number; participantCount: number }) => {
+    reflectParticipantProjection(id, projection);
+  }, [reflectParticipantProjection]);
+  const reflectParticipantMutation = useCallback((id: number, result: { revision: number; participantCount: number }) => {
+    reflectParticipantProjection(id, result);
+    void syncTopic(id);
+    void refreshAfterMutation().then((synced) => {
+      if (!synced) setToast('报名结果已保存，议题列表同步暂时失败；当前人数已保留，可稍后重试。');
+    });
+  }, [reflectParticipantProjection, refreshAfterMutation, syncTopic]);
+  function openActivity(topic: Topic) {
+    activityFocusRestoreSuppressed.current = false;
+    setActivityTopic(topic);
+  }
+  function closeActivityForBusinessResult() {
+    activityFocusRestoreSuppressed.current = true;
+    setActivityTopic(null);
+  }
+  async function complete(message: string, kind?: ModalKind, completedTopic?: Topic, transitionNote?: string, affectedTopicId?: number) {
     setToast(message);
-    await load();
-    if (kind === 'delete') scheduleDestinationFocus('#topics h2');
+    if (kind === 'delete' && affectedTopicId) {
+      setTopics((current) => current.filter((topic) => topic.id !== affectedTopicId));
+      setParticipantsTopic((current) => current?.id === affectedTopicId ? null : current);
+      setPosterTopic((current) => current?.id === affectedTopicId ? null : current);
+      setMeetingTopic((current) => current?.id === affectedTopicId ? null : current);
+      if (activityTopic?.id === affectedTopicId) closeActivityForBusinessResult();
+    }
+    const completedFromActivity = Boolean(completedTopic && activityTopic?.id === completedTopic.id);
+    if (completedTopic?.status === 'CLAIMED' && transitionNote) {
+      mergeTopic(completedTopic);
+      if (completedFromActivity) closeActivityForBusinessResult();
+      if (kind === 'unschedule') {
+        setActiveAnchor(null);
+        setTab('CLAIMED');
+        setPhaseFilter(null);
+        setSearch('');
+        setView('list');
+      }
+      setModal({ kind: 'schedule', topic: completedTopic, transitionNote });
+      if (!await refreshAfterMutation()) setToast(`${message}；结果已保存，列表同步暂时失败，可稍后重试`);
+      return;
+    }
+    setModal(null);
+    if (completedTopic) mergeTopic(completedTopic);
+    const closesInvalidActivity = completedFromActivity && kind === 'unschedule';
+    if (closesInvalidActivity) closeActivityForBusinessResult();
+    if ((kind === 'create' && completedTopic?.status === 'OPEN') || closesInvalidActivity) {
+      setActiveAnchor(null);
+      setTab(completedTopic!.status);
+      setPhaseFilter(null);
+      setSearch('');
+      setView('list');
+    } else if (completedTopic && !completedFromActivity) {
+      const keyword = search.trim().toLowerCase();
+      const remainsVisible = view === 'list'
+        && (tab === 'ALL' || tab === completedTopic.status)
+        && (!phaseFilter || topicPhase(completedTopic, now) === phaseFilter)
+        && (!keyword || [completedTopic.title, completedTopic.summary, completedTopic.proposer, completedTopic.presenter ?? '', ...completedTopic.tags].join(' ').toLowerCase().includes(keyword));
+      if (!remainsVisible) {
+        setActiveAnchor(null);
+        setTab(completedTopic.status);
+        setPhaseFilter(null);
+        setSearch('');
+        setView('list');
+      }
+    }
+    if (!await refreshAfterMutation()) setToast(`${message}；结果已保存，列表同步暂时失败，可稍后重试`);
+    if (kind === 'delete') {
+      scheduleDestinationFocus('#topics h2');
+      return;
+    }
+    if (!completedTopic) return;
+    if (completedFromActivity && !closesInvalidActivity) return;
+    scheduleDestinationFocus(kind === 'edit'
+      ? `[data-edit-topic-id="${completedTopic.id}"]`
+      : `[data-topic-id="${completedTopic.id}"]`);
+  }
+  function closeActionModal() {
+    const closing = modal;
+    setModal(null);
+    if (closing?.kind !== 'schedule' || !closing.transitionNote || !closing.topic) return;
+    setActiveAnchor(null);
+    setTab('CLAIMED');
+    setPhaseFilter(null);
+    setSearch('');
+    setView('list');
+    scheduleDestinationFocus(`[data-topic-id="${closing.topic.id}"]`);
   }
   async function resolveConflict(message: string, kind?: ModalKind, topicId?: number, topicMissing = false) {
     setModal(null);
     setToast(`${message}，已同步最新状态`);
-    await load();
-    if (kind === 'delete' && topicId) {
+    if (topicId && activityTopic?.id === topicId) {
       if (topicMissing) {
+        closeActivityForBusinessResult();
+        await load();
         scheduleDestinationFocus('#topics h2');
         return;
       }
-      scheduleDestinationFocus(`[data-delete-topic-id="${topicId}"]`);
-      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-        if (!document.querySelector(`[data-delete-topic-id="${topicId}"]`)) {
-          focusDestination(`[data-topic-id="${topicId}"]`);
+      try {
+        const latest = await api.topic(topicId);
+        mergeTopic(latest);
+        if (latest.status === 'SCHEDULED' || latest.status === 'ARCHIVED') {
+          await refreshAfterMutation();
+          scheduleDestinationFocus(kind === 'edit'
+            ? '.activity-details-modal .activity-maintain'
+            : '.activity-details-modal [data-initial-focus], .activity-details-modal');
+          return;
         }
-      }));
+        closeActivityForBusinessResult();
+        setActiveAnchor(null);
+        setTab(latest.status);
+        setPhaseFilter(null);
+        setSearch('');
+        setView('list');
+        await refreshAfterMutation();
+        scheduleDestinationFocus(`[data-topic-id="${topicId}"]`);
+        return;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          closeActivityForBusinessResult();
+          await load();
+          scheduleDestinationFocus('#topics h2');
+          return;
+        }
+        await load();
+        scheduleDestinationFocus('.activity-details-modal [data-initial-focus], .activity-details-modal');
+        return;
+      }
     }
+    await load();
+    if (!topicId) return;
+    if (topicMissing) {
+      scheduleDestinationFocus('#topics h2');
+      return;
+    }
+    if (kind !== 'delete') {
+      scheduleDestinationFocus(`[data-topic-id="${topicId}"]`);
+      return;
+    }
+    scheduleDestinationFocus(`[data-delete-topic-id="${topicId}"]`);
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      if (!document.querySelector(`[data-delete-topic-id="${topicId}"]`)) {
+        focusDestination(`[data-topic-id="${topicId}"]`);
+      }
+    }));
   }
   async function resolveParticipantConflict(message: string) {
     const changedId = participantsTopic?.id;
@@ -1760,21 +2648,60 @@ export default function App() {
     await load();
     if (changedId) await syncTopic(changedId);
   }
-  async function resolveMeetingConflict(message: string) {
+  async function resolveMeetingConflict(message: string, suppliedLatest?: Topic, topicMissing = false) {
+    const changedId = meetingTopic?.id ?? suppliedLatest?.id;
+    meetingFocusRestoreSuppressed.current = true;
     setMeetingTopic(null);
     setToast(`${message}，已同步最新状态`);
-    await load();
+    if (!changedId) {
+      await load();
+      return;
+    }
+    let latest = suppliedLatest;
+    if (!latest && !topicMissing) {
+      try {
+        latest = await api.topic(changedId);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) topicMissing = true;
+      }
+    }
+    if (topicMissing || !latest) {
+      await load();
+      scheduleDestinationFocus('#topics h2');
+      return;
+    }
+    mergeTopic(latest);
+    setActiveAnchor(null);
+    setTab(latest.status);
+    setPhaseFilter(null);
+    setSearch('');
+    setView('list');
+    if (!await refreshAfterMutation()) setToast(`${message}；最新议题已保留，列表同步暂时失败`);
+    const stillAttendable = latest.status === 'SCHEDULED'
+      && latest.hasMeetingUrl
+      && canAttendPhase(topicPhase(latest, new Date()));
+    scheduleDestinationFocus(stillAttendable
+      ? `[data-topic-id="${changedId}"] .meeting-link`
+      : `[data-topic-id="${changedId}"]`);
   }
-  function focusDestination(selector: string) {
+  function focusDestination(selector: string, avoidStickyHeader = false) {
     const target = document.querySelector<HTMLElement>(selector);
-    const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+    const behavior = avoidStickyHeader || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
     target?.scrollIntoView({ behavior, block: 'start' });
     target?.focus({ preventScroll: true });
+    if (target && avoidStickyHeader) window.requestAnimationFrame(() => {
+      const header = document.querySelector<HTMLElement>('.site-header');
+      if (!header || !target.isConnected) return;
+      const overlap = header.getBoundingClientRect().bottom + 10 - target.getBoundingClientRect().top;
+      if (overlap > 0) window.scrollBy({ top: -overlap, behavior: 'auto' });
+    });
   }
-  function scheduleDestinationFocus(selector: string) {
+  function scheduleDestinationFocus(selector: string, fallbackSelector?: string, avoidStickyHeader = false) {
     const request = ++focusRequest.current;
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-      if (request === focusRequest.current) focusDestination(selector);
+      if (request !== focusRequest.current) return;
+      const target = document.querySelector<HTMLElement>(selector);
+      focusDestination(target ? selector : fallbackSelector ?? selector, avoidStickyHeader);
     }));
   }
   function scrollToTopics() {
@@ -1787,7 +2714,7 @@ export default function App() {
     setView(nextView);
     setSearch(keyword);
     setPhaseFilter(nextPhase);
-    if (nextView === 'week') setCalendarCursor(new Date());
+    if (nextView === 'week') setCalendarCursor(businessTodayCursor());
     scheduleDestinationFocus('#topics h2');
   }
   function selectTab(nextTab: Tab) {
@@ -1801,6 +2728,21 @@ export default function App() {
     setView(nextView);
     setPhaseFilter(null);
     if (nextView !== 'list' && (tab === 'OPEN' || tab === 'CLAIMED')) setTab('SCHEDULED');
+  }
+  function clearTopicConditions() {
+    setActiveAnchor(null);
+    setTab('ALL');
+    setPhaseFilter(null);
+    setSearch('');
+    scheduleDestinationFocus('#topics h2');
+  }
+  function clearSearchOnly() {
+    setSearch('');
+    scheduleDestinationFocus('#topics h2');
+  }
+  async function retryTopicLoad() {
+    const loaded = await load();
+    scheduleDestinationFocus(loaded ? '#topics h2' : '[data-retry-topics]');
   }
   function navigate(destination: NavDestination) {
     setMobileNavOpen(false);
@@ -1935,9 +2877,9 @@ export default function App() {
           <button className="stat-link" onClick={() => showTopicView('CLAIMED')}><span>准备中</span><strong>{String(stats.claimed).padStart(2, '0')}</strong><small>位伙伴正在探索</small></button>
           <button className="stat-link" onClick={() => showTopicView('SCHEDULED')}><span>已排期</span><strong>{String(stats.scheduled).padStart(2, '0')}</strong><small>场炉边分享</small></button>
           <button className="stat-link" onClick={() => showTopicView('ARCHIVED')}><span>知识归档</span><strong>{String(stats.archived).padStart(2, '0')}</strong><small>份余温被保存</small></button>
-          <button className="next-fire stat-link" onClick={() => stats.nextTopic ? setActivityTopic(stats.nextTopic) : showTopicView('OPEN')}>
+          <button className="next-fire stat-link" onClick={() => nextUpcomingTopic ? openActivity(nextUpcomingTopic) : showTopicView('OPEN')}>
             <span>NEXT FIRESIDE</span>
-            {stats.nextTopic ? <><strong>{stats.nextTopic.scheduledAt && formatDate(stats.nextTopic.scheduledAt)}</strong><small>{stats.nextTopic.title}</small></> : <><strong>等待排期</strong><small>认领一个议题，点燃下一炉</small></>}
+            {nextUpcomingTopic ? <><strong>{nextUpcomingTopic.scheduledAt && formatDate(nextUpcomingTopic.scheduledAt, isDifferentBusinessYear(nextUpcomingTopic.scheduledAt, now))}</strong><small>{nextUpcomingTopic.title}{nextUpcomingDayTotal > 1 ? ` · 当日共 ${nextUpcomingDayTotal} 场` : ''}</small></> : <><strong>等待排期</strong><small>认领一个议题，点燃下一炉</small></>}
           </button>
         </div>
       </section>
@@ -1977,11 +2919,11 @@ export default function App() {
 
         <div className="result-context" aria-live="polite">
           <span>{phaseFilter === 'ENDED' ? '待归档任务' : tabs.find((item) => item.key === tab)?.label} · {displayedTopics.length} 个结果</span>
-          {(phaseFilter || search) && <button onClick={() => { setPhaseFilter(null); setSearch(''); }}>清除条件</button>}
+          {(tab !== 'ALL' || phaseFilter || search) && <button onClick={clearTopicConditions}>清除条件</button>}
         </div>
 
         {loading ? <div className="empty-state"><Flame className="loading-flame" /><h3>正在点燃炉火…</h3></div>
-          : loadError ? <div className="empty-state"><h3>{loadError}</h3><button onClick={() => void load()}>重新连接</button></div>
+          : loadError ? <div className="empty-state"><h3>{loadError}</h3><button data-retry-topics onClick={() => void retryTopicLoad()}>重新连接</button></div>
           : displayedTopics.length && view === 'list' ? <div className="topic-grid">{displayedTopics.map((topic, index) => <TopicCard
               key={topic.id}
               topic={topic}
@@ -1998,9 +2940,10 @@ export default function App() {
               onDragStart={(id) => { if (!reorderInFlight.current) setDraggedId(id); }}
               onDrop={dropTopic}
               onMove={moveTopic}
+              expansionMemory={topicExpansionMemory}
             />)}</div>
-          : view !== 'list' ? <CalendarView topics={displayedTopics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onOpen={setActivityTopic} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onShowOpenTopics={() => showTopicView('OPEN')} now={now} />
-          : search ? <div className="empty-state"><Search /><h3>没有找到匹配的议题</h3><p>可以清除搜索，再看看所有火种。</p><button onClick={() => setSearch('')}>清除搜索</button></div>
+          : view !== 'list' ? <CalendarView topics={displayedTopics} conflictTopics={topics} mode={view} cursor={calendarCursor} onCursorChange={setCalendarCursor} onFocusDestination={scheduleDestinationFocus} onOpen={openActivity} focusRestoreSuppressed={activityFocusRestoreSuppressed} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onShowOpenTopics={() => showTopicView('OPEN')} hasActiveConditions={Boolean((tab !== 'ALL' && tab !== 'SCHEDULED') || phaseFilter || search)} onClearConditions={clearTopicConditions} now={now} />
+          : search ? <div className="empty-state"><Search /><h3>没有找到匹配的议题</h3><p>可以清除搜索，再看看所有火种。</p><button onClick={clearSearchOnly}>清除搜索</button></div>
           : phaseFilter === 'ENDED' ? <div className="empty-state"><Archive /><h3>当前没有待归档活动</h3><p>已经结束的活动会出现在这里。</p><button onClick={() => showTopicView('SCHEDULED')}>查看已排期</button></div>
           : topics.length > 0 ? <div className="empty-state"><Lightbulb /><h3>当前筛选没有议题</h3><p>换个状态，看看广场里的其他火种。</p><button onClick={() => showTopicView('ALL')}>查看全部议题</button></div>
           : <div className="empty-state"><Lightbulb /><h3>这里还没有火种</h3><p>成为第一个发起议题的人。</p><button onClick={() => openAction('create')}>发起议题</button></div>}
@@ -2014,7 +2957,7 @@ export default function App() {
             <button onClick={() => openAction('create')}><span>01</span><i><Lightbulb /></i><h3>创建议题</h3><p>留下一个真问题，告诉大家它为什么让你好奇。</p></button>
             <button onClick={() => showTopicView('OPEN')}><span>02</span><i><UserRoundPlus /></i><h3>认领议题</h3><p>愿意多走一步的人接过火炬，开始做些探索。</p></button>
             <button onClick={() => showTopicView('CLAIMED')}><span>03</span><i><CalendarDays /></i><h3>议题排期</h3><p>约定时间与地点，为共同讨论留出一个晚上。</p></button>
-            <button onClick={() => showTopicView('SCHEDULED', 'week')}><span>04</span><i><Users /></i><h3>报名围炉</h3><p>查看本周排期，报名旁听或进入线上会议。</p></button>
+            <button onClick={() => showTopicView('SCHEDULED', 'week')}><span>04</span><i><Users /></i><h3>报名围炉</h3><p>查看本周排期并报名旁听；活动提供线上入口时，也可进入会议。</p></button>
             <button onClick={() => showTopicView('SCHEDULED', 'list', '', 'ENDED')}><span>05</span><i><Archive /></i><h3>沉淀归档</h3><p>找到已结束的活动，记下收获与线索。</p></button>
           </div>
         </div>
@@ -2047,11 +2990,11 @@ export default function App() {
     <footer className="shell"><a className="brand muted" href="#top"><span className="brand-mark"><Flame size={16} /></span><span>围炉夜话</span></a><nav aria-label="页脚导航"><button onClick={() => navigate('topics')}>议题</button><button onClick={() => navigate('week')}>活动</button><button onClick={() => navigate('archived')}>往期</button><button onClick={() => navigate('how')}>如何参与</button></nav><span>团队共创 · 公开浏览</span></footer>
 
     {mobileNavOpen && <MobileNavigation active={activeDestination} onClose={() => setMobileNavOpen(false)} onNavigate={navigate} accessReady={accessReady} accessEnabled={accessEnabled} canCollaborate={canCollaborate} onAccess={() => { setMobileNavOpen(false); window.requestAnimationFrame(openAccess); }} />}
-    {activityTopic && <ActivityDetailsModal topic={activityTopic} onClose={() => setActivityTopic(null)} onTopicSync={mergeTopic} onPageSync={() => void load()} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onAction={openAction} now={now} />}
-    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message, modal.kind)} onConflict={(message, topicMissing) => void resolveConflict(message, modal.kind, modal.topic?.id, topicMissing)} onRequireAccess={requireAccessForRetainedForm} canCollaborate={canCollaborate} now={now} />}
-    {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} now={now} />}
+    {activityTopic && <ActivityDetailsModal topic={activityTopic} onClose={() => setActivityTopic(null)} focusRestoreSuppressed={activityFocusRestoreSuppressed} onTopicSync={mergeTopic} onPageSync={() => void load()} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onAction={openAction} now={now} />}
+    {modal && <Modal key={`${modal.kind}:${modal.topic?.id ?? 'new'}:${modal.transitionNote ? 'follow-up' : 'direct'}`} kind={modal.kind} topic={modal.topic} transitionNote={modal.transitionNote} onClose={closeActionModal} onComplete={(message, completedTopic, transitionNote, affectedTopicId) => void complete(message, modal.kind, completedTopic, transitionNote, affectedTopicId)} onConflict={(message, topicMissing) => void resolveConflict(message, modal.kind, modal.topic?.id, topicMissing)} onTopicSync={mergeTopic} onRequireAccess={requireAccessForRetainedForm} canCollaborate={canCollaborate} now={now} />}
+    {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={reflectParticipantMutation} onCountConfirmed={reflectParticipantRead} onConflict={(message) => void resolveParticipantConflict(message)} focusRestoreSuppressed={participantsFocusRestoreSuppressed} unlockVersion={unlockVersion} now={now} />}
     {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} onSync={() => void load()} />}
-    {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} onConflict={(message) => void resolveMeetingConflict(message)} unlockVersion={unlockVersion} now={now} />}
+    {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} onConflict={(message, latestTopic, topicMissing) => void resolveMeetingConflict(message, latestTopic, topicMissing)} focusRestoreSuppressed={meetingFocusRestoreSuppressed} unlockVersion={unlockVersion} now={now} />}
     {accessModalOpen && <AccessModal
       message={accessMessage}
       rateLimitedUntil={accessRateLimitedUntil}

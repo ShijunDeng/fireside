@@ -1,22 +1,32 @@
 import type { Topic } from './types';
 import { containsMeetingSensitiveText, redactMeetingSensitiveText } from '../shared/meeting-text';
+import { BUSINESS_TIME_ZONE, businessDateKey, formatBusinessTime } from '../shared/schedule';
 
 const POSTER_WIDTH = 1080;
 const POSTER_HEIGHT = 1440;
 const FONT_STACK = '"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif';
 
 export interface PosterModel {
+  topicId: number;
   title: string;
   summary: string;
   date: string;
   time: string;
   dateKey: string;
+  timeKey: string;
+  programLabel: string;
   presenter: string;
   duration: string;
   location: string;
   tags: string[];
   source: string;
   filename: string;
+}
+
+export interface PosterProgramContext {
+  /** One-based position in the confirmed same-day schedule. */
+  position: number;
+  total: number;
 }
 
 export interface PosterRect {
@@ -42,6 +52,13 @@ export interface PosterTagLayout {
 }
 
 export interface PosterLayout {
+  program: {
+    bounds: PosterRect;
+    labelText: string;
+    labelFontSize: number;
+    labelMaxWidth: number;
+    topicText: string;
+  };
   title: PosterTextBlock;
   summary: PosterTextBlock;
   info: PosterRect;
@@ -59,20 +76,19 @@ export type PosterTextMeasure = (fontSize: number, value: string, fontWeight?: n
 
 function formatParts(value: string) {
   const formatter = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
+    timeZone: BUSINESS_TIME_ZONE,
     year: 'numeric',
     month: 'long',
     day: 'numeric',
     weekday: 'long',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
   });
   const parts = Object.fromEntries(formatter.formatToParts(new Date(value)).map((part) => [part.type, part.value]));
+  const time = formatBusinessTime(value);
   return {
     date: `${parts.year}年${parts.month}月${parts.day}日 · ${parts.weekday}`,
-    time: `${parts.hour}:${parts.minute} 北京时间`,
-    dateKey: `${parts.year}${parts.month.replace(/\D/g, '').padStart(2, '0')}${parts.day.padStart(2, '0')}`,
+    time,
+    dateKey: businessDateKey(value).replaceAll('-', ''),
+    timeKey: time.slice(0, 5).replace(':', ''),
   };
 }
 
@@ -99,16 +115,28 @@ export function posterLocation(topic: Topic) {
   return sanitizePosterText(room) || '地点待定';
 }
 
-export function posterFilename(dateKeyValue: string, title: string) {
+export function posterProgramLabel(context?: PosterProgramContext) {
+  if (!context
+    || !Number.isSafeInteger(context.position)
+    || !Number.isSafeInteger(context.total)
+    || context.total < 2
+    || context.position < 1
+    || context.position > context.total) {
+    return '即将开讲';
+  }
+  return `当日第 ${context.position} / ${context.total} 场`;
+}
+
+export function posterFilename(dateKeyValue: string, timeKeyValue: string, topicId: number, title: string) {
   const safeTitle = Array.from(sanitizePosterText(title)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '')
     .replace(/\s+/g, '-'))
     .slice(0, 36)
     .join('') || '炉边分享';
-  return `围炉夜话-${dateKeyValue}-${safeTitle}.png`;
+  return `围炉夜话-${dateKeyValue}-${timeKeyValue}-${topicId}-${safeTitle}.png`;
 }
 
-export function buildPosterModel(topic: Topic, origin: string, now = new Date()): PosterModel {
+export function buildPosterModel(topic: Topic, origin: string, now = new Date(), programContext?: PosterProgramContext): PosterModel {
   if (!isPosterEligible(topic, now)) {
     throw new Error('排期已过，请先改期或归档');
   }
@@ -118,17 +146,20 @@ export function buildPosterModel(topic: Topic, origin: string, now = new Date())
   const formatted = formatParts(topic.scheduledAt);
   const safeTitle = sanitizePosterText(topic.title);
   return {
+    topicId: topic.id,
     title: safeTitle,
     summary: sanitizePosterText(topic.summary),
     date: formatted.date,
     time: formatted.time,
     dateKey: formatted.dateKey,
+    timeKey: formatted.timeKey,
+    programLabel: posterProgramLabel(programContext),
     presenter: sanitizePosterText(topic.presenter),
     duration: `${topic.duration} 分钟`,
     location: posterLocation(topic),
     tags: topic.tags.slice(0, 5).map(sanitizePosterText),
     source: origin.replace(/^https?:\/\//, '').replace(/\/$/, '') || '围炉夜话议题广场',
-    filename: posterFilename(formatted.dateKey, safeTitle),
+    filename: posterFilename(formatted.dateKey, formatted.timeKey, topic.id, safeTitle),
   };
 }
 
@@ -221,6 +252,12 @@ export function ellipsizePosterText(text: string, measure: (value: string) => nu
 }
 
 export function buildPosterLayout(model: PosterModel, measure: PosterTextMeasure): PosterLayout {
+  const programBounds = { x: 674, y: 92, width: 314, height: 78 };
+  const programLabelMaxWidth = programBounds.width - 36;
+  let programLabelFontSize = 22;
+  while (programLabelFontSize > 16 && measure(programLabelFontSize, model.programLabel, 800) > programLabelMaxWidth) {
+    programLabelFontSize -= 1;
+  }
   const contentX = 96;
   const contentWidth = 888;
   const titleTop = 228;
@@ -310,6 +347,17 @@ export function buildPosterLayout(model: PosterModel, measure: PosterTextMeasure
   const sourceText = ellipsizePosterText(model.source, (value) => measure(20, value, 500), 330);
 
   return {
+    program: {
+      bounds: programBounds,
+      labelText: ellipsizePosterText(
+        model.programLabel,
+        (value) => measure(programLabelFontSize, value, 800),
+        programLabelMaxWidth,
+      ),
+      labelFontSize: programLabelFontSize,
+      labelMaxWidth: programLabelMaxWidth,
+      topicText: `议题 #${String(model.topicId).padStart(3, '0')}`,
+    },
     title: titleBlock,
     summary: summaryBlock,
     info,
@@ -367,21 +415,39 @@ export function renderTopicPoster(canvas: HTMLCanvasElement, model: PosterModel)
   context.fillText('WEEKLY · AI FIRESIDE CHAT', 162, 166);
   context.letterSpacing = '0px';
 
-  roundedRect(context, 778, 93, 210, 62, 31);
+  const layout = buildPosterLayout(model, (size, value, weight = 400) => {
+    context.font = `${weight} ${size}px ${FONT_STACK}`;
+    return context.measureText(value).width;
+  });
+  roundedRect(
+    context,
+    layout.program.bounds.x,
+    layout.program.bounds.y,
+    layout.program.bounds.width,
+    layout.program.bounds.height,
+    layout.program.bounds.height / 2,
+  );
   context.fillStyle = 'rgba(255,176,90,.10)';
   context.fill();
   context.strokeStyle = 'rgba(255,176,90,.32)';
   context.stroke();
   context.fillStyle = '#ffc98a';
-  context.font = `800 24px ${FONT_STACK}`;
+  context.font = `800 ${layout.program.labelFontSize}px ${FONT_STACK}`;
   context.textAlign = 'center';
-  context.fillText('即 将 开 讲', 883, 133);
+  context.fillText(
+    layout.program.labelText,
+    layout.program.bounds.x + layout.program.bounds.width / 2,
+    layout.program.bounds.y + 32,
+  );
+  context.fillStyle = '#a49a8f';
+  context.font = `700 16px ${FONT_STACK}`;
+  context.fillText(
+    layout.program.topicText,
+    layout.program.bounds.x + layout.program.bounds.width / 2,
+    layout.program.bounds.y + 59,
+  );
   context.textAlign = 'left';
 
-  const layout = buildPosterLayout(model, (size, value, weight = 400) => {
-    context.font = `${weight} ${size}px ${FONT_STACK}`;
-    return context.measureText(value).width;
-  });
   context.fillStyle = '#fff5e8';
   context.font = `900 ${layout.title.fontSize}px ${FONT_STACK}`;
   drawTextLines(context, layout.title.lines, layout.title.x, layout.title.y, layout.title.lineHeight);

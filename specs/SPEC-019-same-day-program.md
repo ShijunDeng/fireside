@@ -1,6 +1,6 @@
 # SPEC-019：同日多场日程编排与海报场次上下文
 
-- 状态：`Implementing`
+- 状态：`Accepted`
 - 创建：2026-09-02
 - 最后更新：2026-09-02
 - 依赖：SPEC-002、SPEC-004、SPEC-005、SPEC-006、SPEC-007、SPEC-008、SPEC-011、SPEC-014

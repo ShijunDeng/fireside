@@ -117,6 +117,7 @@ describe('围炉夜话 API', () => {
       { method: 'POST', url: '/api/topics/1/archive' },
       { method: 'POST', url: '/api/topics/1/unarchive' },
       { method: 'GET', url: '/api/topics/1/participants' },
+      { method: 'GET', url: '/api/topics/1/unschedule-impact' },
       { method: 'POST', url: '/api/topics/1/participants' },
       { method: 'DELETE', url: '/api/topics/1/participants/1' },
       { method: 'GET', url: '/api/topics/1/meeting-access' },
@@ -194,7 +195,9 @@ describe('围炉夜话 API', () => {
     const guardedReadVariants = [
       { method: 'GET', url: `/api/topics/${encodedId}/meeting-access` },
       { method: 'GET', url: `/api/topics/${id}/%70articipants` },
+      { method: 'GET', url: `/api/topics/${id}/%75nschedule-impact` },
       { method: 'HEAD', url: `/api/topics/${id}/participants` },
+      { method: 'HEAD', url: `/api/topics/${id}/unschedule-impact` },
       { method: 'HEAD', url: `/api/topics/${encodedId}/meeting-access` },
       { method: 'HEAD', url: '/api/access/session' },
     ] as const;
@@ -219,6 +222,14 @@ describe('围炉夜话 API', () => {
     const participants = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/participants`, headers });
     assert.deepEqual((participants.json() as { name: string }[]).map(({ name }) => name), ['隐私参与者']);
     assert.equal(participants.headers['cache-control'], 'no-store');
+    const unscheduleImpact = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/unschedule-impact`, headers });
+    assert.equal(unscheduleImpact.statusCode, 200);
+    assert.equal(unscheduleImpact.headers['cache-control'], 'no-store');
+    assert.deepEqual(unscheduleImpact.json().participants.map(({ name }: { name: string }) => name), ['隐私参与者']);
+    assert.equal(unscheduleImpact.json().topic.revision, scheduled.json().revision + 1);
+    assert.equal(unscheduleImpact.json().topic.participantCount, 1);
+    assert.equal(unscheduleImpact.json().topic.meetingUrl, null);
+    assert.equal(unscheduleImpact.body.includes(secretMeeting), false);
     const meeting = await protectedApp.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access`, headers });
     assert.equal(meeting.json().meetingUrl, secretMeeting);
     assert.equal(meeting.headers['cache-control'], 'no-store');
@@ -1024,15 +1035,22 @@ describe('围炉夜话 API', () => {
     assert.equal(scheduled.json().hasMeetingUrl, true);
     const meetingAccess = await app.inject({ method: 'GET', url: `/api/topics/${id}/meeting-access` });
     assert.equal(meetingAccess.json().meetingUrl, meetingUrl);
+    assert.equal(meetingAccess.headers.etag, `"${scheduled.json().revision}"`);
 
     const firstJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: 'Alice' } });
     assert.equal(firstJoin.statusCode, 201);
+    assert.equal(firstJoin.headers.etag, '"3"');
+    assert.equal(firstJoin.headers['x-fireside-participant-count'], '1');
     const duplicateJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '  alice  ' } });
     assert.equal(duplicateJoin.statusCode, 409);
     assert.equal(duplicateJoin.json().code, 'PARTICIPANT_DUPLICATE');
     const secondJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '小林' } });
     assert.equal(secondJoin.statusCode, 201);
+    assert.equal(secondJoin.headers.etag, '"4"');
+    assert.equal(secondJoin.headers['x-fireside-participant-count'], '2');
     const participants = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+    assert.equal(participants.headers.etag, '"4"');
+    assert.equal(participants.headers['x-fireside-participant-count'], '2');
     assert.deepEqual((participants.json() as { name: string }[]).map(({ name }) => name), ['Alice', '小林']);
     const topics = await app.inject({ method: 'GET', url: '/api/topics' });
     const topic = (topics.json() as { id: number; participantCount: number }[]).find((item) => item.id === id);
@@ -1040,7 +1058,11 @@ describe('围炉夜话 API', () => {
 
     const leftUpcoming = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(leftUpcoming.statusCode, 204);
+    assert.equal(leftUpcoming.headers.etag, '"5"');
+    assert.equal(leftUpcoming.headers['x-fireside-participant-count'], '1');
     const afterUpcomingLeave = await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` });
+    assert.equal(afterUpcomingLeave.headers.etag, '"5"');
+    assert.equal(afterUpcomingLeave.headers['x-fireside-participant-count'], '1');
     assert.deepEqual((afterUpcomingLeave.json() as { name: string }[]).map(({ name }) => name), ['小林']);
 
     const latestBeforeArchive = await readTopic(app, id);
@@ -1050,6 +1072,7 @@ describe('围炉夜话 API', () => {
       payload: { takeaway: '参会闭环完成。', materialUrl: '' },
     });
     assert.equal(archived.statusCode, 200);
+    assert.equal(archived.json().participantCount, 1);
     const joinArchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '迟到者' } });
     assert.equal(joinArchived.statusCode, 409);
     assert.equal(joinArchived.json().code, 'TOPIC_STATE_CONFLICT');
@@ -1062,6 +1085,7 @@ describe('围炉夜话 API', () => {
 
     const unarchived = await app.inject({ method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(archived.json().revision), payload: {} });
     assert.equal(unarchived.statusCode, 200);
+    assert.equal(unarchived.json().participantCount, 1);
     const frozenLeave = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${secondJoin.json().id}` });
     assert.equal(frozenLeave.statusCode, 409);
     assert.equal(frozenLeave.json().code, 'ACTIVITY_TIME_CONFLICT');
@@ -1098,23 +1122,23 @@ describe('围炉夜话 API', () => {
     const end = start + duration * 60_000;
     const meetingSecret = 'https://meet.example.test/phase?token=never-return-after-end';
 
-    const createScheduled = async (title: string) => {
+    const createScheduled = async (title: string, scheduledStart = start) => {
       const created = await phaseApp.inject({
         method: 'POST', url: '/api/topics',
         payload: { title, summary: '验证活动阶段边界。', proposer: '时间测试', presenter: '时间测试', tags: [] },
       });
       const scheduled = await phaseApp.inject({
         method: 'POST', url: `/api/topics/${created.json().id}/schedule`, headers: ifMatch(created.json().revision),
-        payload: { scheduledAt: new Date(start).toISOString(), duration, room: '阶段测试会议室', meetingUrl: meetingSecret },
+        payload: { scheduledAt: new Date(scheduledStart).toISOString(), duration, room: '阶段测试会议室', meetingUrl: meetingSecret },
       });
       assert.equal(scheduled.statusCode, 200);
       return scheduled.json() as { id: number; revision: number; scheduledAt: string; duration: number };
     };
 
+    const reset = await createScheduled('未举行重排议题', start - duration * 60_000);
     const main = await createScheduled('阶段主议题');
-    const reset = await createScheduled('未举行重排议题');
-    const upcomingCancel = await createScheduled('未来取消议题');
-    const editable = await createScheduled('改期边界议题');
+    const upcomingCancel = await createScheduled('未来取消议题', end);
+    const editable = await createScheduled('改期边界议题', end + duration * 60_000);
     const claimed = await phaseApp.inject({
       method: 'POST', url: '/api/topics',
       payload: { title: '非法排期议题', summary: '过去和当前时间不能排期。', proposer: '时间测试', presenter: '时间测试', tags: [] },
@@ -1243,6 +1267,39 @@ describe('围炉夜话 API', () => {
     assert.equal(archivedMeeting.statusCode, 409);
     assert.equal(archivedMeeting.body.includes(meetingSecret), false);
 
+    const correctedStart = new Date(start + 10 * 60_000).toISOString();
+    const corrected = await phaseApp.inject({
+      method: 'PATCH', url: `/api/topics/${main.id}`, headers: ifMatch(archived.json().revision),
+      payload: { scheduledAt: correctedStart, duration: 30 },
+    });
+    assert.equal(corrected.statusCode, 200);
+    assert.equal(corrected.json().status, 'ARCHIVED');
+    assert.equal(corrected.json().scheduledAt, correctedStart);
+    assert.equal(corrected.json().duration, 30);
+    assert.equal(corrected.json().archivedAt, archived.json().archivedAt);
+    const correctedSnapshot = await readTopic(phaseApp, main.id);
+    const frozenParticipants = (await phaseApp.inject({ method: 'GET', url: `/api/topics/${main.id}/participants` })).json();
+
+    const staleImpossibleHistory = await phaseApp.inject({
+      method: 'PATCH', url: `/api/topics/${main.id}`, headers: ifMatch(archived.json().revision),
+      payload: { scheduledAt: '2031-01-01T01:00:00.000Z', duration: 30 },
+    });
+    assert.equal(staleImpossibleHistory.statusCode, 412);
+    assert.equal(staleImpossibleHistory.json().code, 'TOPIC_REVISION_CONFLICT');
+
+    for (const payload of [
+      { scheduledAt: '2031-01-01T01:00:00.000Z' },
+      { duration: 31 },
+    ]) {
+      const impossibleHistory = await phaseApp.inject({
+        method: 'PATCH', url: `/api/topics/${main.id}`, headers: ifMatch(correctedSnapshot.revision), payload,
+      });
+      assert.equal(impossibleHistory.statusCode, 409);
+      assert.equal(impossibleHistory.json().code, 'ACTIVITY_TIME_CONFLICT');
+      assert.deepEqual(await readTopic(phaseApp, main.id), correctedSnapshot);
+      assert.deepEqual((await phaseApp.inject({ method: 'GET', url: `/api/topics/${main.id}/participants` })).json(), frozenParticipants);
+    }
+
     const resetBefore = await readTopic(phaseApp, reset.id);
     const resetResponse = await phaseApp.inject({
       method: 'POST', url: `/api/topics/${reset.id}/unschedule`, headers: ifMatch(resetBefore.revision), payload: {},
@@ -1256,6 +1313,278 @@ describe('围炉夜话 API', () => {
     assert.deepEqual((await phaseApp.inject({ method: 'GET', url: `/api/topics/${reset.id}/participants` })).json(), []);
 
     await phaseApp.close();
+  });
+
+  it('以半开区间拒绝排期与改期重叠并保持结构化冲突和零副作用', async () => {
+    let clock = new Date('2032-06-01T10:00:00.000Z');
+    const overlapApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, now: () => clock });
+    await overlapApp.ready();
+    const createClaimed = async (title: string) => {
+      const created = await overlapApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title, summary: `${title}的排期边界测试。`, proposer: '排期测试', presenter: '排期测试', tags: [] },
+      });
+      assert.equal(created.statusCode, 201);
+      return created.json() as { id: number; revision: number };
+    };
+    const schedule = (topic: { id: number; revision: number }, scheduledAt: string, duration: number) => overlapApp.inject({
+      method: 'POST', url: `/api/topics/${topic.id}/schedule`, headers: ifMatch(topic.revision),
+      payload: { scheduledAt, duration, room: '单轨围炉会议室', meetingUrl: '' },
+    });
+
+    const before = await createClaimed('相邻前场');
+    const anchor = await createClaimed('冲突基准场');
+    const after = await createClaimed('相邻后场');
+    const failedTarget = await createClaimed('排期冲突目标');
+    assert.equal((await schedule(before, '2032-06-01T10:30:00.000Z', 30)).statusCode, 200);
+    const scheduledAnchor = await schedule(anchor, '2032-06-01T19:00:00+08:00', 60);
+    assert.equal(scheduledAnchor.statusCode, 200);
+    assert.equal((await schedule(after, '2032-06-01T12:00:00.000Z', 30)).statusCode, 200);
+    const offsetSorted = await overlapApp.inject({ method: 'GET', url: '/api/topics?sort=schedule' });
+    assert.deepEqual(
+      (offsetSorted.json() as { id: number; scheduledAt: string | null }[]).filter(({ scheduledAt }) => scheduledAt).map(({ id }) => id),
+      [before.id, anchor.id, after.id],
+    );
+
+    const participant = await overlapApp.inject({
+      method: 'POST', url: `/api/topics/${anchor.id}/participants`, payload: { name: '冲突场次报名人' },
+    });
+    assert.equal(participant.statusCode, 201);
+    const beforeTarget = await readTopic(overlapApp, failedTarget.id);
+    const beforeAnchor = await readTopic(overlapApp, anchor.id);
+    const beforeParticipants = (await overlapApp.inject({ method: 'GET', url: `/api/topics/${anchor.id}/participants` })).json();
+    const beforeList = await overlapApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+
+    const overlap = await schedule(failedTarget, '2032-06-01T11:30:00.000Z', 20);
+    assert.equal(overlap.statusCode, 409);
+    assert.deepEqual(overlap.json(), {
+      code: 'ACTIVITY_SCHEDULE_OVERLAP',
+      message: '该时段与已排期议题重叠，请调整时间后重试',
+      conflicts: [{
+        id: anchor.id,
+        title: '冲突基准场',
+        scheduledAt: '2032-06-01T19:00:00+08:00',
+        duration: 60,
+      }],
+    });
+    assert.deepEqual(await readTopic(overlapApp, failedTarget.id), beforeTarget);
+    assert.deepEqual(await readTopic(overlapApp, anchor.id), beforeAnchor);
+    assert.deepEqual((await overlapApp.inject({ method: 'GET', url: `/api/topics/${anchor.id}/participants` })).json(), beforeParticipants);
+    const afterList = await overlapApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(afterList.headers['x-order-version'], beforeList.headers['x-order-version']);
+    assert.deepEqual(afterList.json(), beforeList.json());
+
+    const patchable = await createClaimed('时长扩张目标');
+    const blocker = await createClaimed('时长扩张阻挡场');
+    const scheduledPatchable = await schedule(patchable, '2032-06-01T12:30:00.000Z', 30);
+    const scheduledBlocker = await schedule(blocker, '2032-06-01T13:00:00.000Z', 30);
+    assert.equal(scheduledPatchable.statusCode, 200);
+    assert.equal(scheduledBlocker.statusCode, 200);
+    const patchableBefore = await readTopic(overlapApp, patchable.id);
+    const durationOverlap = await overlapApp.inject({
+      method: 'PATCH', url: `/api/topics/${patchable.id}`,
+      headers: ifMatch(scheduledPatchable.json().revision), payload: { duration: 31 },
+    });
+    assert.equal(durationOverlap.statusCode, 409);
+    assert.equal(durationOverlap.json().code, 'ACTIVITY_SCHEDULE_OVERLAP');
+    assert.deepEqual(durationOverlap.json().conflicts, [{
+      id: blocker.id,
+      title: '时长扩张阻挡场',
+      scheduledAt: '2032-06-01T13:00:00.000Z',
+      duration: 30,
+    }]);
+    assert.deepEqual(await readTopic(overlapApp, patchable.id), patchableBefore);
+
+    const staleTarget = await createClaimed('陈旧版本优先目标');
+    const renamed = await overlapApp.inject({
+      method: 'PATCH', url: `/api/topics/${staleTarget.id}`, headers: ifMatch(staleTarget.revision), payload: { title: '远端已更新标题' },
+    });
+    assert.equal(renamed.statusCode, 200);
+    const staleOverlap = await schedule(staleTarget, '2032-06-01T11:30:00.000Z', 20);
+    assert.equal(staleOverlap.statusCode, 412);
+    assert.equal(staleOverlap.json().code, 'TOPIC_REVISION_CONFLICT');
+
+    const latestAnchor = await readTopic(overlapApp, anchor.id);
+    clock = new Date('2032-06-01T10:10:00.000Z');
+    const released = await overlapApp.inject({
+      method: 'POST', url: `/api/topics/${anchor.id}/unschedule`, headers: ifMatch(latestAnchor.revision), payload: {},
+    });
+    assert.equal(released.statusCode, 200);
+    const retry = await schedule(failedTarget, '2032-06-01T11:30:00.000Z', 20);
+    assert.equal(retry.statusCode, 200);
+    assert.equal(retry.json().revision, failedTarget.revision + 1);
+
+    const bySchedule = await overlapApp.inject({ method: 'GET', url: '/api/topics?sort=schedule' });
+    const scheduledIds = (bySchedule.json() as { id: number; scheduledAt: string | null }[])
+      .filter(({ scheduledAt }) => scheduledAt)
+      .map(({ id }) => id);
+    assert.deepEqual(scheduledIds.slice(0, 3), [before.id, failedTarget.id, after.id]);
+    const stats = await overlapApp.inject({ method: 'GET', url: '/api/stats' });
+    assert.equal(stats.json().nextTopic.id, before.id);
+    await overlapApp.close();
+  });
+
+  it('让目标、版本与阶段错误稳定先于非法排期候选值', async () => {
+    let clock = new Date('2035-01-01T00:00:00.000Z');
+    const priorityApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, now: () => clock });
+    await priorityApp.ready();
+    const create = async (title: string, presenter?: string) => {
+      const response = await priorityApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title, summary: `${title}的错误优先级验收。`, proposer: '优先级测试', ...(presenter ? { presenter } : {}), tags: [] },
+      });
+      assert.equal(response.statusCode, 201);
+      return response.json() as { id: number; revision: number };
+    };
+    const invalidSchedulePayload = { scheduledAt: 'not-a-time', duration: 1, room: '优先级会议室', meetingUrl: '' };
+    const invalidPatchPayload = { scheduledAt: 'not-a-time', duration: 1 };
+
+    const staleClaimed = await create('陈旧排期目标', '排期人');
+    const renamedClaimed = await priorityApp.inject({
+      method: 'PATCH', url: `/api/topics/${staleClaimed.id}`, headers: ifMatch(staleClaimed.revision), payload: { title: '排期目标已更新' },
+    });
+    assert.equal(renamedClaimed.statusCode, 200);
+    const open = await create('尚未认领目标');
+    const validClaimed = await create('合法状态非法候选', '排期人');
+    const staleScheduledSeed = await create('陈旧改期目标', '改期人');
+    const staleScheduled = await priorityApp.inject({
+      method: 'POST', url: `/api/topics/${staleScheduledSeed.id}/schedule`, headers: ifMatch(staleScheduledSeed.revision),
+      payload: { scheduledAt: '2035-01-01T01:00:00.000Z', duration: 30, room: '改期会议室', meetingUrl: '' },
+    });
+    assert.equal(staleScheduled.statusCode, 200);
+    const renamedScheduled = await priorityApp.inject({
+      method: 'PATCH', url: `/api/topics/${staleScheduledSeed.id}`, headers: ifMatch(staleScheduled.json().revision), payload: { title: '改期目标已更新' },
+    });
+    assert.equal(renamedScheduled.statusCode, 200);
+    const phaseSeed = await create('阶段优先目标', '改期人');
+    const phaseTarget = await priorityApp.inject({
+      method: 'POST', url: `/api/topics/${phaseSeed.id}/schedule`, headers: ifMatch(phaseSeed.revision),
+      payload: { scheduledAt: '2035-01-01T02:00:00.000Z', duration: 30, room: '阶段会议室', meetingUrl: '' },
+    });
+    assert.equal(phaseTarget.statusCode, 200);
+
+    const before = await priorityApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const expectCode = async (
+      request: {
+        method: 'POST' | 'PATCH';
+        url: string;
+        headers: Record<string, string>;
+        payload: Record<string, unknown>;
+      },
+      statusCode: number,
+      code?: string,
+      phase?: string,
+    ) => {
+      const response = await priorityApp.inject(request);
+      assert.equal(response.statusCode, statusCode);
+      if (code) assert.equal(response.json().code, code);
+      if (phase) assert.equal(response.json().phase, phase);
+    };
+
+    await expectCode({ method: 'POST', url: '/api/topics/999999/schedule', headers: ifMatch(1), payload: invalidSchedulePayload }, 404, 'TOPIC_NOT_FOUND');
+    await expectCode({ method: 'POST', url: `/api/topics/${staleClaimed.id}/schedule`, headers: ifMatch(staleClaimed.revision), payload: invalidSchedulePayload }, 412, 'TOPIC_REVISION_CONFLICT');
+    await expectCode({ method: 'POST', url: `/api/topics/${open.id}/schedule`, headers: ifMatch(open.revision), payload: invalidSchedulePayload }, 409, 'TOPIC_STATE_CONFLICT');
+    await expectCode({ method: 'POST', url: `/api/topics/${validClaimed.id}/schedule`, headers: ifMatch(validClaimed.revision), payload: invalidSchedulePayload }, 400);
+
+    await expectCode({ method: 'PATCH', url: '/api/topics/999999', headers: ifMatch(1), payload: invalidPatchPayload }, 404, 'TOPIC_NOT_FOUND');
+    await expectCode({ method: 'PATCH', url: `/api/topics/${staleScheduledSeed.id}`, headers: ifMatch(staleScheduled.json().revision), payload: invalidPatchPayload }, 412, 'TOPIC_REVISION_CONFLICT');
+    await expectCode({ method: 'PATCH', url: `/api/topics/${open.id}`, headers: ifMatch(open.revision), payload: invalidPatchPayload }, 409, 'TOPIC_STATE_CONFLICT');
+    await expectCode({ method: 'PATCH', url: `/api/topics/${phaseSeed.id}`, headers: ifMatch(phaseTarget.json().revision), payload: invalidPatchPayload }, 400);
+
+    clock = new Date('2035-01-01T02:00:00.000Z');
+    await expectCode({ method: 'PATCH', url: `/api/topics/${phaseSeed.id}`, headers: ifMatch(phaseTarget.json().revision), payload: invalidPatchPayload }, 409, 'ACTIVITY_TIME_CONFLICT', 'LIVE');
+    clock = new Date('2035-01-01T02:30:00.000Z');
+    await expectCode({ method: 'PATCH', url: `/api/topics/${phaseSeed.id}`, headers: ifMatch(phaseTarget.json().revision), payload: invalidPatchPayload }, 409, 'ACTIVITY_TIME_CONFLICT', 'ENDED');
+
+    const after = await priorityApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(after.headers['x-order-version'], before.headers['x-order-version']);
+    assert.deepEqual(after.json(), before.json());
+    await priorityApp.close();
+  });
+
+  it('撤销归档不能把已校正的历史时间恢复到重叠单轨', async () => {
+    let clock = new Date('2040-01-01T00:00:00.000Z');
+    const unarchiveApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, now: () => clock });
+    await unarchiveApp.ready();
+    const createAndSchedule = async (title: string, scheduledAt: string) => {
+      const created = await unarchiveApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title, summary: `${title}需保持单轨。`, proposer: '归档测试', presenter: '归档测试', tags: [] },
+      });
+      assert.equal(created.statusCode, 201);
+      const scheduled = await unarchiveApp.inject({
+        method: 'POST', url: `/api/topics/${created.json().id}/schedule`, headers: ifMatch(created.json().revision),
+        payload: { scheduledAt, duration: 30, room: '归档会议室', meetingUrl: '' },
+      });
+      assert.equal(scheduled.statusCode, 200);
+      return scheduled.json() as { id: number; revision: number };
+    };
+
+    const first = await createAndSchedule('撤销归档甲', '2040-01-01T01:00:00.000Z');
+    const second = await createAndSchedule('撤销归档乙', '2040-01-01T02:00:00.000Z');
+    const participant = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${second.id}/participants`, payload: { name: '归档伙伴' },
+    });
+    assert.equal(participant.statusCode, 201);
+    clock = new Date('2040-01-01T03:00:00.000Z');
+    const firstArchived = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${first.id}/archive`, headers: ifMatch(first.revision),
+      payload: { takeaway: '甲归档收获', materialUrl: '' },
+    });
+    assert.equal(firstArchived.statusCode, 200);
+    const secondLatest = await readTopic(unarchiveApp, second.id);
+    const secondArchived = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${second.id}/archive`, headers: ifMatch(secondLatest.revision),
+      payload: { takeaway: '乙归档收获', materialUrl: '' },
+    });
+    assert.equal(secondArchived.statusCode, 200);
+
+    const correctedSlot = '2040-01-01T01:30:00.000Z';
+    const firstCorrected = await unarchiveApp.inject({
+      method: 'PATCH', url: `/api/topics/${first.id}`, headers: ifMatch(firstArchived.json().revision),
+      payload: { scheduledAt: correctedSlot, duration: 45 },
+    });
+    assert.equal(firstCorrected.statusCode, 200);
+    const secondCorrected = await unarchiveApp.inject({
+      method: 'PATCH', url: `/api/topics/${second.id}`, headers: ifMatch(secondArchived.json().revision),
+      payload: { scheduledAt: correctedSlot, duration: 45 },
+    });
+    assert.equal(secondCorrected.statusCode, 200);
+
+    const firstRestored = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${first.id}/unarchive`, headers: ifMatch(firstCorrected.json().revision), payload: {},
+    });
+    assert.equal(firstRestored.statusCode, 200);
+    const beforeTarget = await readTopic(unarchiveApp, second.id);
+    const beforeConflict = await readTopic(unarchiveApp, first.id);
+    const beforeParticipants = (await unarchiveApp.inject({ method: 'GET', url: `/api/topics/${second.id}/participants` })).json();
+    const beforeList = await unarchiveApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const rejected = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${second.id}/unarchive`, headers: ifMatch(secondCorrected.json().revision), payload: {},
+    });
+    assert.equal(rejected.statusCode, 409);
+    assert.deepEqual(rejected.json(), {
+      code: 'ACTIVITY_SCHEDULE_OVERLAP',
+      message: '该时段与已排期议题重叠，请调整时间后重试',
+      conflicts: [{ id: first.id, title: '撤销归档甲', scheduledAt: correctedSlot, duration: 45 }],
+    });
+    assert.deepEqual(await readTopic(unarchiveApp, second.id), beforeTarget);
+    assert.deepEqual(await readTopic(unarchiveApp, first.id), beforeConflict);
+    assert.deepEqual((await unarchiveApp.inject({ method: 'GET', url: `/api/topics/${second.id}/participants` })).json(), beforeParticipants);
+    const afterList = await unarchiveApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    assert.equal(afterList.headers['x-order-version'], beforeList.headers['x-order-version']);
+    assert.deepEqual(afterList.json(), beforeList.json());
+
+    const released = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${first.id}/unschedule`, headers: ifMatch(firstRestored.json().revision), payload: {},
+    });
+    assert.equal(released.statusCode, 200);
+    const retried = await unarchiveApp.inject({
+      method: 'POST', url: `/api/topics/${second.id}/unarchive`, headers: ifMatch(secondCorrected.json().revision), payload: {},
+    });
+    assert.equal(retried.statusCode, 200);
+    assert.equal(retried.json().revision, secondCorrected.json().revision + 1);
+    await unarchiveApp.close();
   });
 
   it('拒绝把会议链接或凭证写入地点且保留普通地点', async () => {
@@ -1339,7 +1668,8 @@ describe('围炉夜话 API', () => {
     assert.deepEqual(updated.json().tags, ['新标签', 'CRUD']);
 
     const invalidUrl = await app.inject({ method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(updated.json().revision), payload: { materialUrl: 'javascript:alert(1)' } });
-    assert.equal(invalidUrl.statusCode, 400);
+    assert.equal(invalidUrl.statusCode, 409);
+    assert.equal(invalidUrl.json().code, 'TOPIC_STATE_CONFLICT');
     const bypassState = await app.inject({
       method: 'PATCH', url: `/api/topics/${id}`,
       headers: ifMatch(updated.json().revision),
@@ -1353,6 +1683,69 @@ describe('围炉夜话 API', () => {
     assert.equal(duplicate.statusCode, 404);
     const topics = await app.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(topics.json().some((topic: { id: number }) => topic.id === id), false);
+  });
+
+  it('资料链接严格限制为 2048 字符且所有成功快照保留真实报名数', async () => {
+    appNow = new Date('2031-04-10T01:00:00.000Z');
+    const created = await app.inject({
+      method: 'POST', url: '/api/topics',
+      payload: { title: '权威报名聚合', summary: '验证资料边界和生命周期响应人数。', proposer: '组织者', presenter: '组织者', tags: [] },
+    });
+    const id = created.json().id as number;
+    const scheduled = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/schedule`, headers: ifMatch(created.json().revision),
+      payload: { scheduledAt: '2031-04-10T02:00:00.000Z', duration: 30, room: '围炉厅' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    const joined = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '资料伙伴' } });
+    assert.equal(joined.statusCode, 201);
+    const joinedRevision = Number(String(joined.headers.etag).slice(1, -1));
+    appNow = new Date('2031-04-10T02:30:00.000Z');
+
+    const materialPrefix = 'https://example.com/';
+    const validMaterial = materialPrefix + 'a'.repeat(2048 - materialPrefix.length);
+    const oversizedMaterial = `${validMaterial}b`;
+    assert.equal(validMaterial.length, 2048);
+    assert.equal(oversizedMaterial.length, 2049);
+
+    const beforeOversizedArchive = await readTopic(app, id);
+    const oversizedArchive = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/archive`, headers: ifMatch(joinedRevision),
+      payload: { takeaway: '不能提交超长资料。', materialUrl: oversizedMaterial },
+    });
+    assert.equal(oversizedArchive.statusCode, 400);
+    assert.deepEqual(await readTopic(app, id), beforeOversizedArchive);
+
+    const archived = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/archive`, headers: ifMatch(joinedRevision),
+      payload: { takeaway: '合法边界可以保存。', materialUrl: validMaterial },
+    });
+    assert.equal(archived.statusCode, 200);
+    assert.equal(archived.json().materialUrl, validMaterial);
+    assert.equal(archived.json().participantCount, 1);
+
+    const beforeOversizedEdit = await readTopic(app, id);
+    const oversizedEdit = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(archived.json().revision),
+      payload: { materialUrl: oversizedMaterial },
+    });
+    assert.equal(oversizedEdit.statusCode, 400);
+    assert.deepEqual(await readTopic(app, id), beforeOversizedEdit);
+
+    const edited = await app.inject({
+      method: 'PATCH', url: `/api/topics/${id}`, headers: ifMatch(archived.json().revision),
+      payload: { takeaway: '修改后仍保留真实报名数。', materialUrl: validMaterial },
+    });
+    assert.equal(edited.statusCode, 200);
+    assert.equal(edited.json().participantCount, 1);
+    assert.equal(edited.json().materialUrl, validMaterial);
+
+    const unarchived = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/unarchive`, headers: ifMatch(edited.json().revision), payload: {},
+    });
+    assert.equal(unarchived.statusCode, 200);
+    assert.equal(unarchived.json().participantCount, 1);
+    assert.equal((await readTopic(app, id)).participantCount, 1);
   });
 
   it('只允许早期议题永久删除，并让成熟状态沿真实生命周期回退', async () => {
@@ -1676,17 +2069,31 @@ describe('围炉夜话 API', () => {
     const firstJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: 'Alice' } });
     assert.equal(firstJoin.statusCode, 201);
     assert.equal((await readTopic(app, id)).revision, 3);
+    const firstImpact = await app.inject({ method: 'GET', url: `/api/topics/${id}/unschedule-impact` });
+    assert.equal(firstImpact.statusCode, 200);
+    assert.equal(firstImpact.headers['cache-control'], 'no-store');
+    assert.equal(firstImpact.json().topic.revision, 3);
+    assert.equal(firstImpact.json().topic.meetingUrl, null);
+    assert.deepEqual(firstImpact.json().participants.map(({ name }: { name: string }) => name), ['Alice']);
+    assert.equal((await readTopic(app, id)).revision, 3, '影响读取必须零写入');
     const duplicateJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: ' alice ' } });
     assert.equal(duplicateJoin.statusCode, 409);
     assert.equal((await readTopic(app, id)).revision, 3);
     const secondJoin = await app.inject({ method: 'POST', url: `/api/topics/${id}/participants`, payload: { name: '小林' } });
     assert.equal(secondJoin.statusCode, 201);
     assert.equal((await readTopic(app, id)).revision, 4);
+    const staleImpactUnschedule = await app.inject({
+      method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(firstImpact.json().topic.revision), payload: {},
+    });
+    assert.equal(staleImpactUnschedule.statusCode, 412);
+    assert.equal(staleImpactUnschedule.json().currentRevision, 4);
+    assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['Alice', '小林']);
     const left = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(left.statusCode, 204);
     assert.equal((await readTopic(app, id)).revision, 5);
     const missingLeave = await app.inject({ method: 'DELETE', url: `/api/topics/${id}/participants/${firstJoin.json().id}` });
     assert.equal(missingLeave.statusCode, 404);
+    assert.equal(missingLeave.json().code, 'PARTICIPANT_NOT_FOUND');
     assert.equal((await readTopic(app, id)).revision, 5);
 
     const beforeStaleDelete = await app.inject({ method: 'GET', url: '/api/topics?sort=manual' });
@@ -1706,12 +2113,21 @@ describe('围炉夜话 API', () => {
     assert.equal(staleUnschedule.json().currentRevision, 5);
     assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json().map(({ name }: { name: string }) => name), ['小林']);
 
+    const latestImpact = await app.inject({ method: 'GET', url: `/api/topics/${id}/unschedule-impact` });
+    assert.equal(latestImpact.json().topic.revision, 5);
+    assert.deepEqual(latestImpact.json().participants.map(({ name }: { name: string }) => name), ['小林']);
+
     const unscheduled = await app.inject({
-      method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(5), payload: {},
+      method: 'POST', url: `/api/topics/${id}/unschedule`, headers: ifMatch(latestImpact.json().topic.revision), payload: {},
     });
     assert.equal(unscheduled.statusCode, 200);
     assert.equal(unscheduled.json().revision, 6);
     assert.deepEqual((await app.inject({ method: 'GET', url: `/api/topics/${id}/participants` })).json(), []);
+    const impactAfterUnschedule = await app.inject({ method: 'GET', url: `/api/topics/${id}/unschedule-impact` });
+    assert.equal(impactAfterUnschedule.statusCode, 409);
+    assert.equal(impactAfterUnschedule.json().code, 'TOPIC_STATE_CONFLICT');
+    const missingImpact = await app.inject({ method: 'GET', url: '/api/topics/999999/unschedule-impact' });
+    assert.equal(missingImpact.statusCode, 404);
   });
 
   it('持久化完整的手动排序并拒绝不完整列表', async () => {
@@ -2032,6 +2448,97 @@ describe('数据库兼容性与并发', () => {
     const winner = first.statusCode === 200 ? first.json().presenter : second.json().presenter;
     const topics = await firstApp.inject({ method: 'GET', url: '/api/topics' });
     assert.equal(topics.json()[0].presenter, winner);
+    await Promise.all([firstApp.close(), secondApp.close()]);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  it('两个应用实例让不同议题竞争同一时段时只提交一个排期', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'fireside-schedule-concurrency-'));
+    const databasePath = path.join(directory, 'shared.db');
+    const now = () => new Date('2033-01-01T10:00:00.000Z');
+    const firstApp = buildApp({ databasePath, seed: false, serveStatic: false, now });
+    const secondApp = buildApp({ databasePath, seed: false, serveStatic: false, now });
+    await Promise.all([firstApp.ready(), secondApp.ready()]);
+    const createClaimed = async (title: string) => {
+      const response = await firstApp.inject({
+        method: 'POST', url: '/api/topics',
+        payload: { title, summary: `${title}竞争同一个单轨时段。`, proposer: '并发排期', presenter: '并发排期', tags: [] },
+      });
+      assert.equal(response.statusCode, 201);
+      return response.json() as { id: number; revision: number; updatedAt: string };
+    };
+    const firstTopic = await createClaimed('并发排期甲');
+    const secondTopic = await createClaimed('并发排期乙');
+    const scheduledAt = '2033-01-01T19:00:00+08:00';
+    const requestFor = (instance: FastifyInstance, topic: typeof firstTopic) => instance.inject({
+      method: 'POST', url: `/api/topics/${topic.id}/schedule`, headers: ifMatch(topic.revision),
+      payload: { scheduledAt, duration: 45, room: '并发单轨会议室', meetingUrl: '' },
+    });
+
+    const [first, second] = await Promise.all([
+      requestFor(firstApp, firstTopic),
+      requestFor(secondApp, secondTopic),
+    ]);
+    assert.deepEqual([first.statusCode, second.statusCode].sort(), [200, 409]);
+    const winnerResponse = first.statusCode === 200 ? first : second;
+    const loserResponse = first.statusCode === 409 ? first : second;
+    const winnerSeed = first.statusCode === 200 ? firstTopic : secondTopic;
+    const loserSeed = first.statusCode === 409 ? firstTopic : secondTopic;
+    assert.equal(loserResponse.json().code, 'ACTIVITY_SCHEDULE_OVERLAP');
+    assert.deepEqual(loserResponse.json().conflicts, [{
+      id: winnerSeed.id,
+      title: first.statusCode === 200 ? '并发排期甲' : '并发排期乙',
+      scheduledAt,
+      duration: 45,
+    }]);
+    const loserAfterConflict = await readTopic(firstApp, loserSeed.id);
+    assert.equal(loserAfterConflict.status, 'CLAIMED');
+    assert.equal(loserAfterConflict.revision, loserSeed.revision);
+    assert.equal(loserAfterConflict.updatedAt, loserSeed.updatedAt);
+    assert.equal(loserAfterConflict.scheduledAt, null);
+
+    const released = await firstApp.inject({
+      method: 'POST', url: `/api/topics/${winnerSeed.id}/unschedule`,
+      headers: ifMatch(winnerResponse.json().revision), payload: {},
+    });
+    assert.equal(released.statusCode, 200);
+    const retried = await requestFor(secondApp, loserSeed);
+    assert.equal(retried.statusCode, 200);
+    assert.equal(retried.json().revision, loserSeed.revision + 1);
+
+    const patchSeed = await createClaimed('并发改期目标');
+    const scheduleSeed = await createClaimed('并发新排期目标');
+    const initiallyScheduled = await firstApp.inject({
+      method: 'POST', url: `/api/topics/${patchSeed.id}/schedule`, headers: ifMatch(patchSeed.revision),
+      payload: { scheduledAt: '2033-01-01T21:00:00+08:00', duration: 45, room: '并发改期原会议室', meetingUrl: '' },
+    });
+    assert.equal(initiallyScheduled.statusCode, 200);
+    const competingAt = '2033-01-01T20:00:00+08:00';
+    const [patched, newlyScheduled] = await Promise.all([
+      firstApp.inject({
+        method: 'PATCH', url: `/api/topics/${patchSeed.id}`,
+        headers: ifMatch(initiallyScheduled.json().revision), payload: { scheduledAt: competingAt },
+      }),
+      secondApp.inject({
+        method: 'POST', url: `/api/topics/${scheduleSeed.id}/schedule`, headers: ifMatch(scheduleSeed.revision),
+        payload: { scheduledAt: competingAt, duration: 45, room: '并发新排期会议室', meetingUrl: '' },
+      }),
+    ]);
+    assert.deepEqual([patched.statusCode, newlyScheduled.statusCode].sort(), [200, 409]);
+    const mixedLoser = patched.statusCode === 409 ? patched : newlyScheduled;
+    assert.equal(mixedLoser.json().code, 'ACTIVITY_SCHEDULE_OVERLAP');
+    const finalPatchTopic = await readTopic(firstApp, patchSeed.id);
+    const finalScheduleTopic = await readTopic(firstApp, scheduleSeed.id);
+    if (patched.statusCode === 200) {
+      assert.equal(finalPatchTopic.scheduledAt, competingAt);
+      assert.equal(finalScheduleTopic.status, 'CLAIMED');
+      assert.equal(finalScheduleTopic.revision, scheduleSeed.revision);
+    } else {
+      assert.equal(finalPatchTopic.scheduledAt, '2033-01-01T21:00:00+08:00');
+      assert.equal(finalPatchTopic.revision, initiallyScheduled.json().revision);
+      assert.equal(finalScheduleTopic.scheduledAt, competingAt);
+    }
+
     await Promise.all([firstApp.close(), secondApp.close()]);
     await rm(directory, { recursive: true, force: true });
   });
