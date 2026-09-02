@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -133,6 +134,7 @@ test('https-layout is convergent and leaves unreadable sentinels and TLS materia
   const sentinel = path.join(fixture, 'home/operator/key.key');
   mkdirSync(path.dirname(sentinel), { recursive: true });
   writeFileSync(sentinel, 'fixture sentinel: do not inspect\n', { mode: 0o000 });
+  const sentinelBefore = lstatSync(sentinel);
 
   const first = invokeFixture(bundle, fixture, 'apply', 'https-layout');
   expectSuccess(first);
@@ -143,6 +145,10 @@ test('https-layout is convergent and leaves unreadable sentinels and TLS materia
   assert.equal(JSON.parse(String(second.stdout)).actionCount, 0);
 
   assert.equal(lstatSync(sentinel).mode & 0o7777, 0o000);
+  const sentinelAfter = lstatSync(sentinel);
+  assert.equal(sentinelAfter.ino, sentinelBefore.ino);
+  assert.equal(sentinelAfter.size, sentinelBefore.size);
+  assert.equal(sentinelAfter.mtimeMs, sentinelBefore.mtimeMs);
   assert(existsSync(path.join(fixture, 'etc/fireside-nginx/nginx.conf')));
   assert(existsSync(path.join(fixture, 'etc/systemd/system/fireside-https.service')));
   assert(existsSync(path.join(fixture, 'usr/local/sbin/fireside-tls-install')));
@@ -167,6 +173,34 @@ test('fixture transaction restores its pre-apply plan after an injected failure'
   const after = invokeFixture(bundle, fixture, 'plan', 'base');
   expectSuccess(after);
   assert.deepEqual(JSON.parse(String(after.stdout)).actions, beforeActions);
+});
+
+test('fixture transaction rolls back every planned action without reading unmanaged files', (t) => {
+  const { workspace, bundle, fixture } = makeWorkspace();
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+
+  const sentinel = path.join(fixture, 'home/operator/private.key');
+  mkdirSync(path.dirname(sentinel), { recursive: true });
+  writeFileSync(sentinel, 'unmanaged unreadable sentinel\n', { mode: 0o000 });
+  const sentinelBefore = lstatSync(sentinel);
+  const initialPlan = invokeFixture(bundle, fixture, 'plan', 'base');
+  expectSuccess(initialPlan);
+  const initialActions = JSON.parse(String(initialPlan.stdout)).actions;
+  assert(initialActions.length > 0);
+
+  for (let failAfter = 1; failAfter <= initialActions.length; failAfter += 1) {
+    const failed = invokeFixture(bundle, fixture, 'apply', 'base', ['--fail-after', String(failAfter)]);
+    assert.notEqual(failed.status, 0, `fail-after ${failAfter} unexpectedly succeeded`);
+    assert.match(output(failed), new RegExp(`injected fixture failure at action ${failAfter}`));
+    const after = invokeFixture(bundle, fixture, 'plan', 'base');
+    expectSuccess(after);
+    assert.deepEqual(JSON.parse(String(after.stdout)).actions, initialActions);
+    const sentinelAfter = lstatSync(sentinel);
+    assert.equal(sentinelAfter.ino, sentinelBefore.ino);
+    assert.equal(sentinelAfter.mode & 0o7777, 0o000);
+    assert.equal(sentinelAfter.size, sentinelBefore.size);
+    assert.equal(sentinelAfter.mtimeMs, sentinelBefore.mtimeMs);
+  }
 });
 
 test('fixture planning rejects symlinks, special objects, wrong modes, and multiply-linked files', (t) => {
@@ -227,7 +261,10 @@ test('manifest verification rejects tampering and undeclared files', (t) => {
   const markerPath = path.join(first.bundle, 'HOST_INSTALLER_PRODUCTION_MODE');
   const marker = readFileSync(markerPath);
   marker[0] ^= 1;
-  writeFileSync(markerPath, marker);
+  const tamperedMarker = `${markerPath}.tampered`;
+  writeFileSync(tamperedMarker, marker, { mode: 0o444 });
+  chmodSync(tamperedMarker, 0o444);
+  renameSync(tamperedMarker, markerPath);
   const digestFailure = invokeFixture(first.bundle, first.fixture, 'plan', 'base');
   assert.notEqual(digestFailure.status, 0);
   assert.match(output(digestFailure), /digest is invalid/);

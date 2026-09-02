@@ -69,11 +69,17 @@ TLS 材料安装属于 SPEC-020 的独立 `fireside-tls-install`：只接受操�
 - 无 root 测试在临时 fixture root 验证资产规划、首次与第二次 apply、异常 symlink/特殊文件/错 owner-mode 拒绝、失败回滚和 production override 拒绝。
 - shell/Node 语法、bundle manifest、systemd unit 与 Nginx 配置通过；敏感路径使用不可读哨兵证明安装布局不打开它们。
 - README 主路径收口为：安装已审阅 root-owned bundle → `check` → `apply base` → 人工提供 env/已登记只读 key → `verify base` → 显式 release install + bootstrap/promote → `activate base`；HTTPS 独立走 `apply https-layout` → TLS install/rotate → `activate https`。
+- 主机安装器测试必须在 root、本机普通身份和生产隔离 `fireside-build` 身份下保持同一结果。fixture 事务快照不得读取或改写计划外的 `0000` 哨兵正文；回滚只恢复本事务管理的路径与 fixture state，并逐个注入每个计划动作的失败点证明完整恢复，不得通过 root 绕过权限获得假通过。
+- bundle digest 篡改用例必须显式以文件所有者可执行的模式转换完成篡改并恢复 `0444`，随后由 digest（不是写权限或 mode）拒绝；测试自身不能隐含要求 root 绕过只读位。
 
 ## 6. 回归证据
 
 2026-09-02 已实现 `ops/host-installer/` 显式资产清单、manifest bundle、固定 dispatcher、base/https-layout 规划与事务 apply。HTTPS profile 同时安装不含材料的独立 TLS 安装入口；证书和私钥仍只能由操作者显式调用 SPEC-020 安装器导入。无 root fixture 测试 7 项通过，覆盖 bundle 篡改/额外文件、二次 apply 零动作、symlink/FIFO/错 owner-mode/硬链接、注入失败恢复和 production override 拒绝；HTTPS/TLS 联合专项共 12 项通过。README 主路径已收口到 host installer → 显式 env/key → release controller → TLS installer，公钥登记不再尝试穿越 0700 私钥目录。
 
 当前主机已从 27 文件 manifest bundle 固化 `/usr/local/libexec/fireside-host-installer` 与 `/usr/local/sbin/fireside-host-install`；`check` 的 7 项依赖全部可用，`apply base` 只补建安装器状态目录，`apply https-layout` 为零动作，随后 base/HTTPS 双 `verify` 和双 `plan` 均收敛。80、443 与三项服务保持 active，本机可信 HTTPS 健康检查为 200。
+
+第 51 轮生产候选门禁复现：隔离 build 用户运行同套测试时，`https-layout` 的 unreadable sentinel 快照和 manifest marker 篡改分别因 `EACCES` 失败；root 本地测试掩盖了两项测试基础设施权限假设。修复必须保持真实生产 owner/mode/manifest 门禁不放宽，并由非 root 定向测试、完整 check 与 controller install 共同验收。
+
+修复验收：fixture 改为只回滚受管动作与虚拟 state，不再递归读取模拟主机；篡改夹具以最终 `0444` 的原子替换验证 digest。root 与真实 `fireside-build` 均 8/8，新增逐个计划动作的失败注入；完整 check 181/181、0 漏洞。生产 owner/mode/manifest、固定路径与非 root 构建门禁未放宽。
 
 剩余边界：`activate` 仍由操作者在 release/TLS 健康验收后显式使用 systemd 命令，host installer 不擅自启动服务；`check` 当前覆盖依赖，端口冲突和完整在线握手由发布/TLS 安装器门禁负责。规格保持 Implementing，后续若收口统一 activate 命令须先扩展本规格。

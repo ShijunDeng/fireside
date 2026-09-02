@@ -719,3 +719,11 @@
 - 决策：目标先声明 96px `scroll-margin-top`，通用业务聚焦再读取真实 sticky header 与目标矩形；若顶部不足 header bottom + 10px，执行即时差值滚动校正，以 2px 余量稳定满足 8px 验收线。静态边距防止浏览器在后续滚动阶段重新遮挡，动态校正适配真实导航高度；保留目标焦点、当前周和 fallback，不触发平滑二次漂移。
 - 验收：360/390/768/1440 在 1.2 秒后 activeElement 仍为目标周事件，顶部安全间距至少 8px；清搜索、重连及既有导航落点不回退。
 - 成熟度：第 48 轮有有效 P2，不计 clean，连续 clean 保持 0；修复后从第 49 轮重新计数。
+
+## Iteration 094：主机安装器夹具跨身份可复现（Accepted）
+
+- 规格：SPEC-003、SPEC-037；生产 controller 以 `fireside-build` 运行候选 check 时，两项本地 root 通过的测试因 `EACCES` 失败。
+- 根因边界：fixture 事务快照不应依赖读取计划外 `0000` 哨兵；digest 篡改测试不应依赖 root 直接写 `0444`。真实 production bundle 的 root owner、0755/0444、manifest、单链接与固定路径门禁不得放宽。
+- 决策：fixture 事务改为只记录并回滚本次管理动作涉及的 state/路径，或使用不读取正文且不会改变活动树链接不变量的等价机制；篡改测试由所有者显式临时开写、改内容、恢复 0444 后验证 digest 拒绝。
+- 验收：普通非 root 与 root 身份的主机安装器专项结果一致、root 全量测试通过、release controller `install` 通过；每个计划动作的注入失败均恢复、0000 哨兵未读未改，manifest digest/extra file、硬链接与 production override 门禁均保留。
+- 结果：root 与真实 `fireside-build` 专项均 8/8，逐个动作失败注入全部恢复；完整 check 181/181、依赖漏洞 0。修复严格限于 fixture/test/spec，产品业务成熟度仍采用第 49/50 轮结论。

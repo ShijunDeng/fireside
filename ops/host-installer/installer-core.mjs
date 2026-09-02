@@ -1,10 +1,9 @@
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, chownSync, closeSync, copyFileSync, cpSync, existsSync, fsyncSync,
-  lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync,
+  chmodSync, chownSync, closeSync, copyFileSync, existsSync, fsyncSync,
+  lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync,
   rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -200,7 +199,7 @@ export class FixtureAdapter {
     this.state = existsSync(this.statePath)
       ? JSON.parse(readFileSync(this.statePath, 'utf8'))
       : { accounts: { root: { system: true, group: 'root', home: '/root', shell: '/bin/sh', supplementaryGroups: [] }, 'www-data': { system: true, group: 'www-data', home: '/nonexistent', shell: '/usr/sbin/nologin', supplementaryGroups: [] } }, metadata: {}, daemonReloads: 0 };
-    this.snapshot = null;
+    this.transaction = null;
   }
 
   target(destination) { return path.join(this.root, destination.slice(1)); }
@@ -223,6 +222,7 @@ export class FixtureAdapter {
   }
   createDirectory(directory) {
     const target = this.target(directory.destination);
+    this.transaction?.undo.push(() => rmSync(target, { recursive: true, force: true }));
     ensureParent(target);
     mkdirSync(target, { mode: Number.parseInt(directory.mode, 8) });
     chmodSync(target, Number.parseInt(directory.mode, 8));
@@ -231,6 +231,19 @@ export class FixtureAdapter {
   }
   installFile(asset, source) {
     const target = this.target(asset.destination);
+    const previous = lstatExists(target)
+      ? { data: readFileSync(target), mode: lstatSync(target).mode & 0o7777 }
+      : null;
+    this.transaction?.undo.push(() => {
+      if (!previous) {
+        if (lstatExists(target)) unlinkSync(target);
+        return;
+      }
+      const temporary = `${target}.host-install-rollback-${process.pid}`;
+      writeFileSync(temporary, previous.data, { mode: previous.mode });
+      chmodSync(temporary, previous.mode);
+      renameSync(temporary, target);
+    });
     ensureParent(target);
     const temporary = `${target}.host-install-${process.pid}`;
     copyFileSync(source, temporary);
@@ -241,17 +254,24 @@ export class FixtureAdapter {
   }
   daemonReload() { this.state.daemonReloads += 1; this.save(); }
   begin() {
-    this.save();
-    this.snapshot = mkdtempSync(path.join(os.tmpdir(), 'fireside-host-fixture-snapshot-'));
-    cpSync(this.root, path.join(this.snapshot, 'root'), { recursive: true, dereference: false });
+    this.transaction = {
+      undo: [],
+      state: structuredClone(this.state),
+      stateFile: lstatExists(this.statePath) ? readFileSync(this.statePath) : null,
+    };
   }
-  commit() { rmSync(this.snapshot, { recursive: true, force: true }); this.snapshot = null; }
+  commit() { this.transaction = null; }
   rollback() {
-    rmSync(this.root, { recursive: true, force: true });
-    cpSync(path.join(this.snapshot, 'root'), this.root, { recursive: true, dereference: false });
-    rmSync(this.snapshot, { recursive: true, force: true });
-    this.snapshot = null;
-    this.state = JSON.parse(readFileSync(this.statePath, 'utf8'));
+    if (!this.transaction) return;
+    for (const undo of this.transaction.undo.reverse()) undo();
+    if (this.transaction.stateFile === null) {
+      if (lstatExists(this.statePath)) unlinkSync(this.statePath);
+    } else {
+      writeFileSync(this.statePath, this.transaction.stateFile, { mode: 0o600 });
+      chmodSync(this.statePath, 0o600);
+    }
+    this.state = this.transaction.state;
+    this.transaction = null;
   }
 }
 
