@@ -113,7 +113,7 @@ sudo stat -c '%U:%G:%a %n' \
 上述输出必须依次为 `root:root:755`、`fireside:fireside:700`、`root:root:700`、`root:root:700`、`root:root:700`。如果账户或目录已存在，应先核对而不是删除重建；任一目录缺失或元数据不符都不得继续启动 recovery。生产共享口令只写入 `/etc/fireside.env`：
 
 ```dotenv
-FIRESIDE_WRITE_KEY=<由安全随机源生成的 32 至 256 字符值>
+FIRESIDE_WRITE_KEY=<6 至 256 个 Unicode 字符的团队共享口令>
 ```
 
 使用 `sudoedit /etc/fireside.env` 编辑，并确认：

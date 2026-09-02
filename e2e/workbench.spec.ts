@@ -1,7 +1,7 @@
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
-const writeKey = 'e2e-fireside-write-key';
+const writeKey = '松风明月共围炉';
 const legacyWriteKeyStorage = 'fireside-write-key';
 const collaborationSessionStorage = 'fireside-collaboration-session-v1';
 let collaborationSession = '';
@@ -9,7 +9,10 @@ const sessionHeaders = () => ({ 'X-Fireside-Session': collaborationSession });
 const revisionHeaders = (revision: number) => ({ ...sessionHeaders(), 'If-Match': `"${revision}"` });
 
 async function issueSession(request: APIRequestContext, key = writeKey) {
-  const response = await request.post('/api/access/verify', { headers: { 'X-Fireside-Write-Key': key } });
+  const response = await request.post('/api/access/verify', { headers: {
+    'X-Fireside-Write-Key': Buffer.from(key, 'utf8').toString('base64url'),
+    'X-Fireside-Write-Key-Encoding': 'base64url-utf8-v1',
+  } });
   expect(response.status()).toBe(200);
   const body = await response.json() as { sessionToken: string; expiresAt: string };
   expect(body.sessionToken).toMatch(/^v1\./);
@@ -832,16 +835,26 @@ test.describe('议题管理工作台', () => {
     await protectedCard.getByRole('button', { name: '加入会议' }).click();
     let accessDialog = page.getByRole('dialog');
     await expect(accessDialog.getByRole('heading', { name: '解锁围炉协作' })).toBeVisible();
+    await accessDialog.getByLabel('围炉口令').fill('五字口令呀');
+    await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    await expect(accessDialog.getByText('围炉口令至少需要 6 个字符')).toBeVisible();
+    await expect(accessDialog.getByLabel('围炉口令')).toHaveValue('');
     await accessDialog.getByLabel('围炉口令').fill('wrong-key');
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
     await expect(accessDialog.getByText('围炉口令不正确')).toBeVisible();
     await expect(accessDialog.getByLabel('围炉口令')).toHaveValue('');
     await accessDialog.getByLabel('围炉口令').fill(writeKey);
+    const encodedVerification = page.waitForRequest((request) => request.url().endsWith('/api/access/verify'));
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
+    const verificationHeaders = (await encodedVerification).headers();
+    expect(verificationHeaders['x-fireside-write-key-encoding']).toBe('base64url-utf8-v1');
+    expect(verificationHeaders['x-fireside-write-key']).toBe(Buffer.from(writeKey, 'utf8').toString('base64url'));
+    expect(verificationHeaders['x-fireside-write-key']).toMatch(/^[A-Za-z0-9_-]+$/);
     const meetingDialog = page.getByRole('dialog');
     await expect(meetingDialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', secretMeeting);
     await meetingDialog.getByRole('button', { name: '关闭' }).click();
     await expectCollaborationState(page, '退出协作');
+    expect(await page.evaluate((plainKey) => Object.values(sessionStorage).includes(plainKey), writeKey)).toBe(false);
 
     await clickCollaborationState(page, '退出协作');
     await expectCollaborationState(page, '解锁协作');

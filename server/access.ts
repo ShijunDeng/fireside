@@ -6,8 +6,10 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { isIP } from 'node:net';
+import { TextDecoder } from 'node:util';
 
 export const COLLABORATION_SESSION_TTL_MS = 8 * 60 * 60 * 1_000;
+export const WRITE_KEY_HEADER_ENCODING = 'base64url-utf8-v1';
 
 const SESSION_VERSION = 'v1';
 const SESSION_NONCE_BYTES = 16;
@@ -24,15 +26,23 @@ const DEFAULT_GLOBAL_LIMIT = 200;
 const DEFAULT_MAX_SOURCES = 10_000;
 const DEFAULT_CLEANUP_INTERVAL = 256;
 const DEFAULT_CLEANUP_BATCH_SIZE = 256;
+const WRITE_KEY_MAX_UTF8_BYTES = 256 * 4;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
-const placeholderWriteKeys = new Set([
-  'change-me',
-  'changeme',
-  'password',
-  'fireside',
-  'secret',
-  'your-key-here',
-]);
+export function decodeWriteKeyHeader(value: string | undefined, encoding: string | undefined) {
+  if (value === undefined) return undefined;
+  if (encoding === undefined) return /^[\x00-\x7f]*$/.test(value) ? value : undefined;
+  if (encoding !== WRITE_KEY_HEADER_ENCODING || !BASE64URL_PATTERN.test(value)) return undefined;
+  try {
+    const bytes = Buffer.from(value, 'base64url');
+    if (bytes.length === 0 || bytes.length > WRITE_KEY_MAX_UTF8_BYTES || bytes.toString('base64url') !== value) return undefined;
+    const decoded = utf8Decoder.decode(bytes);
+    return Buffer.from(decoded, 'utf8').equals(bytes) ? decoded : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export function writeKeyMatches(candidate: string | undefined, expected: string) {
   if (!candidate) return false;
@@ -47,13 +57,11 @@ export function requireProductionWriteKey(nodeEnv: string | undefined, writeKey:
   const characters = writeKey ? [...writeKey] : [];
   const valid = Boolean(writeKey)
     && writeKey === writeKey!.trim()
-    && characters.length >= 32
-    && characters.length <= 256
-    && !placeholderWriteKeys.has(writeKey!.toLocaleLowerCase('en-US'))
-    && !characters.every((character) => character === characters[0]);
+    && characters.length >= 6
+    && characters.length <= 256;
 
   if (!valid) {
-    throw new Error('生产环境 FIRESIDE_WRITE_KEY 必须是无首尾空白的 32 至 256 字符高强度随机值');
+    throw new Error('生产环境 FIRESIDE_WRITE_KEY 必须是无首尾空白的 6 至 256 字符值');
   }
   return writeKey;
 }

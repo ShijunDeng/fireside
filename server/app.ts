@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
   createAuthRateLimiter,
+  decodeWriteKeyHeader,
   issueCollaborationSession,
   normalizeClientIp,
   validateCollaborationSession,
@@ -223,7 +224,11 @@ export function buildApp(options: AppOptions = {}) {
       return reply.code(429).send({ code: 'ACCESS_RATE_LIMITED', message: '尝试过于频繁，请稍后再试' });
     }
     const header = request.headers['x-fireside-write-key'];
-    const candidate = Array.isArray(header) ? header[0] : header;
+    const encodingHeader = request.headers['x-fireside-write-key-encoding'];
+    const candidate = decodeWriteKeyHeader(
+      Array.isArray(header) ? undefined : header,
+      Array.isArray(encodingHeader) ? undefined : encodingHeader,
+    );
     if (!writeKeyMatches(candidate, writeKey)) {
       const recorded = authRateLimiter.recordFailure(source);
       if (recorded.limited) {

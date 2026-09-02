@@ -19,7 +19,10 @@ const issueSession = async (instance: FastifyInstance, writeKey: string, remoteA
   const response = await instance.inject({
     method: 'POST',
     url: '/api/access/verify',
-    headers: { 'x-fireside-write-key': writeKey },
+    headers: {
+      'x-fireside-write-key': Buffer.from(writeKey, 'utf8').toString('base64url'),
+      'x-fireside-write-key-encoding': 'base64url-utf8-v1',
+    },
     remoteAddress,
   });
   assert.equal(response.statusCode, 200);
@@ -64,7 +67,7 @@ describe('围炉夜话 API', () => {
   });
 
   it('只用短期会话保护全部写操作、名单和真实会议入口', async () => {
-    const writeKey = 'correct-horse-battery-staple';
+    const writeKey = '松风明月共围炉';
     const protectedApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey });
     await protectedApp.ready();
     const publicAccess = await protectedApp.inject({ method: 'GET', url: '/api/access' });
@@ -120,6 +123,21 @@ describe('围炉夜话 API', () => {
     });
     assert.equal(oldClient.statusCode, 401);
     assert.equal(oldClient.json().code, 'ACCESS_SESSION_REQUIRED');
+
+    const legacyKey = 'legacy-ascii-key';
+    const legacyApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey: legacyKey });
+    await legacyApp.ready();
+    assert.equal((await legacyApp.inject({
+      method: 'POST', url: '/api/access/verify', headers: { 'x-fireside-write-key': legacyKey },
+    })).statusCode, 200);
+    assert.equal((await legacyApp.inject({
+      method: 'POST', url: '/api/access/verify',
+      headers: {
+        'x-fireside-write-key': Buffer.from(legacyKey).toString('base64url'),
+        'x-fireside-write-key-encoding': 'unknown-v2',
+      },
+    })).statusCode, 401);
+    await legacyApp.close();
 
     const malformedBeforeAuth = await protectedApp.inject({
       method: 'POST', url: '/api/topics', headers: { 'content-type': 'application/json' }, payload: '{',
@@ -282,13 +300,18 @@ describe('围炉夜话 API', () => {
     await limitedApp.ready();
     const source = '203.0.113.10';
     const preissued = await issueSession(limitedApp, writeKey, source);
-    const wrongCandidates: Array<string | undefined> = [undefined, '', 'wrong'];
+    const wrongCandidates: Array<{ value?: string; encoding?: string }> = [
+      {},
+      { value: '====', encoding: 'base64url-utf8-v1' },
+      { value: 'wrong' },
+    ];
     for (let index = 0; index < wrongCandidates.length; index += 1) {
       const candidate = wrongCandidates[index];
       const failed = await limitedApp.inject({
         method: 'POST', url: '/api/access/verify', remoteAddress: source,
         headers: {
-          ...(candidate === undefined ? {} : { 'x-fireside-write-key': candidate }),
+          ...(candidate.value === undefined ? {} : { 'x-fireside-write-key': candidate.value }),
+          ...(candidate.encoding === undefined ? {} : { 'x-fireside-write-key-encoding': candidate.encoding }),
           'x-forwarded-for': `198.51.100.${index + 1}`,
           forwarded: `for=192.0.2.${index + 1}`,
           'x-real-ip': `192.0.2.${index + 10}`,

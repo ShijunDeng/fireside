@@ -79,10 +79,22 @@ function revisionHeaders(revision: number) {
   return { 'If-Match': `"${revision}"` };
 }
 
+export function encodeWriteKeyHeader(key: string) {
+  const bytes = new TextEncoder().encode(key);
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
 export const api = {
   access: () => request<{ enabled: boolean }>('/api/access'),
   verifyAccess: async (key: string) => {
-    const response = await fetch('/api/access/verify', { method: 'POST', headers: { 'X-Fireside-Write-Key': key } });
+    const response = await fetch('/api/access/verify', {
+      method: 'POST',
+      headers: {
+        'X-Fireside-Write-Key': encodeWriteKeyHeader(key),
+        'X-Fireside-Write-Key-Encoding': 'base64url-utf8-v1',
+      },
+    });
     return readBody<{ sessionToken: string; expiresAt: string }>(response, false);
   },
   accessSession: async () => {

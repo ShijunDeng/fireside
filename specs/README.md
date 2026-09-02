@@ -41,5 +41,6 @@
 | [SPEC-013](./SPEC-013-request-error-contract.md) | Ready | 客户端请求解析错误的稳定状态码、安全反馈与零副作用 |
 | [SPEC-014](./SPEC-014-reschedule-participant-notice.md) | Accepted | 有报名活动改期的影响确认与线下通知责任 |
 | [SPEC-015](./SPEC-015-navigation-destination-layout.md) | Accepted | 吸顶任务导航落点、焦点、当前态与合理排版 |
+| [SPEC-016](./SPEC-016-unicode-passphrase.md) | Accepted | UTF-8 围炉口令、六字符生产门槛与版本化浏览器传输 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

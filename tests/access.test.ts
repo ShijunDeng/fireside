@@ -3,10 +3,12 @@ import { describe, it } from 'node:test';
 import {
   COLLABORATION_SESSION_TTL_MS,
   createAuthRateLimiter,
+  decodeWriteKeyHeader,
   issueCollaborationSession,
   normalizeClientIp,
   requireProductionWriteKey,
   validateCollaborationSession,
+  WRITE_KEY_HEADER_ENCODING,
   writeKeyMatches,
 } from '../server/access';
 
@@ -18,29 +20,27 @@ describe('围炉口令安全边界', () => {
     assert.equal(writeKeyMatches('', 'secret'), false);
   });
 
-  it('生产环境只接受无首尾空白的 32..256 code point 非重复密钥', () => {
-    const valid32 = '0123456789abcdef0123456789abcdef';
+  it('生产环境只接受无首尾空白的 6..256 code point 显式配置', () => {
+    const valid6 = 'secret';
     const valid256 = Array.from({ length: 256 }, (_, index) => String.fromCodePoint(0x4e00 + index)).join('');
-    assert.equal(requireProductionWriteKey('production', valid32), valid32);
+    assert.equal(requireProductionWriteKey('production', valid6), valid6);
     assert.equal(requireProductionWriteKey('production', valid256), valid256);
-    const validUnicode32 = '🔥'.repeat(31) + '炬';
-    assert.equal(requireProductionWriteKey('production', validUnicode32), validUnicode32);
+    const validUnicode6 = '🔥'.repeat(5) + '炬';
+    assert.equal(requireProductionWriteKey('production', validUnicode6), validUnicode6);
+    assert.equal(requireProductionWriteKey('production', '火'.repeat(6)), '火'.repeat(6));
     assert.equal(requireProductionWriteKey('test', 'short'), 'short');
     assert.equal(requireProductionWriteKey('development', undefined), undefined);
 
     for (const invalid of [
       undefined,
       '',
-      'short',
-      'x'.repeat(31),
-      '🔥'.repeat(31),
-      'x'.repeat(32),
-      `${valid32} `,
-      ` ${valid32}`,
+      '五字符',
+      'x'.repeat(5),
+      '🔥'.repeat(5),
+      `${valid6} `,
+      ` ${valid6}`,
       'x'.repeat(257),
       '火'.repeat(257),
-      'CHANGE-ME',
-      'your-key-here',
     ]) {
       assert.throws(
         () => requireProductionWriteKey('production', invalid),
@@ -50,6 +50,26 @@ describe('围炉口令安全边界', () => {
           return true;
         },
       );
+    }
+  });
+
+  it('严格解码版本化 UTF-8 口令并兼容旧 ASCII', () => {
+    const candidates = ['松风明月共围炉', 'ASCII-secret', '🔥围炉夜话🔥'];
+    for (const candidate of candidates) {
+      const encoded = Buffer.from(candidate, 'utf8').toString('base64url');
+      assert.equal(decodeWriteKeyHeader(encoded, WRITE_KEY_HEADER_ENCODING), candidate);
+    }
+    assert.equal(decodeWriteKeyHeader('legacy-ascii', undefined), 'legacy-ascii');
+    assert.equal(decodeWriteKeyHeader('围炉', undefined), undefined);
+    for (const [value, encoding] of [
+      ['', WRITE_KEY_HEADER_ENCODING],
+      ['====', WRITE_KEY_HEADER_ENCODING],
+      ['YQ==', WRITE_KEY_HEADER_ENCODING],
+      ['YQ', 'unknown-v2'],
+      [Buffer.from([0xc3, 0x28]).toString('base64url'), WRITE_KEY_HEADER_ENCODING],
+      [Buffer.alloc(1025, 0x61).toString('base64url'), WRITE_KEY_HEADER_ENCODING],
+    ] as const) {
+      assert.equal(decodeWriteKeyHeader(value, encoding), undefined);
     }
   });
 });

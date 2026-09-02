@@ -906,6 +906,10 @@ function AccessModal({ message, rateLimitedUntil, onClose, onRateLimited, onUnlo
     event.preventDefault();
     const key = inputRef.current?.value.trim() ?? '';
     if (inputRef.current) inputRef.current.value = '';
+    if ([...key].length < 6) {
+      setError('围炉口令至少需要 6 个字符');
+      return;
+    }
     setSubmitting(true);
     setError('');
     try {
@@ -932,9 +936,9 @@ function AccessModal({ message, rateLimitedUntil, onClose, onRateLimited, onUnlo
       <span className="modal-eyebrow"><LockKeyhole size={14} /> TRUSTED COLLABORATORS</span>
       <h2 id="access-title">解锁围炉协作</h2>
       <p className="modal-intro">{message}</p>
-      <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>口令只用于本次验证；当前标签页只保存 8 小时临时协作凭证。</span></p></div>
+      <div className="access-note"><ShieldCheck size={18} /><p><strong>公开浏览，协作者共建</strong><span>支持中文；口令由组织者提供，只用于本次验证。当前标签页只保存 8 小时临时协作凭证。</span></p></div>
       <form onSubmit={unlock}>
-        <label>围炉口令<input ref={inputRef} name="writeKey" type="password" required autoComplete="current-password" autoFocus data-initial-focus placeholder="输入团队共享口令" /></label>
+        <label>围炉口令<input ref={inputRef} name="writeKey" type="password" required autoComplete="current-password" autoCapitalize="none" autoCorrect="off" autoFocus data-initial-focus placeholder="输入围炉口令（至少 6 个字符）" /></label>
         {(error || remainingSeconds > 0) && <div ref={errorRef} className="form-error" role="alert" tabIndex={-1}>
           {remainingSeconds > 0 ? `${error || '尝试过于频繁，请稍后再试'}；请等待 ${remainingSeconds} 秒后重新验证。` : error}
         </div>}
