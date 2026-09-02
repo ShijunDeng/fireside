@@ -66,5 +66,6 @@
 | [SPEC-038](./SPEC-038-authoritative-topic-mutation.md) | Accepted | 报名与生命周期 mutation 的权威 Topic revision/人数快照 |
 | [SPEC-039](./SPEC-039-material-url-bound.md) | Accepted | 沉淀资料链接 2048 字符边界与零副作用拒绝 |
 | [SPEC-040](./SPEC-040-readable-typography.md) | Accepted | 全站业务文字可读性下限、跨端字号层级与布局回归 |
+| [SPEC-041](./SPEC-041-product-readme.md) | Accepted | 面向业务旅程的项目入口 README 与独立生产运行手册 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

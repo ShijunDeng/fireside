@@ -1,0 +1,254 @@
+# Fireside 生产运行手册
+
+本文面向主机管理员，覆盖首次安装、HTTPS、版本发布、回滚、备份和权限验收。产品与本地开发入口见[项目 README](../README.md)。
+
+生产环境不从 Git 工作树运行，也不使用 npm、tsx 或 esbuild 启动服务。构建产物安装到版本化的只读 release，Node 由固定的 `fireside` 系统账户直接运行；`fireside.socket` 由 systemd 持有公网 80 端口并把名为 `fireside` 的 fd 3 交给应用。
+
+HTTPS 使用独立的 `fireside-https.service` 和完整 Nginx 主配置，只监听 443 并反向代理到回环 80；不会加载系统默认站点，也不会替代或重定向现有 HTTP。证书链与私钥分别安装为 `/etc/fireside-tls/fullchain.pem`（0644）和 `/etc/fireside-tls/privkey.pem`（0600），不得提交 Git。详细边界、验收和 DNS 前置条件见 [SPEC-020](../specs/SPEC-020-https-edge.md)。
+
+### 主机安装器（首次安装主路径）
+
+安装与部署分为两个固定入口：`fireside-host-install` 只准备账户、目录、控制器、systemd 与 HTTPS 布局；`fireside-release` 只安装、提升和回滚已经提交到 GitHub `main` 的业务 commit。两者都从 root-owned `/usr/local` 运行，不以 root 执行工作树脚本。
+
+先由普通用户构建无敏感内容、带 manifest 的主机 bundle，再一次性复制到固定目录。以下 bootstrap 仅用于首次信任或经审阅的安装器升级；目标已存在时不要覆盖，应在维护窗口用同样流程创建新目录、核对 manifest 后原子替换：
+
+```bash
+host_bundle_parent=$(mktemp -d)
+node ops/host-installer/build-bundle.mjs --output "${host_bundle_parent}/bundle"
+sudo test ! -e /usr/local/libexec/fireside-host-installer
+sudo cp -a -- "${host_bundle_parent}/bundle" /usr/local/libexec/fireside-host-installer
+sudo chown -R root:root /usr/local/libexec/fireside-host-installer
+sudo chmod 0755 /usr/local/libexec/fireside-host-installer
+sudo install -o root -g root -m 0755 \
+  /usr/local/libexec/fireside-host-installer/dispatcher.sh \
+  /usr/local/sbin/fireside-host-install
+sudo /usr/local/sbin/fireside-host-install check
+sudo /usr/local/sbin/fireside-host-install apply base
+sudo /usr/local/sbin/fireside-host-install apply https-layout
+```
+
+`apply` 是收敛式布局安装：相同健康状态再次执行不改变 release、数据库、证书或服务运行态；遇到异常 owner、mode、链接或既有账户定义会失败关闭。HTTPS profile 同时安装独立的 `/usr/local/sbin/fireside-tls-install`，但绝不搜索或复制 TLS 材料。
+
+共享口令仍由操作者使用 `sudoedit /etc/fireside.env` 写入，并保持 `root:root 0600`。仓库只读 deploy key 必须先在普通用户可读的临时目录生成并向 GitHub 登记公钥，再把材料安装到 root-only 目录，不能从 0700 的 `/etc/fireside-release` 直接调用普通用户 `gh`：
+
+```bash
+deploy_key_stage=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C fireside-production-readonly \
+  -f "${deploy_key_stage}/github_readonly_ed25519"
+gh repo deploy-key add "${deploy_key_stage}/github_readonly_ed25519.pub" \
+  --repo ShijunDeng/fireside --title fireside-production-readonly
+sudo install -o root -g root -m 0600 \
+  "${deploy_key_stage}/github_readonly_ed25519" \
+  /etc/fireside-release/github_readonly_ed25519
+sudo /usr/local/sbin/fireside-host-install verify base
+```
+
+证书由操作者明确指定，安装器不会自动猜测 home 文件。材料必须是 root-owned 普通单链接文件，私钥源权限 0600；成功后服务只依赖规范名称，源文件可以删除：
+
+```bash
+sudo /usr/local/sbin/fireside-tls-install \
+  /absolute/staging/fullchain.pem /absolute/staging/privkey.pem
+curl --resolve firesidechat.cn:443:127.0.0.1 \
+  https://firesidechat.cn/api/health
+```
+
+TLS 安装器固定校验 `firesidechat.cn` SAN、有效期、系统信任链、公私钥匹配和 Nginx 配置；随后原子替换 `/etc/fireside-tls/fullchain.pem` 与 `privkey.pem`、重启并有限重试本机健康检查，任何失败恢复旧材料。`www.firesidechat.cn` 308 跳到裸域名；弃用的 `fireside.show` 与其他 Host 返回 421。公网发布还必须把 `firesidechat.cn` A 记录指向实际入口并开放 80/443。
+
+### 手工布局参考（仅用于故障审计）
+
+创建无登录权限的固定账户和四个相互隔离的目录：
+
+```bash
+sudo groupadd --system fireside
+sudo useradd --system --gid fireside --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin fireside
+sudo install -d -o root -g root -m 0755 /opt/fireside/releases
+sudo install -d -o fireside -g fireside -m 0700 /var/lib/fireside
+sudo install -d -o root -g root -m 0700 /var/lib/fireside-release
+sudo install -d -o root -g root -m 0700 /var/backups/fireside
+sudo install -d -o root -g root -m 0700 /etc/fireside-release
+sudo stat -c '%U:%G:%a %n' \
+  /opt/fireside/releases /var/lib/fireside /var/lib/fireside-release \
+  /var/backups/fireside /etc/fireside-release
+```
+
+上述输出必须依次为 `root:root:755`、`fireside:fireside:700`、`root:root:700`、`root:root:700`、`root:root:700`。如果账户或目录已存在，应先核对而不是删除重建；任一目录缺失或元数据不符都不得继续启动 recovery。生产共享口令只写入 `/etc/fireside.env`：
+
+```dotenv
+FIRESIDE_WRITE_KEY=<6 至 256 个 Unicode 字符的团队共享口令>
+```
+
+使用 `sudoedit /etc/fireside.env` 编辑，并确认：
+
+```bash
+sudo chown root:root /etc/fireside.env
+sudo chmod 0600 /etc/fireside.env
+```
+
+不要把真实口令放入仓库、命令参数、URL、聊天记录或 systemd unit。systemd manager 会在降权前读取环境文件；`fireside` 服务账户不需要、也不应能直接打开它。
+
+为生产 controller 创建仓库专属的只读 deploy key，并用 GitHub CLI 添加到本仓库；不要复用个人写 key。主机公钥 pin 来自 GitHub 官方公布的 ED25519 key，并作为已审阅 controller asset 安装，不能用 `accept-new` 或单独信任现场 `ssh-keyscan`：
+
+```bash
+deploy_key_stage=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C fireside-production-readonly \
+  -f "${deploy_key_stage}/github_readonly_ed25519"
+gh repo deploy-key add "${deploy_key_stage}/github_readonly_ed25519.pub" \
+  --repo ShijunDeng/fireside --title fireside-production-readonly
+sudo install -o root -g root -m 0600 \
+  "${deploy_key_stage}/github_readonly_ed25519" \
+  /etc/fireside-release/github_readonly_ed25519
+```
+
+命令不得增加 `--allow-write`。GitHub 仓库设置中须复核该 deploy key 为只读；私钥、host pin 或其父目录元数据异常时，controller 必须在联网与候选构建前失败关闭。
+
+### 构建并安装版本化 release
+
+生产发布不执行 Git 工作树里的 root 脚本。先创建与 `fireside` 完全分离、无登录 home 和附加组的构建身份，再把已审阅、已提交的控制器文件复制到 root-owned 固定路径。此复制是控制器的显式 bootstrap；日常 `install/promote/rollback/recover` 只从 `/usr/local` 入口执行。
+
+```bash
+sudo useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin fireside-build
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/fireside-release
+sudo install -o root -g root -m 0755 \
+  ops/install-release.sh ops/promote-release.sh ops/rollback-release.sh \
+  ops/release-status.sh ops/release-lib.sh ops/guarded-backup.sh \
+  /usr/local/libexec/fireside-release/
+sudo install -o root -g root -m 0444 ops/controller-assets/CONTROLLER_PRODUCTION_MODE \
+  /usr/local/libexec/fireside-release/CONTROLLER_PRODUCTION_MODE
+sudo install -o root -g root -m 0644 ops/release-preflight.mjs \
+  /usr/local/libexec/fireside-release/release-preflight.mjs
+sudo install -o root -g root -m 0755 ops/fireside-release /usr/local/sbin/fireside-release
+```
+
+普通用户先完成质量检查、commit 与 SSH push；确认工作树干净且 HEAD 已属于 `origin/main` 后，先完成下方 systemd 单元安装，再安装候选并按主机状态选择 `bootstrap` 或 `promote`：
+
+```bash
+npm ci
+npm run check
+npm run test:e2e -- --retries=0
+git commit
+GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' git push ssh://git@ssh.github.com:443/ShijunDeng/fireside.git main
+GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new' git fetch ssh://git@ssh.github.com:443/ShijunDeng/fireside.git refs/heads/main:refs/remotes/origin/main
+commit=$(git rev-parse HEAD)
+test "$(git rev-parse refs/remotes/origin/main)" = "${commit}"
+git diff --exit-code
+sudo /usr/local/sbin/fireside-release install "${commit}"
+```
+
+`install` 通过固定 GitHub SSH 443 远端核对私有仓库 main，并从该 commit 生成唯一源码归档，不读取 ignored `server-build/`；权威读取只使用 root-owned 的专用只读 deploy key 与 host-key 文件，禁用用户 SSH 配置、默认 identities、agent、证书、代理、密码和交互认证。npm lifecycle 只以 `fireside-build` 运行，测试/构建/数据库预检使用独立 cgroup，含生产备份副本的预检没有外网。root 在构建身份退出后生成包含 commit、Git tree、源码归档 SHA-256、Node/npm 版本和完整文件集合/模式/大小/哈希的 manifest。候选安装完成仍不会改变 `current`。
+
+`promote` 在同一维护锁内确认当前版本健康、创建在线备份、让候选迁移隔离副本，再让旧版本读取同一副本验证回滚兼容。只有全部通过才写入 fsync 事务日志、原子切换、重启，并以 socket/service、稳定 MainPID、UID、实际 cwd 和连续健康请求验收。失败自动恢复调用前版本；回退成功返回 3，回退本身失败返回 4，锁冲突返回 75。
+
+安装后的结构必须类似：
+
+```text
+/opt/fireside/releases/<commit>/
+├── server-build/
+│   ├── dist/
+│   └── server/
+│       ├── index.js
+│       └── backup-cli.js
+├── node_modules/
+├── package.json
+└── package-lock.json
+```
+
+控制器拒绝短 SHA、不是固定 GitHub 仓库权威 `main` 头部的 commit、脏工作树、特殊文件、越界链接、manifest 外文件、陈旧/篡改产物和覆盖已有 release。本地 `origin/main` 只用于操作者的前置确认，不能替代控制器对 GitHub 的独立核验。release 归 `root:root` 所有，服务账户只读。`/opt/fireside/previous` 只在新版本稳定健康后指向调用前版本；`/var/lib/fireside-release/transaction` 是 root-only 发布事务日志。
+
+### 安装 systemd 单元
+
+```bash
+sudo install -o root -g root -m 0644 ops/fireside.service /etc/systemd/system/fireside.service
+sudo install -o root -g root -m 0644 ops/fireside.socket /etc/systemd/system/fireside.socket
+sudo install -o root -g root -m 0644 ops/fireside-backup.service /etc/systemd/system/fireside-backup.service
+sudo install -o root -g root -m 0644 ops/fireside-backup.timer /etc/systemd/system/fireside-backup.timer
+sudo install -o root -g root -m 0644 ops/fireside-release-recover.service /etc/systemd/system/fireside-release-recover.service
+sudo install -o root -g root -m 0644 ops/fireside-runtime-gate.service /etc/systemd/system/fireside-runtime-gate.service
+sudo install -o root -g root -m 0644 ops/fireside-backup-gate.service /etc/systemd/system/fireside-backup-gate.service
+sudo systemctl daemon-reload
+sudo systemctl disable fireside.service
+sudo systemctl enable fireside.socket fireside-backup.timer
+sudo systemctl start fireside-release-recover.service
+```
+
+干净主机没有 `current` / `previous` 时只执行一次显式自举；已有健康 `current` 的主机执行普通提升，两者不能互换：
+
+```bash
+# 干净主机
+sudo /usr/local/sbin/fireside-release bootstrap "${commit}"
+
+# 已有健康版本
+sudo /usr/local/sbin/fireside-release promote "${commit}"
+
+sudo systemctl start fireside.socket fireside.service fireside-backup.timer
+sudo /usr/local/sbin/fireside-release status
+```
+
+`bootstrap` 会拒绝任何既有/异常 current、previous 或 transaction；有历史主库时先生成并以大小+SHA-256绑定一致备份，失败恢复原业务指纹。`/run` 被清空的冷启动由独立 root gate 从健康 current重建 selector 与按commit绑定的写许可。只启用socket和timer；服务由socket激活，也可以在发布完成后显式启动。应用没有 `CAP_NET_BIND_SERVICE` 或其他 capability。后续重启时socket继续监听80，连接可以短暂排队。
+
+### 从旧工作树迁移生产数据库
+
+首次迁移必须在受控窗口完成，且目标 `/var/lib/fireside/fireside.db` 不存在时才允许执行：
+
+1. 安装并验证新 release，但暂不启动新服务。
+2. 停止旧服务，阻止新的业务写入。
+3. 使用新 release 的 `backup-cli.js` 和 `better-sqlite3` 在线 backup API，从旧数据库生成 root-only 的一致单文件备份；禁止把 `cp fireside.db` 当作备份，因为 WAL 可能包含尚未 checkpoint 的数据。
+4. 对备份执行 `integrity_check` 并核对非敏感业务指纹后，把该备份安装为 `/var/lib/fireside/fireside.db`，所有者为 `fireside:fireside`、模式为 `0600`。
+5. 把旧路径的数据库、WAL 和 SHM 改为 `root:root 0600`，旧数据目录改为 `0700` 并保留为回滚证据，不删除或覆盖。
+6. 启动 socket 和新服务，核对健康页、公开数据指纹、全部 revision、order version 与参与人数。
+
+迁移失败时不得用空库覆盖目标，不得删除旧数据库或最近备份。
+
+### 日常发布与回滚
+
+日常发布只使用上述 `install` 与 `promote`。控制器会自动完成新备份、候选迁移、旧版本向后兼容预检、原子切换、稳定健康门禁和失败回退；不要手工改写 `current` / `previous`。不可逆 schema 变化必须采用 expand / migrate / contract 分阶段方式，保证当前与上一个 release 在回滚期都能读取数据库。
+
+显式回到上一健康版本，或回到指定的已验证 commit：
+
+```bash
+sudo /usr/local/sbin/fireside-release rollback --previous
+sudo /usr/local/sbin/fireside-release rollback <40位commit>
+```
+
+rollback 使用与 promote 相同的备份、隔离兼容、事务日志、稳定健康和失败恢复门禁；成功后 `previous` 指向调用前版本，便于撤销本次回滚。socket 在服务切换期间持续监听 80。任何代码回退都不自动恢复数据库；只有完成兼容迁移且确需恢复数据时，才在服务停止后从已校验备份人工恢复。
+
+每个变更命令都会先恢复未完成事务；`fireside-release-recover.service` 还会在应用启动前把掉电/SIGKILL 中断的双指针切换恢复到调用前版本。人工检查或恢复：
+
+```bash
+sudo /usr/local/sbin/fireside-release status
+sudo /usr/local/sbin/fireside-release recover
+```
+
+### 一致备份与恢复演练
+
+`fireside-backup.timer` 每天 03:15 进入计划，并加入最多 15 分钟随机延迟分散系统负载；`Persistent=true` 会在主机错过计划后补跑。独立 root gate 先恢复孤儿事务并从健康 `current` 重建 `/run` 运行态；随后最小权限 runner 对发布维护锁持共享锁，再次核对 selector、写许可和无事务状态，避免 timer 跨版本或从未验收候选备份。gate、watchdog 与 backup 都不继承应用口令。备份 CLI 从以下环境读取配置：
+
+```text
+DATABASE_PATH=/var/lib/fireside/fireside.db
+BACKUP_DIRECTORY=/var/backups/fireside
+BACKUP_RETENTION=14
+```
+
+备份服务以 root 启动，但 capability 边界只保留读取私有生产库所需的 `CAP_DAC_READ_SEARCH`；挂载沙箱把生产状态设为只读，唯一持久可写路径是 `/var/backups/fireside`，并禁止网络及访问 `/etc/fireside.env`。应用服务不能读取、修改或删除备份。手动验收：
+
+```bash
+sudo systemctl start fireside-backup.service
+sudo systemctl status fireside-backup.service --no-pager
+sudo journalctl -u fireside-backup.service -n 20 --no-pager
+sudo systemctl list-timers fireside-backup.timer --no-pager
+```
+
+成功日志只包含时间、备份文件名、字节数、SHA-256、Topic 数、参与人数和 order version，不得包含标题、姓名、会议链接、口令或 token。发布顺序为临时文件 fsync → rename → 目录 fsync → prune → 目录 fsync；只有新备份已持久化才会删除严格匹配命名规则的超额旧备份，默认保留 14 份。同目录 SQLite mutex 防止并发任务；下一轮只清理严格命名、root 所有、单链接普通文件且超过 24 小时的崩溃孤儿。
+
+恢复演练在 root-only 临时目录中复制最新备份，以只读方式执行 `integrity_check`，并比较 Topic 数、全部 revision、order version、参与人数和敏感字段存在性摘要。演练不得监听生产端口、修改生产库或改变 `current`；完成后只删除本次明确创建的临时目录。本机备份不等于主机级灾难恢复，仍需另行提供加密异地备份。
+
+### 发布后权限与连续性检查
+
+```bash
+systemctl is-active fireside.socket fireside.service fireside-backup.timer
+systemctl show fireside.service -p User -p Group -p MainPID -p NoNewPrivileges -p CapabilityBoundingSet -p AmbientCapabilities
+stat -c '%A %a %U:%G %n' /var/lib/fireside /var/lib/fireside/fireside.db /var/lib/fireside/fireside.db-wal /var/lib/fireside/fireside.db-shm /etc/fireside.env /var/backups/fireside
+ss -ltnp '( sport = :80 )'
+systemd-analyze security fireside.service
+```
+
+MainPID 必须是 UID/GID `fireside` 的直接 Node 进程，不能出现 npm、shell、tsx 或 esbuild 子进程；`CapInh/CapPrm/CapEff/CapAmb/CapBnd` 全为零且 `NoNewPrivs=1`。`/var/lib/fireside` 必须是 `0700`，DB/WAL/SHM 必须是 `0600`，普通用户不可读；服务账户只能写状态目录，不能写 release、unit、环境文件或备份目录。

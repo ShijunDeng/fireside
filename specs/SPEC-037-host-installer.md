@@ -7,9 +7,9 @@
 
 ## 1. 问题
 
-`ops/install-release.sh` 只负责从已授权 commit 构建不可变 release，不是主机安装器。当前首次准备、controller 固化、7 个 base systemd unit、HTTPS 目录/配置/unit 仍是 README 中数十条手工 `sudo install`；中断时容易留下混合状态，也没有单一的幂等验证入口。
+`ops/install-release.sh` 只负责从已授权 commit 构建不可变 release，不是主机安装器。历史上首次准备、controller 固化、7 个 base systemd unit、HTTPS 目录/配置/unit 仍是文档中的数十条手工 `sudo install`；中断时容易留下混合状态，也没有单一的幂等验证入口。
 
-README 还存在确定性矛盾：先把 `/etc/fireside-release` 设为 `root:root 0700`，又让普通用户从该目录读取 `.pub` 调用 `gh repo deploy-key add`，普通用户实际无法遍历该目录。不能通过放宽密钥目录解决。
+历史操作文档还存在确定性矛盾：先把 `/etc/fireside-release` 设为 `root:root 0700`，又让普通用户从该目录读取 `.pub` 调用 `gh repo deploy-key add`，普通用户实际无法遍历该目录。不能通过放宽密钥目录解决。
 
 ## 2. 产品化安装结构
 
@@ -68,13 +68,13 @@ TLS 材料安装属于 SPEC-020 的独立 `fireside-tls-install`：只接受操�
 - `ops/host-installer/` 存在显式资产清单、bundle 打包器、dispatcher 与安装逻辑；打包输出不包含口令、token、证书或私钥。
 - 无 root 测试在临时 fixture root 验证资产规划、首次与第二次 apply、异常 symlink/特殊文件/错 owner-mode 拒绝、失败回滚和 production override 拒绝。
 - shell/Node 语法、bundle manifest、systemd unit 与 Nginx 配置通过；敏感路径使用不可读哨兵证明安装布局不打开它们。
-- README 主路径收口为：安装已审阅 root-owned bundle → `check` → `apply base` → 人工提供 env/已登记只读 key → `verify base` → 显式 release install + bootstrap/promote → `activate base`；HTTPS 独立走 `apply https-layout` → TLS install/rotate → `activate https`。
+- 生产运行手册主路径收口为：安装已审阅 root-owned bundle → `check` → `apply base` → 人工提供 env/已登记只读 key → `verify base` → 显式 release install + bootstrap/promote → `activate base`；HTTPS 独立走 `apply https-layout` → TLS install/rotate → `activate https`。
 - 主机安装器测试必须在 root、本机普通身份和生产隔离 `fireside-build` 身份下保持同一结果。fixture 事务快照不得读取或改写计划外的 `0000` 哨兵正文；回滚只恢复本事务管理的路径与 fixture state，并逐个注入每个计划动作的失败点证明完整恢复，不得通过 root 绕过权限获得假通过。
 - bundle digest 篡改用例必须显式以文件所有者可执行的模式转换完成篡改并恢复 `0444`，随后由 digest（不是写权限或 mode）拒绝；测试自身不能隐含要求 root 绕过只读位。
 
 ## 6. 回归证据
 
-2026-09-02 已实现 `ops/host-installer/` 显式资产清单、manifest bundle、固定 dispatcher、base/https-layout 规划与事务 apply。HTTPS profile 同时安装不含材料的独立 TLS 安装入口；证书和私钥仍只能由操作者显式调用 SPEC-020 安装器导入。无 root fixture 测试 7 项通过，覆盖 bundle 篡改/额外文件、二次 apply 零动作、symlink/FIFO/错 owner-mode/硬链接、注入失败恢复和 production override 拒绝；HTTPS/TLS 联合专项共 12 项通过。README 主路径已收口到 host installer → 显式 env/key → release controller → TLS installer，公钥登记不再尝试穿越 0700 私钥目录。
+2026-09-02 已实现 `ops/host-installer/` 显式资产清单、manifest bundle、固定 dispatcher、base/https-layout 规划与事务 apply。HTTPS profile 同时安装不含材料的独立 TLS 安装入口；证书和私钥仍只能由操作者显式调用 SPEC-020 安装器导入。无 root fixture 测试 7 项通过，覆盖 bundle 篡改/额外文件、二次 apply 零动作、symlink/FIFO/错 owner-mode/硬链接、注入失败恢复和 production override 拒绝；HTTPS/TLS 联合专项共 12 项通过。生产运行手册主路径已收口到 host installer → 显式 env/key → release controller → TLS installer，公钥登记不再尝试穿越 0700 私钥目录。
 
 当前主机已从 27 文件 manifest bundle 固化 `/usr/local/libexec/fireside-host-installer` 与 `/usr/local/sbin/fireside-host-install`；`check` 的 7 项依赖全部可用，`apply base` 只补建安装器状态目录，`apply https-layout` 为零动作，随后 base/HTTPS 双 `verify` 和双 `plan` 均收敛。80、443 与三项服务保持 active，本机可信 HTTPS 健康检查为 200。
 

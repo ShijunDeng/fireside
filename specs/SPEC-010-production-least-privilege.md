@@ -144,7 +144,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 
 - 文档中的“首次准备”必须能在没有 `current`、`previous` 和运行中 Fireside 服务的新主机上从零完成，不能把已有健康 `current` 当作隐含前置条件。控制器提供显式 `bootstrap <commit>`；普通 `promote` 继续只处理已有健康版本升级，两种语义不得自动猜测。
 - bootstrap 只在 `current`、`previous`、发布事务三者均不存在时运行；任一已存在（包括错误类型、悬空链接或半完成状态）都拒绝。目标 release 仍须通过完整 commit、manifest、运行树和预检门禁。第二次 bootstrap 必须拒绝且不改变 current、数据库、备份或服务。
-- systemd 单元、`fireside`/`fireside-build` 身份、root-only 密钥、`/var/lib/fireside-release`、生产状态和备份目录是 bootstrap 的显式前置条件。README 必须先安装/加载单元并让 recovery 进入本次开机的 active-exited 状态，再执行 install/bootstrap；不能先 promote、后安装单元。
+- systemd 单元、`fireside`/`fireside-build` 身份、root-only 密钥、`/var/lib/fireside-release`、生产状态和备份目录是 bootstrap 的显式前置条件。生产运行手册必须先安装/加载单元并让 recovery 进入本次开机的 active-exited 状态，再执行 install/bootstrap；不能先 promote、后安装单元。
 - 新机准备命令必须显式创建并立即验证 `/var/lib/fireside-release` 为 root:root 0700，与 release root、业务数据和备份目录一并形成完整四目录前置。不能依赖 controller 在 systemd sandbox 外隐式创建；`ReadWritePaths` 的固定目标在 recovery 启动前必须存在，缺失时文档前置验收应明确失败。
 - 无主库时，候选在 root-only 临时目录创建 `seed=false` 的空业务库并通过健康、公开读取、关闭和业务指纹检查，再以 `fireside:fireside 0600` 安装为生产库；不得在预检前建立 `current`。失败恢复后不得遗留 current/previous、空主库、WAL/SHM 或健康标记。
 - SQLite 边车必须完整覆盖 `-wal`、`-shm` 和 rollback `-journal`。无主库而任一同名边车以普通文件、链接、目录或其他类型存在时，bootstrap 在触碰指针/数据库前拒绝并原样保留证据；不能把 hot journal 当作无关文件。workload 已停止后的安装/恢复须安全清理三类旧边车并同步目录，再原子替换主库并再次同步；原本无库的失败恢复不遗留本次任何主库或边车。
@@ -213,7 +213,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 22. 在 umask 022 且锁不存在时执行 install/promote/recover 的锁准备逻辑，结果必须为 root:root 0600 普通单链接文件；预置 0644 时安全修权，预置 symlink/目录/非 root/多链接时拒绝。`nobody` 无法打开或持锁，backup 与 controller 的共享/排他互斥仍成立。
 23. 在开发仓库 local config 设置 `url.*.insteadOf` 指向攻击者 bare main，并用 `core.attributesFile`/`.git/info/attributes` 对 tracked 文件设置 `export-ignore`；生产授权、tree 和归档仍只能来自固定 GitHub fetch 的 root-owned bare 仓库，假 main 与被隐藏文件均不能进入结果。
 24. 候选迁移分别在不递增 revision 时改写 title/summary、把一个非空 meeting URL 替换为另一非空 secret；计数、revision、presence 与 order 均保持不变，`businessDataSha256` 必须变化并在切换前退出 2。只 ADD COLUMN/default/index 的 schema 扩展必须保持该 hash 并通过。
-25. 干净 fixture 按 README 从创建目录、安装/加载 unit、install 到 `bootstrap` 后在 80 端口健康；初始没有 current/previous/DB，成功后 current 指向目标、previous 仍不存在、主库私有且 status 为 clean。
+25. 干净 fixture 按生产运行手册从创建目录、安装/加载 unit、install 到 `bootstrap` 后在 80 端口健康；初始没有 current/previous/DB，成功后 current 指向目标、previous 仍不存在、主库私有且 status 为 clean。
 26. 无 current 但已有业务库时，bootstrap 必须先生成一致备份；预检、数据库安装、指针、restart、health、marker 和清 journal 各阶段失败/中断都恢复原业务指纹与“无 current”状态。恢复失败返回 4 并保留 journal；成功恢复返回 3，重复 recovery 幂等。
 27. current、previous、journal、悬空指针或非链接路径任一已存在时 bootstrap 都拒绝；第二次 bootstrap 不改变健康 current、DB、备份数量和服务。无主库失败不得遗留新 DB/WAL/SHM。
 28. 同一 boot 先让 recovery 达到 active-exited，再在 promote 的 prepared/switched/healthy/previous 各阶段模拟控制器 SIGKILL；随后分别触发 `Restart=on-failure`、显式 service restart、timer 和人工 backup。每次启动门禁必须在业务 Node/backup runner 前恢复 orphan transaction，最终 current/previous/cwd 回到 from/originalPrevious，target runner 从未被 backup 调用。
@@ -243,7 +243,7 @@ SQLite 主库、WAL、SHM 为 `root:root 0644`，数据目录为 0755，普通�
 52. 预置 switched orphan transaction/active 后启动带阻塞 build hook 的 install；install 获锁后必须在 hook、Git 授权和 stage/release 创建前立即失败，不改任何证据。随后recover/watchdog能立即取锁并恢复origin。
 53. target MainPID 在线且 switched orphan 时直接启动 `fireside-runtime-gate.service`；最终只允许两种结果：origin MainPID/cwd/current/selector/permit 一致且journal已清，或gate失败且journal保留。不得出现旧target PID存活但journal消失。正常 app restart 的旧MainPID=0路径仍须无死锁通过。
 54. 构造合法 committed journal/current/previous/healthy，再把 release-active 换成目录、链接、错误元数据或错误txid。recover/gate 必须返回4且journal与异常active均原样保留；修正active后重试才能清理两者、重建运行态并恢复写入。
-55. 在无 `/var/lib/fireside-release` 的干净主机根按 README 逐条执行；准备阶段必须先创建 root:root0700 状态目录，recovery 首次 start 返回0并 active(exited)，随后 install/bootstrap/80 健康。删除该目录后，前置验收必须明确失败，不得对缺失 namespace 路径宣称可部署。
+55. 在无 `/var/lib/fireside-release` 的干净主机根按生产运行手册逐条执行；准备阶段必须先创建 root:root0700 状态目录，recovery 首次 start 返回0并 active(exited)，随后 install/bootstrap/80 健康。删除该目录后，前置验收必须明确失败，不得对缺失 namespace 路径宣称可部署。
 56. 在与backup gate/watchdog unit完全相同的 bounding set 下恢复 origin；新版本健康响应commit精确匹配时成功，commit错误、缺失（非显式legacy）或稳定窗PID变化均拒绝。gate进程实测无法读 `/proc/<MainPID>/environ`，legacy helper仅输出cwd；最终MainPID/健康commit/current/selector/permit一致。
 57. 在 prepared journal 落盘后、watchdog READY 前仅 SIGKILL `flock --close` 监督PID，并强watchdog/gate先于旧worker继续；恢复者必须根据journal owner清空旧进程组，旧worker不得再写journal/切current，并发布命令不得入锁。watchdog启动故障下 current/previous/DB/permit/active均不变，prepared journal要么安全清理要么保留并返回4。
 58. 在敏感preflight stage已chown后 SIGKILL controller，等待或保留旧transient，再用与生产`npm ci`完全相同的UID/网络/sandbox哨兵扫描独特业务值；必须EACCES且无出网。下一个main-lock入口必须先同步停止旧unit、再清理只位于root-only固定父目录的孤儿stage；清理期间不存在活跃写者，异常类型/名称/所有者保留证据并失败关闭。
