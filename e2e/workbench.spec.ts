@@ -234,6 +234,109 @@ test.describe('议题管理工作台', () => {
     await expect(updatedCard).toHaveCount(0);
   });
 
+  test('已有报名的活动改期先确认影响，保留名单且冲突后必须重新确认', async ({ page, request }, testInfo) => {
+    const marker = `${testInfo.project.name}-${Date.now()}`;
+    const title = `改期通知确认-${marker}`;
+    const remoteTitle = `远端已更新-${marker}`;
+    const created = await request.post('/api/topics', { headers: sessionHeaders(), data: {
+      title,
+      summary: '已有报名伙伴时，修改活动安排必须确认线下通知责任。',
+      proposer: '改期协调者',
+      presenter: '改期协调者',
+      tags: ['改期'],
+    } });
+    expect(created.status()).toBe(201);
+    const topic = await created.json() as PhaseTopic;
+    const scheduled = await request.post(`/api/topics/${topic.id}/schedule`, {
+      headers: revisionHeaders(topic.revision),
+      data: {
+        scheduledAt: new Date(Date.now() + 2 * 86_400_000).toISOString(),
+        duration: 30,
+        room: '原围炉会议室',
+        meetingUrl: 'https://meet.example.test/original?passcode=must-stay-hidden',
+      },
+    });
+    expect(scheduled.status()).toBe(200);
+    const joined = await request.post(`/api/topics/${topic.id}/participants`, {
+      headers: sessionHeaders(),
+      data: { name: `报名伙伴-${marker}` },
+    });
+    expect(joined.status()).toBe(201);
+
+    let browserPatchCount = 0;
+    page.on('request', (requestEvent) => {
+      if (requestEvent.method() === 'PATCH' && new URL(requestEvent.url()).pathname === `/api/topics/${topic.id}`) browserPatchCount += 1;
+    });
+
+    try {
+      await page.goto('/');
+      const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+      await expect(card).toContainText('1 人报名');
+      await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
+      let dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '编辑议题' }) });
+      await dialog.getByLabel('时长（分钟）').fill('45');
+      await dialog.getByRole('button', { name: '保存修改' }).click();
+
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
+      await expect(dialog.getByRole('heading', { name: '确认通知报名伙伴？' })).toBeFocused();
+      await expect(dialog).toContainText('1 位伙伴已报名');
+      await expect(dialog).toContainText('30 分钟');
+      await expect(dialog).toContainText('45 分钟');
+      await expect(dialog).toContainText('系统不会自动通知报名伙伴');
+      await expect(dialog).not.toContainText('must-stay-hidden');
+      expect(browserPatchCount).toBe(0);
+
+      await dialog.getByRole('button', { name: '返回修改' }).click();
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '编辑议题' }) });
+      await expect(dialog.getByLabel('时长（分钟）')).toHaveValue('45');
+      await expect(dialog.getByRole('button', { name: '保存修改' })).toBeFocused();
+      await dialog.getByRole('button', { name: '保存修改' }).click();
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
+      expect(browserPatchCount).toBe(0);
+
+      const beforeRemoteEdit = await readPhaseTopic(request, topic.id);
+      const remoteEdit = await request.patch(`/api/topics/${topic.id}`, {
+        headers: revisionHeaders(beforeRemoteEdit.revision),
+        data: { title: remoteTitle },
+      });
+      expect(remoteEdit.status()).toBe(200);
+      await dialog.getByRole('button', { name: '确认保存并另行通知' }).click();
+
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '编辑议题' }) });
+      await expect(dialog.getByRole('alert')).toContainText('议题已被其他协作者更新');
+      await expect(dialog.getByLabel('议题标题')).toHaveValue(remoteTitle);
+      await expect(dialog.getByLabel('时长（分钟）')).toHaveValue('45');
+      expect(browserPatchCount).toBe(1);
+      await dialog.getByRole('button', { name: '基于最新版再次保存' }).click();
+
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
+      await expect(dialog).toContainText('1 位伙伴已报名');
+      const actionBounds = await Promise.all([
+        dialog.getByRole('button', { name: '确认保存并另行通知' }).boundingBox(),
+        dialog.getByRole('button', { name: '返回修改' }).boundingBox(),
+      ]);
+      for (const bounds of actionBounds) {
+        expect(bounds).not.toBeNull();
+        expect(bounds!.height).toBeGreaterThanOrEqual(44);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await dialog.getByRole('button', { name: '确认保存并另行通知' }).click();
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByText('改期已保存，1 位伙伴仍保留报名，请另行通知')).toBeVisible();
+      expect(browserPatchCount).toBe(2);
+
+      const latest = await readPhaseTopic(request, topic.id);
+      expect(latest).toEqual(expect.objectContaining({ title: remoteTitle, duration: 45, participantCount: 1 }));
+      const participants = await request.get(`/api/topics/${topic.id}/participants`, { headers: sessionHeaders() });
+      expect(participants.status()).toBe(200);
+      expect(await participants.json()).toHaveLength(1);
+      const updatedCard = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: remoteTitle, exact: true }) });
+      await expect(updatedCard).toContainText('1 人报名');
+    } finally {
+      await deleteLatestTopic(request, topic.id);
+    }
+  });
+
   test('自荐发布并可逐步撤销排期和认领', async ({ page }, testInfo) => {
     const title = `自荐发布浏览器验收-${testInfo.project.name}-${Date.now()}`;
     await page.goto('/');
@@ -1192,6 +1295,7 @@ test.describe('议题管理工作台', () => {
 
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole('alert')).toContainText('议题已被其他协作者更新');
+    await expect(dialog.getByLabel('议题标题')).toHaveValue(remoteTitle);
     await expect(dialog.getByLabel('一句话简介')).toHaveValue(localSummary);
     await dialog.getByRole('button', { name: '基于最新版再次保存' }).click();
 

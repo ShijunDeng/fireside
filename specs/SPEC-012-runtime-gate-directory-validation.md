@@ -1,6 +1,6 @@
 # SPEC-012：运行态门禁目录校验
 
-- 状态：`Implementing`
+- 状态：`Accepted`
 - 创建：2026-09-02
 - 最后更新：2026-09-02
 
@@ -25,3 +25,10 @@
 3. 现有发布控制器故障注入测试全部通过。
 4. 在真实 systemd 门禁中恢复当前 `reverting` 事务，旧版本健康恢复；随后新候选正常 promote，`current`、runtime selector、write permit 和健康接口指向同一提交。
 
+## 4. 实现与验证
+
+- `prepare_runtime_root` 先要求非符号链接真实目录，再校验 `root:root 0755`；不再读取目录链接数。
+- `release-active`、`writes-enabled`、事务和健康标记的普通文件单链接约束保持不变。
+- 49 项发布控制器故障注入测试通过；全量 `npm run check` 为 145 项测试、类型检查和生产构建通过。
+- 真实故障事务已恢复到 `b15bdf5`，验证 journal clean、selector/write permit 重建、服务健康；修复提交 `7582f3c` 随后成功 promote。
+- 生产 `current`、进程 cwd、`/api/health.releaseCommit` 均为 `7582f3c0fdefce30664fe778f6ea59f9c73ff0b5`；服务以 `fireside` UID 运行，socket 监听 `0.0.0.0:80`，公开转发地址健康返回同一提交。

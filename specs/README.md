@@ -37,6 +37,8 @@
 | [SPEC-009](./SPEC-009-auth-rate-limit.md) | Accepted | 口令抗猜测、短期协作令牌、生产密钥强度与失败关闭 |
 | [SPEC-010](./SPEC-010-production-least-privilege.md) | Implementing | 非 root 服务、socket activation、私有状态、崩溃安全备份与门禁回滚发布 |
 | [SPEC-011](./SPEC-011-calendar-participation.md) | Accepted | 产品操作逻辑、日历活动详情与参与闭环、导航和合理排版 |
-| [SPEC-012](./SPEC-012-runtime-gate-directory-validation.md) | Implementing | 运行态门禁目录校验 |
+| [SPEC-012](./SPEC-012-runtime-gate-directory-validation.md) | Accepted | 运行态门禁目录校验 |
+| [SPEC-013](./SPEC-013-request-error-contract.md) | Ready | 客户端请求解析错误的稳定状态码、安全反馈与零副作用 |
+| [SPEC-014](./SPEC-014-reschedule-participant-notice.md) | Accepted | 有报名活动改期的影响确认与线下通知责任 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

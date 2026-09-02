@@ -56,6 +56,8 @@ type Tab = 'ALL' | TopicStatus;
 type ModalKind = 'create' | 'claim' | 'schedule' | 'archive' | 'edit' | 'delete' | 'release' | 'unschedule' | 'unarchive';
 type ViewMode = 'list' | 'month' | 'week';
 type PosterPhase = 'checking' | 'generating' | 'ready' | 'read-error' | 'render-error' | 'unavailable';
+type EditDraftField = 'title' | 'summary' | 'proposer' | 'tags' | 'presenter' | 'scheduledAt' | 'duration' | 'room' | 'meetingUrl' | 'takeaway' | 'materialUrl';
+type EditDraft = Record<EditDraftField, string>;
 
 const tabs: { key: Tab; label: string }[] = [
   { key: 'ALL', label: '全部议题' },
@@ -167,16 +169,13 @@ function useDialogA11y(onClose: () => void, label = 'dialog') {
     };
   }, [returnFocusKey, token]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isTop || initialFocusHandledRef.current) return;
-    const frame = window.requestAnimationFrame(() => {
-      if (!dialogStack.isTop(token)) return;
-      const dialog = dialogRef.current;
-      if (!dialog) return;
-      initialFocusHandledRef.current = true;
-      (dialog.querySelector<HTMLElement>('[data-initial-focus]') ?? dialog.querySelector<HTMLElement>(focusableSelector) ?? dialog).focus();
-    });
-    return () => window.cancelAnimationFrame(frame);
+    if (!dialogStack.isTop(token)) return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    initialFocusHandledRef.current = true;
+    (dialog.querySelector<HTMLElement>('[data-initial-focus]') ?? dialog.querySelector<HTMLElement>(focusableSelector) ?? dialog).focus();
   }, [isTop, token]);
 
   useEffect(() => {
@@ -1013,9 +1012,20 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [editRevision, setEditRevision] = useState(topic?.revision ?? 1);
+  const [editBase, setEditBase] = useState(topic);
+  const [editDraft, setEditDraft] = useState<EditDraft | null>(() => topic ? topicToEditDraft(topic) : null);
+  const [editDraftVersion, setEditDraftVersion] = useState(0);
+  const [pendingEdit, setPendingEdit] = useState<{
+    payload: Parameters<typeof api.update>[2];
+    changes: { label: string; before: string; after: string }[];
+    participantCount: number;
+  } | null>(null);
   const [revisionConflict, setRevisionConflict] = useState('');
   const [revisionConflictAttempt, setRevisionConflictAttempt] = useState(0);
   const revisionConflictRef = useRef<HTMLDivElement>(null);
+  const rescheduleConfirmRef = useRef<HTMLHeadingElement>(null);
+  const editSubmitRef = useRef<HTMLButtonElement>(null);
+  const editFormRef = useRef<HTMLFormElement>(null);
   const conflictCloseHandled = useRef(false);
   const phase = topic ? topicPhase(topic, now) : null;
   const endedReset = kind === 'unschedule' && phase === 'ENDED';
@@ -1024,6 +1034,21 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
   const editScheduleMinimum = topic?.scheduledAt && new Date(topic.scheduledAt).getTime() < now.getTime() + 60_000
     ? formatDateTimeInput(topic.scheduledAt)
     : minimumScheduleAt;
+  function topicToEditDraft(source: Topic): EditDraft {
+    return {
+      title: source.title,
+      summary: source.summary,
+      proposer: source.proposer,
+      tags: source.tags.join(', '),
+      presenter: source.presenter ?? '',
+      scheduledAt: formatDateTimeInput(source.scheduledAt),
+      duration: source.duration === null ? '' : String(source.duration),
+      room: legacyMeetingUrl(source.room) ? '线上会议' : source.room ?? '',
+      meetingUrl: topicMeetingUrl(source) ?? '',
+      takeaway: source.takeaway ?? '',
+      materialUrl: source.materialUrl ?? '',
+    };
+  }
   function closeModal() {
     if (kind === 'edit' && revisionConflict && onConflict) {
       if (conflictCloseHandled.current) return;
@@ -1054,8 +1079,15 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
     return () => window.cancelAnimationFrame(frame);
   }, [revisionConflict, revisionConflictAttempt]);
 
+  useEffect(() => {
+    if (!pendingEdit) return;
+    const frame = window.requestAnimationFrame(() => rescheduleConfirmRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingEdit]);
+
   function editPayload(data: FormData) {
-    if (!topic) return {} as Parameters<typeof api.update>[2];
+    const base = editBase ?? topic;
+    if (!base) return {} as Parameters<typeof api.update>[2];
     const payload: Parameters<typeof api.update>[2] = {};
     const text = (name: string) => String(data.get(name) ?? '').trim();
     const tags = () => text('tags').split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
@@ -1067,39 +1099,89 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
       if (value !== (original ?? '').trim()) payload[key] = value;
     };
 
-    setTextIfChanged('title', topic.title);
-    setTextIfChanged('summary', topic.summary);
-    setTextIfChanged('proposer', topic.proposer);
+    setTextIfChanged('title', base.title);
+    setTextIfChanged('summary', base.summary);
+    setTextIfChanged('proposer', base.proposer);
     const nextTags = tags();
-    if (nextTags.length !== topic.tags.length || nextTags.some((tag, index) => tag !== topic.tags[index])) payload.tags = nextTags;
-    if (data.has('presenter')) setTextIfChanged('presenter', topic.presenter);
+    if (nextTags.length !== base.tags.length || nextTags.some((tag, index) => tag !== base.tags[index])) payload.tags = nextTags;
+    if (data.has('presenter')) setTextIfChanged('presenter', base.presenter);
     if (data.has('scheduledAt')) {
       const value = text('scheduledAt');
-      if (value !== formatDateTimeInput(topic.scheduledAt)) payload.scheduledAt = new Date(value).toISOString();
+      if (value !== formatDateTimeInput(base.scheduledAt)) payload.scheduledAt = new Date(value).toISOString();
     }
     if (data.has('duration')) {
       const value = Number(data.get('duration'));
-      if (value !== topic.duration) payload.duration = value;
+      if (value !== base.duration) payload.duration = value;
     }
-    if (data.has('room')) setTextIfChanged('room', legacyMeetingUrl(topic.room) ? '线上会议' : topic.room);
-    if (data.has('meetingUrl')) setTextIfChanged('meetingUrl', topicMeetingUrl(topic));
-    if (data.has('takeaway')) setTextIfChanged('takeaway', topic.takeaway);
-    if (data.has('materialUrl')) setTextIfChanged('materialUrl', topic.materialUrl);
+    if (data.has('room')) setTextIfChanged('room', legacyMeetingUrl(base.room) ? '线上会议' : base.room);
+    if (data.has('meetingUrl')) setTextIfChanged('meetingUrl', topicMeetingUrl(base));
+    if (data.has('takeaway')) setTextIfChanged('takeaway', base.takeaway);
+    if (data.has('materialUrl')) setTextIfChanged('materialUrl', base.materialUrl);
     return payload;
   }
 
-  async function recoverEditConflict(conflict: ApiError) {
+  function rescheduleChanges(payload: Parameters<typeof api.update>[2]) {
+    const base = editBase ?? topic;
+    if (!base) return [];
+    const changes: { label: string; before: string; after: string }[] = [];
+    if (typeof payload.scheduledAt === 'string') {
+      changes.push({ label: '分享时间', before: formatDate(base.scheduledAt!, true), after: formatDate(payload.scheduledAt, true) });
+    }
+    if (payload.duration !== undefined) {
+      changes.push({ label: '分享时长', before: `${base.duration} 分钟`, after: `${payload.duration} 分钟` });
+    }
+    if (payload.room !== undefined) {
+      changes.push({ label: '地点 / 参与说明', before: base.room || '未设置', after: payload.room || '未设置' });
+    }
+    if (payload.meetingUrl !== undefined) {
+      const hadMeeting = Boolean(topicMeetingUrl(base) || base.hasMeetingUrl);
+      const hasMeeting = Boolean(payload.meetingUrl);
+      changes.push({
+        label: '线上会议入口',
+        before: hadMeeting ? '已设置（已隐藏）' : '未设置',
+        after: hasMeeting ? hadMeeting ? '已变更（已隐藏）' : '已设置（已隐藏）' : '未设置',
+      });
+    }
+    return changes;
+  }
+
+  function mergeLatestIntoUntouchedDraft(latest: Topic, attemptedPayload: Parameters<typeof api.update>[2]) {
+    const form = editFormRef.current;
+    const merged = topicToEditDraft(latest);
+    if (form) {
+      (Object.keys(merged) as EditDraftField[]).forEach((name) => {
+        if (!Object.prototype.hasOwnProperty.call(attemptedPayload, name)) return;
+        const control = form.elements.namedItem(name);
+        if (control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement) merged[name] = control.value;
+      });
+    }
+    setEditDraft(merged);
+    setEditDraftVersion((version) => version + 1);
+  }
+
+  async function recoverEditConflict(conflict: ApiError, attemptedPayload: Parameters<typeof api.update>[2]) {
     if (!topic || !onConflict) {
       setError('议题版本已变化，请关闭后刷新再试');
       setSubmitting(false);
       return;
     }
     try {
-      const latest = await api.topic(topic.id);
+      let latest = await api.topic(topic.id);
       if (latest.status !== topic.status) {
         onConflict('议题状态已变化，本次修改未执行');
         return;
       }
+      if (latest.hasMeetingUrl && canAttendPhase(topicPhase(latest, now))) {
+        try {
+          const { meetingUrl } = await api.meetingAccess(latest.id);
+          latest = { ...latest, meetingUrl };
+        } catch {
+          // The latest public snapshot is still authoritative; a hidden meeting
+          // value remains untouched unless the collaborator edits that field.
+        }
+      }
+      mergeLatestIntoUntouchedDraft(latest, attemptedPayload);
+      setEditBase(latest);
       setEditRevision(latest.revision);
       setRevisionConflict(`${conflict.message}。你的表单内容仍然保留；再次保存会基于最新版重试，关闭则放弃草稿并同步最新版。`);
       setRevisionConflictAttempt((attempt) => attempt + 1);
@@ -1115,11 +1197,40 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
     }
   }
 
+  async function confirmReschedule() {
+    if (!pendingEdit || !topic) return;
+    const confirmation = pendingEdit;
+    setSubmitting(true);
+    setError('');
+    try {
+      await api.update(topic.id, editRevision, confirmation.payload);
+      onComplete(`改期已保存，${confirmation.participantCount} 位伙伴仍保留报名，请另行通知`);
+    } catch (err) {
+      setPendingEdit(null);
+      if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
+        await recoverEditConflict(err, confirmation.payload);
+        return;
+      }
+      if (err instanceof ApiError && err.status === 409 && onConflict) {
+        onConflict(err.message);
+        return;
+      }
+      setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
+      setSubmitting(false);
+    }
+  }
+
+  function returnToEdit() {
+    setPendingEdit(null);
+    window.requestAnimationFrame(() => editSubmitRef.current?.focus());
+  }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSubmitting(true);
     setError('');
     const data = new FormData(event.currentTarget);
+    let attemptedEditPayload: Parameters<typeof api.update>[2] = {};
     try {
       if (kind === 'create') {
         const proposer = String(data.get('proposer'));
@@ -1160,8 +1271,16 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
         onComplete('归档已撤销，议题恢复为已排期');
       } else if (kind === 'edit' && topic) {
         const payload = editPayload(data);
+        attemptedEditPayload = payload;
         if (Object.keys(payload).length === 0) {
           setError('没有需要保存的修改');
+          setSubmitting(false);
+          return;
+        }
+        const changes = rescheduleChanges(payload);
+        const base = editBase ?? topic;
+        if (base.status === 'SCHEDULED' && topicPhase(base, now) === 'UPCOMING' && base.participantCount > 0 && changes.length > 0) {
+          setPendingEdit({ payload, changes, participantCount: base.participantCount });
           setSubmitting(false);
           return;
         }
@@ -1174,7 +1293,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
     } catch (err) {
       if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
         if (kind === 'edit') {
-          await recoverEditConflict(err);
+          await recoverEditConflict(err, attemptedEditPayload);
           return;
         }
         if (onConflict) {
@@ -1196,11 +1315,27 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
       <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} inert={!isTop}>
         <button className="modal-close" onClick={closeModal} aria-label="关闭"><X size={19} /></button>
         <span className="modal-eyebrow"><Sparkles size={14} />{copy.eyebrow}</span>
-        <h2 id="modal-title">{copy.title}</h2>
-        <p className="modal-intro">{copy.intro}</p>
+        <h2 id="modal-title" ref={rescheduleConfirmRef} tabIndex={pendingEdit ? -1 : undefined}>{pendingEdit ? '确认通知报名伙伴？' : copy.title}</h2>
+        <p className="modal-intro">{pendingEdit ? '活动安排发生变化，请先确认受影响范围。' : copy.intro}</p>
         {topic && <div className="selected-topic"><span>本次议题</span><strong>{topic.title}</strong></div>}
 
-        <form onSubmit={submit}>
+        {pendingEdit && <section className="reschedule-confirm" aria-labelledby="modal-title">
+          <div className="reschedule-impact"><Users size={20} /><p><strong>{pendingEdit.participantCount} 位伙伴已报名</strong><span>确认后报名会保留，但他们不会收到系统通知。</span></p></div>
+          <dl className="reschedule-changes">
+            {pendingEdit.changes.map((change) => <div key={change.label}>
+              <dt>{change.label}</dt>
+              <dd><span>{change.before}</span><ArrowRight size={14} /><strong>{change.after}</strong></dd>
+            </div>)}
+          </dl>
+          <p className="reschedule-notice" role="note">系统不会自动通知报名伙伴，请确认已通过其他方式通知。</p>
+          {error && <div className="form-error" role="alert">{error}</div>}
+          <div className="reschedule-actions">
+            <button type="button" className="btn" onClick={returnToEdit} disabled={submitting}>返回修改</button>
+            <button type="button" className="submit-btn" onClick={() => void confirmReschedule()} disabled={submitting}>{submitting ? '正在保存…' : '确认保存并另行通知'}{!submitting && <ChevronRight size={17} />}</button>
+          </div>
+        </section>}
+
+        <form key={kind === 'edit' ? editDraftVersion : undefined} ref={kind === 'edit' ? editFormRef : undefined} onSubmit={submit} hidden={Boolean(pendingEdit)} aria-hidden={pendingEdit ? 'true' : undefined}>
           {kind === 'create' && <>
             <label>议题标题<input name="title" required maxLength={80} placeholder="最近有什么让你停下来多看了一眼？" autoFocus data-initial-focus /></label>
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} placeholder="它为什么值得一起聊聊？你想从哪里开始探索？" /></label>
@@ -1228,25 +1363,25 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
             <label>资料链接（选填）<input name="materialUrl" type="url" placeholder="https://" /></label>
           </>}
           {kind === 'edit' && topic && <>
-            <label>议题标题<input name="title" required maxLength={80} defaultValue={topic.title} autoFocus data-initial-focus /></label>
-            <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} defaultValue={topic.summary} /></label>
+            <label>议题标题<input name="title" required maxLength={80} defaultValue={editDraft?.title ?? topic.title} autoFocus data-initial-focus /></label>
+            <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} defaultValue={editDraft?.summary ?? topic.summary} /></label>
             <div className="form-row">
-              <label>发起人<input name="proposer" required maxLength={30} defaultValue={topic.proposer} /></label>
-              <label>标签（最多 5 个）<input name="tags" maxLength={100} defaultValue={topic.tags.join(', ')} /></label>
+              <label>发起人<input name="proposer" required maxLength={30} defaultValue={editDraft?.proposer ?? topic.proposer} /></label>
+              <label>标签（最多 5 个）<input name="tags" maxLength={100} defaultValue={editDraft?.tags ?? topic.tags.join(', ')} /></label>
             </div>
-            {topic.status !== 'OPEN' && <label>分享人<input name="presenter" required maxLength={30} defaultValue={topic.presenter ?? ''} /></label>}
+            {topic.status !== 'OPEN' && <label>分享人<input name="presenter" required maxLength={30} defaultValue={editDraft?.presenter ?? topic.presenter ?? ''} /></label>}
             {(topic.status === 'SCHEDULED' || topic.status === 'ARCHIVED') && <>
               {timeLocked && <div className="phase-lock-note" role="status">{phase === 'LIVE' ? '活动进行中，排期已锁定。' : '分享已结束，排期与时长不再可修改。'} 仍可修正地点和会议链接。</div>}
-              <label>分享时间<input name="scheduledAt" type="datetime-local" required min={phase === 'UPCOMING' ? editScheduleMinimum : undefined} disabled={timeLocked} defaultValue={formatDateTimeInput(topic.scheduledAt)} /></label>
+              <label>分享时间<input name="scheduledAt" type="datetime-local" required min={phase === 'UPCOMING' ? editScheduleMinimum : undefined} disabled={timeLocked} defaultValue={editDraft?.scheduledAt ?? formatDateTimeInput(topic.scheduledAt)} /></label>
               <div className="form-row">
-                <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} disabled={timeLocked} defaultValue={topic.duration ?? 40} /></label>
-                <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue={legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? ''} /></label>
+                <label>时长（分钟）<input name="duration" type="number" required min={10} max={240} disabled={timeLocked} defaultValue={editDraft?.duration ?? topic.duration ?? 40} /></label>
+                <label>地点 / 参与说明（链接与凭证请填下方）<input name="room" required maxLength={60} defaultValue={editDraft?.room ?? (legacyMeetingUrl(topic.room) ? '线上会议' : topic.room ?? '')} /></label>
               </div>
-              <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} defaultValue={topicMeetingUrl(topic) ?? ''} placeholder={topic.hasMeetingUrl && !topicMeetingUrl(topic) ? '原链接已隐藏；留空保留，填写则替换' : 'https://'} /></label>
+              <label>线上会议链接（选填）<input name="meetingUrl" type="url" maxLength={2048} defaultValue={editDraft?.meetingUrl ?? topicMeetingUrl(topic) ?? ''} placeholder={topic.hasMeetingUrl && !topicMeetingUrl(topic) ? '原链接已隐藏；留空保留，填写则替换' : 'https://'} /></label>
             </>}
             {topic.status === 'ARCHIVED' && <>
-              <label>本期收获<textarea name="takeaway" required maxLength={1000} rows={4} defaultValue={topic.takeaway ?? ''} /></label>
-              <label>资料链接（选填）<input name="materialUrl" type="url" defaultValue={topic.materialUrl ?? ''} placeholder="https://" /></label>
+              <label>本期收获<textarea name="takeaway" required maxLength={1000} rows={4} defaultValue={editDraft?.takeaway ?? topic.takeaway ?? ''} /></label>
+              <label>资料链接（选填）<input name="materialUrl" type="url" defaultValue={editDraft?.materialUrl ?? topic.materialUrl ?? ''} placeholder="https://" /></label>
             </>}
           </>}
           {kind === 'delete' && topic && <div className="delete-warning"><Trash2 size={19} /><p><strong>{topic.title}</strong><span>此操作不可撤销，请确认是否继续。</span></p></div>}
@@ -1255,7 +1390,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
           {revisionConflict && <div ref={revisionConflictRef} className="form-error" role="alert" tabIndex={-1}>{revisionConflict}</div>}
           {error && <div className="form-error" role="alert">{error}</div>}
-          <button className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
+          <button ref={kind === 'edit' ? editSubmitRef : undefined} className={`submit-btn ${kind === 'delete' ? 'delete-submit' : ''}`} disabled={submitting} type="submit">
             {submitting ? '正在处理…' : kind === 'create' ? '发布议题' : kind === 'claim' ? '确认认领' : kind === 'schedule' ? '确认排期' : kind === 'archive' ? '完成归档' : kind === 'release' ? '重新开放认领' : kind === 'unschedule' ? endedReset ? '确认未举行 / 重新排期' : '确认取消排期' : kind === 'unarchive' ? '确认撤销归档' : kind === 'edit' ? revisionConflict ? '基于最新版再次保存' : '保存修改' : '确认删除'}
             {!submitting && <ChevronRight size={17} />}
           </button>
