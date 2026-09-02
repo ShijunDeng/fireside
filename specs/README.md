@@ -44,5 +44,6 @@
 | [SPEC-016](./SPEC-016-unicode-passphrase.md) | Accepted | UTF-8 围炉口令、六字符生产门槛与版本化浏览器传输 |
 | [SPEC-017](./SPEC-017-mature-topic-delete-guard.md) | Accepted | 成熟议题永久删除门禁、生命周期纠错路径与并发恢复 |
 | [SPEC-018](./SPEC-018-create-entry-auth-distinction.md) | Accepted | 发起议题与解锁协作入口分离、先写草稿再显式发布 |
+| [SPEC-019](./SPEC-019-same-day-program.md) | Implementing | 同日单轨联场、排期防重叠、当日日程与海报场次上下文 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

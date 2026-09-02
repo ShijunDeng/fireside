@@ -90,3 +90,4 @@
 - 普通业务表单的 `400 / 413 / 415 / 500` 会保留草稿并聚焦“内容已保留，未提交”；有报名改期在可重试错误后保留确认层、人数、变更对照和 pending payload。
 - 真实 HTTP、流式超限、Content-Length 不一致、raw EOF、未知 500 与日志脱敏均有自动化回归。`npm run check` 154 项全绿；独占 `npx playwright test --retries=0` 为 80 通过、4 项按设备职责跳过；生产构建、差异检查和依赖审计（0 漏洞）通过。
 - API、生命周期和 UX 三路独立终审均为 clean。本轮修复了已证实错误与页面恢复阻断，成熟度连续无发现计数保持 0。
+- 实现提交 `b3aacd2` 已通过不可变候选安装并受控提升；生产 `current=b3aacd2`、`previous=4480475`、journal clean，socket/service active 并监听 `0.0.0.0:80`。本机与公网首页/健康检查均为 200，`fireside` 版本化口令验证为 200，近五分钟 journal 无 warning。

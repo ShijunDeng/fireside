@@ -68,6 +68,7 @@
 ### FR-PRIVACY-003 全字段与文件名防线
 
 - `title`、`summary`、`presenter`、每一个 `tag` 和 `room` 在进入 `PosterModel` 前都经过同一纯函数脱敏。
+- 按 SPEC-019，`PosterModel` 还包含公开 Topic ID 和可选的同日场次上下文；文件名加入北京时间时分和 ID，仍必须通过本规格的所有凭证脱敏和布局预算。
 - `meetingUrl` 永远不进入 `PosterModel`；`hasMeetingUrl` 只生成不含原始入口的线上参与提示。
 - 即使传入未经公开 API 映射的历史原始 `room`，模型层仍必须独立隐藏 URL、会议编号和密码；不能只依赖服务端公开响应。
 - 文件名生成函数必须自行对标题脱敏，再执行非法字符清理和长度限制，不能信任调用方已经清理。文件名不得出现 URL 主机、会议号残片、中文密码、`pwd` 或 `passcode` 值。
