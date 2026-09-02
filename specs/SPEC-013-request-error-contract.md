@@ -1,8 +1,9 @@
 # SPEC-013：客户端请求错误契约
 
-- 状态：`Ready`
+- 状态：`Accepted`
 - 创建：2026-09-02
 - 最后更新：2026-09-02
+- 依赖：SPEC-005、SPEC-009、SPEC-010、SPEC-014
 
 ## 1. 用户问题
 
@@ -16,32 +17,76 @@
 | 截断/畸形 JSON | `FST_ERR_CTP_INVALID_JSON_BODY` | 500 | 400 |
 | `application/xml` | `FST_ERR_CTP_INVALID_MEDIA_TYPE` | 500 | 415 |
 | body 超过默认 1 MiB | `FST_ERR_CTP_BODY_TOO_LARGE` | 500 | 413 |
-| `Content-Length` 与实际正文不一致 | `FST_ERR_CTP_INVALID_CONTENT_LENGTH` | 500 | 400 |
+| 可完整交给 Fastify 的正文长度与 `Content-Length` 不一致 | `FST_ERR_CTP_INVALID_CONTENT_LENGTH` | 500 | 400 |
 
-四条路径均未写入 Topic，但错误反馈违反 SPEC-011 已登记的 `400 / 413 / 415` 页面/API契约。
+五条路径均未写入 Topic，但错误反馈违反 SPEC-011 已登记的 `400 / 413 / 415` 页面/API契约。
 
-## 2. 错误契约
+独立浏览器复审另确定一个页面阻断：有报名活动的改期先进入“确认保存并另行通知”；若第二阶段请求收到上述客户端错误，页面会提前退出确认层、把错误留在 Pixel 7 视口以下并把焦点丢到 `body`。草稿虽然还在，但用户既看不到失败原因，也无法判断是否已经保存。
 
-有效协作会话下：
+## 2. 服务端错误契约
+
+服务显式把请求体上限固定为 `1,048,576` bytes，不依赖 Fastify 当前版本的默认值。有效协作会话下：
 
 - 空或畸形 JSON：`400 { code: "INVALID_JSON_BODY", message: "提交内容不是有效的 JSON，请检查后重试" }`。
 - 不支持的媒体类型：`415 { code: "UNSUPPORTED_MEDIA_TYPE", message: "提交格式不受支持，请使用 JSON" }`。
 - 请求体超过限制：`413 { code: "REQUEST_BODY_TOO_LARGE", message: "提交内容过大，请精简后重试" }`。
 - 请求长度与实际正文不一致：`400 { code: "INVALID_REQUEST_BODY", message: "请求内容不完整，请重新提交" }`。
 - 不回显原始 payload、口令、会话令牌或 Fastify 内部异常文本。
-- 未识别的程序异常继续返回通用 `500`，并记录服务端错误日志。
+- 只按五个已审阅 Fastify `error.code` 映射，不允许按任意 `statusCode` 透传框架或插件的内部 message。
+- 上述预期客户端拒绝不写 error 级日志；未识别的程序异常继续返回通用 `500`，并记录服务端错误日志。
 
-认证优先级保持不变：无效/缺失会话叠加上述任一解析错误时仍先返回 `401 ACCESS_SESSION_REQUIRED`，不能借解析错误探测受保护路由。
+真实 TCP 客户端在正文传完前断开时，Node/Fastify 可能直接进入 raw client-error 层，应用不无条件承诺结构化 JSON；验收只要求安全的通用 `400` 或关闭连接、零业务写入且进程继续健康。只有正文流正常结束并产生 `FST_ERR_CTP_INVALID_CONTENT_LENGTH` 时才承诺上述精确 `INVALID_REQUEST_BODY` JSON。
+
+### 2.1 错误优先级
+
+受保护业务写的顺序固定为：
+
+`无效/缺失会话 401 → 发布写屏障 503 → body parser 400/413/415 → If-Match 400/428 → handler 业务错误`
+
+- 无效/缺失会话叠加任一畸形、错误媒体类型或超限正文时仍返回 `401 ACCESS_SESSION_REQUIRED`，不能借解析错误探测受保护路由。
+- 有效会话但生产发布屏障关闭时仍先返回 `503 RELEASE_IN_PROGRESS`，错误正文不能绕过发布写屏障。
+- 有效会话且允许写入时，解析错误先于 `If-Match` 语法和业务状态；解析阶段不得进入 handler。
+
+### 2.2 `/api/access/verify` 特例
+
+验证入口只从请求头读取口令，但 Fastify 仍可能尝试解析调用者附带的 body。为维持 SPEC-009 的限流顺序：
+
+- `onRequest` 在 body parser 前设置 `Cache-Control: no-store` 并执行限流 preflight；已限流来源无论附带空/畸形 JSON、XML 或超限 body，都先返回 `429 ACCESS_RATE_LIMITED` 和整数 `Retry-After`。
+- 未限流来源才进入 parser。正确、错误或缺失口令叠加同一种坏 body 时返回完全相同的本规格解析错误，不比较口令、不记录一次口令失败，也不得形成口令正确性 oracle。
+- body 合法或未提供 body 时，handler 才比较口令并按 SPEC-009 记录失败或签发会话；一次请求不能重复 preflight 或重复计数。
 
 ## 3. 数据不变式
 
 所有解析拒绝路径必须在业务 handler 前终止，且 Topic 行、revision、position、手动排序版本和参与名单均保持不变。客户端可安全修改输入后重试，但服务端不得把失败请求部分执行。
 
-## 4. 验收
+## 4. 页面恢复契约
 
-1. 使用有效会话分别验证空 JSON、畸形 JSON、错误媒体类型、超大 body 和错误 Content-Length 的精确状态码、code 与安全文案。
-2. 验证错误前后的完整公开 Topic 列表、revision/position、`X-Order-Version` 和参与名单一致。
-3. 无效会话叠加畸形 JSON 和超大 body 仍为 401。
-4. 无 body 的 DELETE 若错误携带 JSON Content-Type 返回 400，正确 DELETE 不携带该头仍按业务语义成功。
-5. 注入未知内部异常时继续为安全的 500，且 logger 收到错误；客户端响应不含异常正文。
-6. 全量单元/API、类型检查、生产构建和桌面/移动浏览器回归继续通过。
+- 创建、认领、排期、归档、普通编辑和生命周期表单收到 `400 / 413 / 415 / 500` 后保持当前弹窗、全部输入和可执行的提交按钮；错误区使用 `role="alert"`，明确“内容已保留，未提交”，不自动重试，也不误打开口令层。
+- 有报名活动的改期二次确认收到上述可重试错误时必须保留 `pendingEdit`、报名人数、脱敏变更对照和本地草稿，在确认层内显示并聚焦可见错误；一次点击只发出一次请求。只有需要合并最新版的 `412` 才退出确认层回到编辑冲突恢复，`409` 继续按状态冲突关闭失效流程，`401` 继续使用既有叠层解锁且不自动提交。
+- 排序若收到解析或服务错误，继续回滚乐观顺序并读取权威列表；不把失败显示为成功。
+- 第一方页面仍只发送合法 JSON；浏览器验收用网络层返回真实结构的 `400 / 413 / 415` 来验证客户端恢复，不为制造错误而污染生产 API。
+
+## 5. 验收
+
+1. 使用有效会话分别验证空 JSON、畸形 JSON、错误媒体类型、预声明超限/实际流式超限 body 和可解析的错误 Content-Length 的精确状态码、code 与安全文案；明确断言固定 1 MiB 边界。
+2. 验证错误前后的完整公开 Topic 列表、全部 revision/position/updatedAt、`X-Order-Version` 和参与名单一致。
+3. 无效会话叠加全部解析错误仍为 401；有效会话加关闭的发布屏障仍为 503；解析错误叠加缺失/非法 `If-Match` 时解析错误优先。
+4. `/verify` 覆盖未限流、已限流、窗口恢复三阶段，以及正确/错误口令的坏 body 等价响应；断言 no-store、Retry-After、一次计数和无口令 oracle。
+5. 无 body 的 DELETE 若错误携带 JSON Content-Type 返回 400，正确 DELETE 不携带该头仍按 SPEC-017 业务语义成功。
+6. 注入未知内部异常时继续为安全的 500，且 logger 收到错误；客户端响应不含异常正文、payload、session、口令或堆栈。预期五类 4xx 不写 error 日志。
+7. 真实监听端口覆盖空/畸形 JSON、错误媒体类型和超限 body；raw TCP 提前 EOF 至少满足安全拒绝、零写入、进程和后续健康请求可用。
+8. 桌面 Chrome 与 Pixel 7 覆盖普通表单保留，以及有报名改期确认分别收到至少一种 `400 / 413 / 415` 后仍停留确认层、错误可见且聚焦、草稿/人数/变更不变、按钮恢复和单击单请求；401/412/409 既有分支回归。
+9. 全量单元/API、类型检查、生产构建、无重试桌面/移动浏览器回归和依赖审计继续通过。
+
+## 6. 非目标与后续
+
+- 不修改浏览器或代理已经断开、因而无法可靠接收响应的网络物理语义。
+- 本规格不引入自动重放写请求；所有重试必须由用户显式发起。
+- 取消排期通知名单、NEXT FIRESIDE 时间推进、移动月历“今天”定位和是否允许并行排期，是本轮独立审查确认的后续业务候选；完成本规格不得停止成熟度循环。
+
+## 7. 实现与验收记录
+
+- Fastify 显式固定 `1,048,576` bytes 正文上限，仅映射五个已审阅 parser code；受保护路由保持 `401 → 503 → parser → If-Match → 业务` 顺序。`/verify` 的 no-store 与限流 preflight 已前置到 body parser 之前，坏正文不比较口令、不计一次失败。
+- 普通业务表单的 `400 / 413 / 415 / 500` 会保留草稿并聚焦“内容已保留，未提交”；有报名改期在可重试错误后保留确认层、人数、变更对照和 pending payload。
+- 真实 HTTP、流式超限、Content-Length 不一致、raw EOF、未知 500 与日志脱敏均有自动化回归。`npm run check` 154 项全绿；独占 `npx playwright test --retries=0` 为 80 通过、4 项按设备职责跳过；生产构建、差异检查和依赖审计（0 漏洞）通过。
+- API、生命周期和 UX 三路独立终审均为 clean。本轮修复了已证实错误与页面恢复阻断，成熟度连续无发现计数保持 0。

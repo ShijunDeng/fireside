@@ -401,6 +401,35 @@ test.describe('议题管理工作台', () => {
       dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
       expect(browserPatchCount).toBe(0);
 
+      const parserStatus = testInfo.project.name === 'mobile' ? 413 : 400;
+      const parserCode = testInfo.project.name === 'mobile' ? 'REQUEST_BODY_TOO_LARGE' : 'INVALID_JSON_BODY';
+      const parserMessage = testInfo.project.name === 'mobile' ? '提交内容过大，请精简后重试' : '提交内容不是有效的 JSON，请检查后重试';
+      let rejectNextPatch = true;
+      await page.route(`**/api/topics/${topic.id}`, async (route) => {
+        if (route.request().method() !== 'PATCH' || !rejectNextPatch) return route.continue();
+        rejectNextPatch = false;
+        return route.fulfill({
+          status: parserStatus,
+          contentType: 'application/json',
+          body: JSON.stringify({ code: parserCode, message: parserMessage }),
+        });
+      });
+      await dialog.getByRole('button', { name: '确认保存并另行通知' }).click();
+      dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
+      const parserAlert = dialog.getByRole('alert');
+      await expect(parserAlert).toHaveText(`${parserMessage}；内容已保留，未提交`);
+      await expect(parserAlert).toBeFocused();
+      await expect(dialog).toContainText('1 位伙伴已报名');
+      await expect(dialog).toContainText('30 分钟');
+      await expect(dialog).toContainText('45 分钟');
+      await expect(dialog.getByRole('button', { name: '确认保存并另行通知' })).toBeEnabled();
+      expect(await parserAlert.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        return bounds.top >= 0 && bounds.bottom <= window.innerHeight;
+      })).toBe(true);
+      expect(browserPatchCount).toBe(1);
+      await page.unroute(`**/api/topics/${topic.id}`);
+
       const beforeRemoteEdit = await readPhaseTopic(request, topic.id);
       const remoteEdit = await request.patch(`/api/topics/${topic.id}`, {
         headers: revisionHeaders(beforeRemoteEdit.revision),
@@ -413,7 +442,7 @@ test.describe('议题管理工作台', () => {
       await expect(dialog.getByRole('alert')).toContainText('议题已被其他协作者更新');
       await expect(dialog.getByLabel('议题标题')).toHaveValue(remoteTitle);
       await expect(dialog.getByLabel('时长（分钟）')).toHaveValue('45');
-      expect(browserPatchCount).toBe(1);
+      expect(browserPatchCount).toBe(2);
       await dialog.getByRole('button', { name: '基于最新版再次保存' }).click();
 
       dialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '确认通知报名伙伴？' }) });
@@ -430,7 +459,7 @@ test.describe('议题管理工作台', () => {
       await dialog.getByRole('button', { name: '确认保存并另行通知' }).click();
       await expect(dialog).toHaveCount(0);
       await expect(page.getByText('改期已保存，1 位伙伴仍保留报名，请另行通知')).toBeVisible();
-      expect(browserPatchCount).toBe(2);
+      expect(browserPatchCount).toBe(3);
 
       const latest = await readPhaseTopic(request, topic.id);
       expect(latest).toEqual(expect.objectContaining({ title: remoteTitle, duration: 45, participantCount: 1 }));
@@ -442,6 +471,37 @@ test.describe('议题管理工作台', () => {
     } finally {
       await deleteLatestTopic(request, topic.id);
     }
+  });
+
+  test('普通表单请求错误保留输入、聚焦说明且不自动重试', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('button', { name: /发起议题/ }).first().click();
+    const dialog = page.getByRole('dialog', { name: '发起一个新议题' });
+    await dialog.getByLabel('议题标题').fill('客户端错误保留的议题草稿');
+    await dialog.getByLabel('一句话简介').fill('错误发生后仍应留在当前表单。');
+    await dialog.getByLabel('你的名字').fill('恢复测试');
+    let requestCount = 0;
+    await page.route('**/api/topics', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
+      requestCount += 1;
+      return route.fulfill({
+        status: 415,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'UNSUPPORTED_MEDIA_TYPE', message: '提交格式不受支持，请使用 JSON' }),
+      });
+    });
+    await dialog.getByRole('button', { name: '发布议题' }).click();
+    const alert = dialog.getByRole('alert');
+    await expect(alert).toHaveText('提交格式不受支持，请使用 JSON；内容已保留，未提交');
+    await expect(alert).toBeFocused();
+    await expect(dialog.getByLabel('议题标题')).toHaveValue('客户端错误保留的议题草稿');
+    await expect(dialog.getByLabel('一句话简介')).toHaveValue('错误发生后仍应留在当前表单。');
+    await expect(dialog.getByLabel('你的名字')).toHaveValue('恢复测试');
+    await expect(dialog.getByRole('button', { name: '发布议题' })).toBeEnabled();
+    await expect(page.getByRole('dialog', { name: '输入围炉口令' })).toHaveCount(0);
+    expect(requestCount).toBe(1);
+    await page.unroute('**/api/topics');
+    await dialog.getByRole('button', { name: '关闭' }).click();
   });
 
   test('自荐发布并可逐步撤销排期和认领', async ({ page }, testInfo) => {
@@ -893,22 +953,40 @@ test.describe('议题管理工作台', () => {
     await clickCollaborationState(page, '退出协作');
     await expectCollaborationState(page, '解锁协作');
     await page.getByRole('button', { name: /发起议题/ }).first().click();
-    accessDialog = page.getByRole('dialog');
+    const createDialog = page.getByRole('dialog', { name: '发起一个新议题' });
+    await expect(createDialog).toBeVisible();
+    await expect(page.getByRole('dialog', { name: '解锁围炉协作' })).toHaveCount(0);
+    await expect(createDialog.getByRole('status')).toContainText('可以先填写草稿');
+    const retainedTitle = `口令失效表单保留-${marker}`;
+    await createDialog.getByLabel('议题标题').fill(retainedTitle);
+    await createDialog.getByLabel('一句话简介').fill('第一次提交因口令失效而失败，重新解锁后由用户再次确认。');
+    await createDialog.getByLabel('你的名字').fill('协作测试者');
+    let createRequestCount = 0;
+    page.on('request', (outgoing) => {
+      if (outgoing.method() === 'POST' && outgoing.url().endsWith('/api/topics')) createRequestCount += 1;
+    });
+    await createDialog.getByRole('button', { name: '发布议题' }).click();
+    accessDialog = page.getByRole('dialog', { name: '解锁围炉协作' });
+    await expect(accessDialog).toContainText('议题草稿已保留且尚未提交');
+    expect(createRequestCount).toBe(0);
     await accessDialog.getByLabel('围炉口令').fill(writeKey);
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
-    const retainedTitle = `口令失效表单保留-${marker}`;
-    await page.getByLabel('议题标题').fill(retainedTitle);
-    await page.getByLabel('一句话简介').fill('第一次提交因口令失效而失败，重新解锁后由用户再次确认。');
-    await page.getByLabel('你的名字').fill('协作测试者');
+    await expect(createDialog.getByLabel('议题标题')).toHaveValue(retainedTitle);
+    await expect(createDialog.getByRole('button', { name: '发布议题' })).toBeFocused();
+    expect(createRequestCount).toBe(0);
+
     await page.evaluate(() => sessionStorage.setItem('fireside-collaboration-session-v1', 'expired-session'));
-    await page.getByRole('button', { name: '发布议题' }).click();
+    await createDialog.getByRole('button', { name: '发布议题' }).click();
     accessDialog = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: '解锁围炉协作' }) });
     await expect(accessDialog).toBeVisible();
-    await expect(page.locator('input[name="title"]')).toHaveValue(retainedTitle);
+    await expect(createDialog.getByLabel('议题标题')).toHaveValue(retainedTitle);
+    expect(createRequestCount).toBe(1);
     await accessDialog.getByLabel('围炉口令').fill(writeKey);
     await accessDialog.getByRole('button', { name: '解锁协作' }).click();
-    await expect(page.locator('input[name="title"]')).toHaveValue(retainedTitle);
-    await page.getByRole('button', { name: '发布议题' }).click();
+    await expect(createDialog.getByLabel('议题标题')).toHaveValue(retainedTitle);
+    expect(createRequestCount).toBe(1);
+    await createDialog.getByRole('button', { name: '发布议题' }).click();
+    expect(createRequestCount).toBe(2);
     await expect(page.getByRole('heading', { name: retainedTitle, exact: true })).toBeVisible();
 
     const allTopics = await request.get('/api/topics');
@@ -916,6 +994,99 @@ test.describe('议题管理工作台', () => {
       .filter((item) => item.title === protectedTitle || item.title === retainedTitle)
       .map(({ id }) => id);
     await Promise.all(cleanupIds.map((id) => deleteLatestTopic(request, id)));
+  });
+
+  test('解锁协作与发起议题在锁定状态进入不同任务', async ({ page, request }, testInfo) => {
+    const title = `入口分离-${testInfo.project.name}-${Date.now()}`;
+    let createdId: number | null = null;
+    await page.goto('/');
+    await page.evaluate(() => {
+      localStorage.setItem('e2e-force-locked', '1');
+      sessionStorage.removeItem('fireside-collaboration-session-v1');
+    });
+    await page.reload();
+    await expectCollaborationState(page, '解锁协作');
+
+    await clickCollaborationState(page, '解锁协作');
+    const accessDialog = page.getByRole('dialog', { name: '解锁围炉协作' });
+    await expect(accessDialog).toBeVisible();
+    await expect(page.getByRole('dialog', { name: '发起一个新议题' })).toHaveCount(0);
+    await accessDialog.getByRole('button', { name: '关闭' }).click();
+    if (testInfo.project.name === 'mobile') await expect(page.getByRole('button', { name: '菜单', exact: true })).toBeFocused();
+    else await expect(page.locator('.desktop-nav').getByRole('button', { name: '解锁协作', exact: true })).toBeFocused();
+
+    await page.getByRole('button', { name: /发起议题|^发起$/ }).first().click();
+    const createDialog = page.getByRole('dialog', { name: '发起一个新议题' });
+    await expect(createDialog).toBeVisible();
+    await expect(page.getByRole('dialog', { name: '解锁围炉协作' })).toHaveCount(0);
+    await expect(createDialog.getByLabel('议题标题')).toBeFocused();
+    await expect(createDialog).toContainText('可以先填写草稿；发布时再用围炉口令解锁');
+    await createDialog.getByLabel('议题标题').fill(title);
+    await createDialog.getByLabel('一句话简介').fill('先整理草稿，再在真正发布时解锁。');
+    await createDialog.getByLabel('你的名字').fill('入口测试者');
+    await createDialog.getByLabel('标签（最多 5 个）').fill('入口, 草稿');
+    await createDialog.getByLabel('我来分享').check();
+    const submit = createDialog.getByRole('button', { name: '发布议题' });
+    let createRequests = 0;
+    page.on('request', (outgoing) => {
+      if (outgoing.method() === 'POST' && outgoing.url().endsWith('/api/topics')) createRequests += 1;
+    });
+
+    async function expectDraft() {
+      await expect(createDialog.getByLabel('议题标题')).toHaveValue(title);
+      await expect(createDialog.getByLabel('一句话简介')).toHaveValue('先整理草稿，再在真正发布时解锁。');
+      await expect(createDialog.getByLabel('你的名字')).toHaveValue('入口测试者');
+      await expect(createDialog.getByLabel('标签（最多 5 个）')).toHaveValue('入口, 草稿');
+      await expect(createDialog.getByLabel('我来分享')).toBeChecked();
+      await expect(submit).toBeFocused();
+      expect(createRequests).toBe(0);
+    }
+    async function openDraftAccess() {
+      await submit.click();
+      const dialog = page.getByRole('dialog', { name: '解锁围炉协作' });
+      await expect(page.locator('[role="dialog"]')).toHaveCount(2);
+      await expect(createDialog).toHaveAttribute('inert', '');
+      await expect(dialog).toContainText('议题草稿已保留且尚未提交');
+      expect(createRequests).toBe(0);
+      return dialog;
+    }
+
+    let draftAccess = await openDraftAccess();
+    await draftAccess.getByLabel('围炉口令').fill('五字口令呀');
+    await draftAccess.getByRole('button', { name: '解锁协作' }).click();
+    await expect(draftAccess.getByRole('alert')).toContainText('围炉口令至少需要 6 个字符');
+    expect(createRequests).toBe(0);
+    await draftAccess.getByRole('button', { name: '关闭' }).click();
+    await expectDraft();
+
+    draftAccess = await openDraftAccess();
+    await page.locator('.access-backdrop').click({ position: { x: 2, y: 2 } });
+    await expectDraft();
+
+    draftAccess = await openDraftAccess();
+    await page.keyboard.press('Escape');
+    await expectDraft();
+
+    draftAccess = await openDraftAccess();
+    await draftAccess.getByLabel('围炉口令').fill(writeKey);
+    await draftAccess.getByRole('button', { name: '解锁协作' }).click();
+    await expectDraft();
+
+    try {
+      const created = page.waitForResponse((response) => response.url().endsWith('/api/topics')
+        && response.request().method() === 'POST' && response.status() === 201);
+      await submit.click();
+      const createdResponse = await created;
+      createdId = ((await createdResponse.json()) as { id: number }).id;
+      expect(createRequests).toBe(1);
+      const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+      await expect(card).toContainText('已被认领');
+      await expect(card).toContainText('分享 · 入口测试者');
+      await expect(card.locator('.topic-tags')).toContainText('入口');
+      await expect(card.locator('.topic-tags')).toContainText('草稿');
+    } finally {
+      if (createdId !== null) await deleteLatestTopic(request, createdId);
+    }
   });
 
   test('旧口令不迁移，刷新校验临时会话且退出清理敏感弹窗', async ({ page, request }, testInfo) => {
@@ -1132,11 +1303,8 @@ test.describe('议题管理工作台', () => {
       await expect(accessDialog).toHaveCount(0);
       await expect(businessDialog.locator('input[name="title"]')).toHaveValue(draftTitle);
 
-      const rejectedAgain = page.waitForResponse((response) => response.url().endsWith('/api/topics')
-        && response.request().method() === 'POST' && response.status() === 401);
       await submitButton.click();
-      await rejectedAgain;
-      expect(createRequests).toHaveLength(2);
+      expect(createRequests).toHaveLength(1);
       accessDialog = page.locator('.access-modal[role="dialog"]');
       await expect(accessDialog.getByRole('alert')).toContainText('请等待');
       await expect(accessDialog.locator('button[type="submit"]')).toBeDisabled();
@@ -1146,7 +1314,7 @@ test.describe('议题管理工作台', () => {
       await expect(accessDialog.getByLabel('围炉口令')).toBeFocused();
       await expect(accessDialog.locator('button[type="submit"]')).toBeEnabled();
       expect(verifyRequests).toBe(3);
-      expect(createRequests).toHaveLength(2);
+      expect(createRequests).toHaveLength(1);
 
       await accessDialog.getByLabel('围炉口令').fill(writeKey);
       const unlocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 200);
@@ -1155,14 +1323,14 @@ test.describe('议题管理工作台', () => {
       verifyRequests += 1;
       await expect(accessDialog).toHaveCount(0);
       await expect(businessDialog.locator('input[name="title"]')).toHaveValue(draftTitle);
-      expect(createRequests).toHaveLength(2);
+      expect(createRequests).toHaveLength(1);
 
       const created = page.waitForResponse((response) => response.url().endsWith('/api/topics')
         && response.request().method() === 'POST' && response.status() === 201);
       await submitButton.click();
       const createdResponse = await created;
       createdIds.push(((await createdResponse.json()) as { id: number }).id);
-      expect(createRequests).toHaveLength(3);
+      expect(createRequests).toHaveLength(2);
       expect(verifyRequests).toBe(4);
       await expect(page.getByRole('heading', { name: draftTitle, exact: true })).toBeVisible();
     } finally {
@@ -1261,6 +1429,15 @@ test.describe('议题管理工作台', () => {
       await expect(accessDialog.getByLabel('围炉口令')).toBeFocused();
       return accessDialog;
     }
+    async function openAccessFromLockedDraft() {
+      await submitButton.click();
+      const accessDialog = page.locator('.access-modal[role="dialog"]');
+      await expect(page.locator('[role="dialog"]')).toHaveCount(2);
+      await expect(businessDialog).toHaveAttribute('inert', '');
+      await expect(accessDialog).toContainText('议题草稿已保留且尚未提交');
+      await expect(accessDialog.getByLabel('围炉口令')).toBeFocused();
+      return accessDialog;
+    }
     async function expectDraftAfterAccessClose() {
       await expect(page.locator('[role="dialog"]')).toHaveCount(1);
       await expect(businessDialog).not.toHaveAttribute('inert', '');
@@ -1278,8 +1455,8 @@ test.describe('议题管理工作台', () => {
       await accessDialog.getByRole('button', { name: '关闭' }).click();
       await expectDraftAfterAccessClose();
 
-      accessDialog = await openAccessFromReal401();
-      expect(createRequests).toHaveLength(2);
+      accessDialog = await openAccessFromLockedDraft();
+      expect(createRequests).toHaveLength(1);
       await accessDialog.getByLabel('围炉口令').fill('wrong-key');
       const wrongKey = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 401);
       await accessDialog.getByRole('button', { name: '解锁协作' }).click();
@@ -1294,22 +1471,22 @@ test.describe('议题管理工作台', () => {
       await page.locator('.access-backdrop').click({ position: { x: 2, y: 2 } });
       await expectDraftAfterAccessClose();
 
-      accessDialog = await openAccessFromReal401();
-      expect(createRequests).toHaveLength(3);
+      accessDialog = await openAccessFromLockedDraft();
+      expect(createRequests).toHaveLength(1);
       await accessDialog.getByLabel('围炉口令').fill(writeKey);
       const unlocked = page.waitForResponse((response) => response.url().endsWith('/api/access/verify') && response.status() === 200);
       await accessDialog.getByRole('button', { name: '解锁协作' }).click();
       await unlocked;
       await expectDraftAfterAccessClose();
       await page.waitForTimeout(250);
-      expect(createRequests).toHaveLength(3);
+      expect(createRequests).toHaveLength(1);
 
       const created = page.waitForResponse((response) => response.url().endsWith('/api/topics')
         && response.request().method() === 'POST' && response.status() === 201);
       await submitButton.click();
       const createdResponse = await created;
       createdId = ((await createdResponse.json()) as { id: number }).id;
-      expect(createRequests).toHaveLength(4);
+      expect(createRequests).toHaveLength(2);
       await expect(page.locator('[role="dialog"]')).toHaveCount(0);
       await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
       await expect.poll(() => page.evaluate(() => document.body.style.overflow)).toBe('visible');

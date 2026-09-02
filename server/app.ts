@@ -18,6 +18,34 @@ import type { Topic } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
+const requestBodyLimit = 1024 * 1024;
+const parserErrorResponses = {
+  FST_ERR_CTP_EMPTY_JSON_BODY: {
+    status: 400,
+    code: 'INVALID_JSON_BODY',
+    message: '提交内容不是有效的 JSON，请检查后重试',
+  },
+  FST_ERR_CTP_INVALID_JSON_BODY: {
+    status: 400,
+    code: 'INVALID_JSON_BODY',
+    message: '提交内容不是有效的 JSON，请检查后重试',
+  },
+  FST_ERR_CTP_INVALID_MEDIA_TYPE: {
+    status: 415,
+    code: 'UNSUPPORTED_MEDIA_TYPE',
+    message: '提交格式不受支持，请使用 JSON',
+  },
+  FST_ERR_CTP_BODY_TOO_LARGE: {
+    status: 413,
+    code: 'REQUEST_BODY_TOO_LARGE',
+    message: '提交内容过大，请精简后重试',
+  },
+  FST_ERR_CTP_INVALID_CONTENT_LENGTH: {
+    status: 400,
+    code: 'INVALID_REQUEST_BODY',
+    message: '请求内容不完整，请重新提交',
+  },
+} as const;
 
 const nonEmptyText = (label: string, max = 120) => z.string().trim().min(1, `${label}不能为空`).max(max, `${label}不能超过 ${max} 个字符`);
 const createTopicSchema = z.object({
@@ -102,6 +130,7 @@ function validationMessage(error: z.ZodError) {
 
 export function buildApp(options: AppOptions = {}) {
   const app = Fastify({
+    bodyLimit: requestBodyLimit,
     trustProxy: false,
     logger: options.logger ? {
       redact: ['req.headers.x-fireside-write-key', 'req.headers.x-fireside-session'],
@@ -130,14 +159,24 @@ export function buildApp(options: AppOptions = {}) {
   app.addHook('onClose', async () => db.close());
 
   app.addHook('onRequest', async (request, reply) => {
-    if (!writeKey) return;
     const routePattern = request.routeOptions.url;
+    const isVerify = request.method === 'POST' && routePattern === '/api/access/verify';
+    if (isVerify) {
+      reply.header('Cache-Control', 'no-store');
+      if (!writeKey) return;
+      const preflight = authRateLimiter.preflight(normalizeClientIp(request.ip));
+      if (preflight.limited) {
+        reply.header('Retry-After', String(preflight.retryAfter));
+        return reply.code(429).send({ code: 'ACCESS_RATE_LIMITED', message: '尝试过于频繁，请稍后再试' });
+      }
+      return;
+    }
+    if (!writeKey) return;
     const sensitiveRead = ['GET', 'HEAD'].includes(request.method) && (
       routePattern === '/api/access/session'
       || routePattern === '/api/topics/:id/participants'
       || routePattern === '/api/topics/:id/meeting-access'
     );
-    const isVerify = request.method === 'POST' && routePattern === '/api/access/verify';
     const businessWrite = ['POST', 'PATCH', 'DELETE'].includes(request.method)
       && !isVerify;
     if (!sensitiveRead && !businessWrite) return;
@@ -216,14 +255,8 @@ export function buildApp(options: AppOptions = {}) {
   }));
   app.get('/api/access', async () => ({ enabled: Boolean(writeKey) }));
   app.post('/api/access/verify', async (request, reply) => {
-    reply.header('Cache-Control', 'no-store');
     if (!writeKey) return reply.code(204).send();
     const source = normalizeClientIp(request.ip);
-    const preflight = authRateLimiter.preflight(source);
-    if (preflight.limited) {
-      reply.header('Retry-After', String(preflight.retryAfter));
-      return reply.code(429).send({ code: 'ACCESS_RATE_LIMITED', message: '尝试过于频繁，请稍后再试' });
-    }
     const header = request.headers['x-fireside-write-key'];
     const encodingHeader = request.headers['x-fireside-write-key-encoding'];
     const candidate = decodeWriteKeyHeader(
@@ -731,9 +764,17 @@ export function buildApp(options: AppOptions = {}) {
     return reply.code(204).send();
   });
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
+    const errorCode = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : '';
+    const parserResponse = parserErrorResponses[errorCode as keyof typeof parserErrorResponses];
+    if (parserResponse) {
+      if (request.routeOptions.url === '/api/access/verify') reply.header('Cache-Control', 'no-store');
+      return reply.code(parserResponse.status).send({ code: parserResponse.code, message: parserResponse.message });
+    }
     app.log.error(error);
-    reply.code(500).send({ message: '炉火晃了一下，请稍后再试' });
+    return reply.code(500).send({ message: '炉火晃了一下，请稍后再试' });
   });
 
   if (options.serveStatic ?? true) {

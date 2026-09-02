@@ -1018,12 +1018,14 @@ function MeetingModal({ topic, onClose, onConflict, unlockVersion, now }: {
   </div>;
 }
 
-function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
+function Modal({ kind, topic, onClose, onComplete, onConflict, onRequireAccess, canCollaborate, now }: {
   kind: ModalKind;
   topic: Topic | null;
   onClose: () => void;
   onComplete: (message: string) => void;
   onConflict?: (message: string, topicMissing?: boolean) => void;
+  onRequireAccess: (kind: ModalKind) => void;
+  canCollaborate: boolean;
   now: Date;
 }) {
   const [submitting, setSubmitting] = useState(false);
@@ -1041,6 +1043,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
   const [revisionConflictAttempt, setRevisionConflictAttempt] = useState(0);
   const revisionConflictRef = useRef<HTMLDivElement>(null);
   const rescheduleConfirmRef = useRef<HTMLHeadingElement>(null);
+  const submissionErrorRef = useRef<HTMLDivElement>(null);
   const editSubmitRef = useRef<HTMLButtonElement>(null);
   const editFormRef = useRef<HTMLFormElement>(null);
   const conflictCloseHandled = useRef(false);
@@ -1101,6 +1104,23 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
     const frame = window.requestAnimationFrame(() => rescheduleConfirmRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [pendingEdit]);
+
+  useEffect(() => {
+    if (!error) return;
+    const frame = window.requestAnimationFrame(() => {
+      submissionErrorRef.current?.focus();
+      submissionErrorRef.current?.scrollIntoView({ block: 'nearest' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [error]);
+
+  function submissionErrorMessage(err: unknown) {
+    const message = err instanceof Error ? err.message : '提交失败，请稍后重试';
+    if (err instanceof ApiError && [400, 413, 415, 500].includes(err.status)) {
+      return `${message}；内容已保留，未提交`;
+    }
+    return message;
+  }
 
   function editPayload(data: FormData) {
     const base = editBase ?? topic;
@@ -1223,16 +1243,17 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
       await api.update(topic.id, editRevision, confirmation.payload);
       onComplete(`改期已保存，${confirmation.participantCount} 位伙伴仍保留报名，请另行通知`);
     } catch (err) {
-      setPendingEdit(null);
       if (err instanceof ApiError && err.status === 412 && err.code === 'TOPIC_REVISION_CONFLICT') {
+        setPendingEdit(null);
         await recoverEditConflict(err, confirmation.payload);
         return;
       }
       if (err instanceof ApiError && err.status === 409 && onConflict) {
+        setPendingEdit(null);
         onConflict(err.message);
         return;
       }
-      setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
+      setError(submissionErrorMessage(err));
       setSubmitting(false);
     }
   }
@@ -1244,6 +1265,10 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!canCollaborate) {
+      onRequireAccess(kind);
+      return;
+    }
     setSubmitting(true);
     setError('');
     const data = new FormData(event.currentTarget);
@@ -1326,7 +1351,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
         onConflict('议题已由其他协作者删除，无需重复操作', true);
         return;
       }
-      setError(err instanceof Error ? err.message : '提交失败，请稍后重试');
+      setError(submissionErrorMessage(err));
       setSubmitting(false);
     }
   }
@@ -1349,7 +1374,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
             </div>)}
           </dl>
           <p className="reschedule-notice" role="note">系统不会自动通知报名伙伴，请确认已通过其他方式通知。</p>
-          {error && <div className="form-error" role="alert">{error}</div>}
+          {error && <div ref={submissionErrorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
           <div className="reschedule-actions">
             <button type="button" className="btn" onClick={returnToEdit} disabled={submitting}>返回修改</button>
             <button type="button" className="submit-btn" onClick={() => void confirmReschedule()} disabled={submitting}>{submitting ? '正在保存…' : '确认保存并另行通知'}{!submitting && <ChevronRight size={17} />}</button>
@@ -1357,6 +1382,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
         </section>}
 
         <form key={kind === 'edit' ? editDraftVersion : undefined} ref={kind === 'edit' ? editFormRef : undefined} onSubmit={submit} hidden={Boolean(pendingEdit)} aria-hidden={pendingEdit ? 'true' : undefined}>
+          {kind === 'create' && !canCollaborate && <div className="phase-lock-note" role="status">可以先填写草稿；发布时再用围炉口令解锁，系统不会自动提交。</div>}
           {kind === 'create' && <>
             <label>议题标题<input name="title" required maxLength={80} placeholder="最近有什么让你停下来多看了一眼？" autoFocus data-initial-focus /></label>
             <label>一句话简介<textarea name="summary" required maxLength={500} rows={4} placeholder="它为什么值得一起聊聊？你想从哪里开始探索？" /></label>
@@ -1412,7 +1438,7 @@ function Modal({ kind, topic, onClose, onComplete, onConflict, now }: {
           {kind === 'unschedule' && topic && <div className="delete-warning neutral"><CalendarX2 size={19} /><p><strong>{topic.title}</strong><span>{endedReset ? '该操作会清空旧报名、排期、地点与会议入口；分享人和议题内容保留，随后可重新排期。' : '日历事件与现有报名会被移除，分享人和议题内容继续保留。'}</span></p></div>}
           {kind === 'unarchive' && topic && <div className="delete-warning neutral"><RotateCcw size={19} /><p><strong>{topic.title}</strong><span>原排期继续保留；收获摘要、资料链接和归档时间会被清空。</span></p></div>}
           {revisionConflict && <div ref={revisionConflictRef} className="form-error" role="alert" tabIndex={-1}>{revisionConflict}</div>}
-          {error && <div className="form-error" role="alert">{error}</div>}
+          {error && !pendingEdit && <div ref={submissionErrorRef} className="form-error" role="alert" tabIndex={-1}>{error}</div>}
           {kind === 'delete' ? <div className="delete-actions">
             <button type="button" className="btn" data-initial-focus onClick={closeModal} disabled={submitting}>取消</button>
             <button className="submit-btn delete-submit" disabled={submitting} type="submit">
@@ -1641,7 +1667,22 @@ export default function App() {
     setAccessMessage('输入团队共享口令后，即可创建、认领、排期与维护议题。');
     setAccessModalOpen(true);
   }
+  function requireAccessForRetainedForm(kind: ModalKind) {
+    if (!accessReady) {
+      setToast('正在确认协作状态，请稍候再试');
+      return;
+    }
+    pendingAccessAction.current = null;
+    setAccessMessage(kind === 'create'
+      ? '议题草稿已保留且尚未提交。解锁后请返回表单，确认内容并再次点击发布。'
+      : '当前表单内容已保留且尚未提交。解锁后请确认内容并再次提交。');
+    setAccessModalOpen(true);
+  }
   function openAction(kind: ModalKind, topic: Topic | null = null) {
+    if (kind === 'create') {
+      setModal({ kind, topic: null });
+      return;
+    }
     requireAccess(async () => {
       const requestEpoch = accessEpoch.current;
       let editableTopic = topic;
@@ -2007,7 +2048,7 @@ export default function App() {
 
     {mobileNavOpen && <MobileNavigation active={activeDestination} onClose={() => setMobileNavOpen(false)} onNavigate={navigate} accessReady={accessReady} accessEnabled={accessEnabled} canCollaborate={canCollaborate} onAccess={() => { setMobileNavOpen(false); window.requestAnimationFrame(openAccess); }} />}
     {activityTopic && <ActivityDetailsModal topic={activityTopic} onClose={() => setActivityTopic(null)} onTopicSync={mergeTopic} onPageSync={() => void load()} onParticipants={openParticipants} onMeeting={openMeeting} onPoster={setPosterTopic} onAction={openAction} now={now} />}
-    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message, modal.kind)} onConflict={(message, topicMissing) => void resolveConflict(message, modal.kind, modal.topic?.id, topicMissing)} now={now} />}
+    {modal && <Modal kind={modal.kind} topic={modal.topic} onClose={() => setModal(null)} onComplete={(message) => void complete(message, modal.kind)} onConflict={(message, topicMissing) => void resolveConflict(message, modal.kind, modal.topic?.id, topicMissing)} onRequireAccess={requireAccessForRetainedForm} canCollaborate={canCollaborate} now={now} />}
     {participantsTopic && <ParticipantsModal topic={participantsTopic} onClose={() => setParticipantsTopic(null)} onChanged={() => void load()} onConflict={(message) => void resolveParticipantConflict(message)} unlockVersion={unlockVersion} now={now} />}
     {posterTopic && <PosterModal topic={posterTopic} onClose={() => setPosterTopic(null)} onSync={() => void load()} />}
     {meetingTopic && <MeetingModal topic={meetingTopic} onClose={() => setMeetingTopic(null)} onConflict={(message) => void resolveMeetingConflict(message)} unlockVersion={unlockVersion} now={now} />}

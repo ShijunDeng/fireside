@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
+import { createConnection } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, afterEach, before, describe, it } from 'node:test';
@@ -294,6 +296,11 @@ describe('围炉夜话 API', () => {
       assert.equal(response.json().code, 'RELEASE_IN_PROGRESS');
       assert.equal(response.headers['retry-after'], '3');
     }
+    const malformedDuringRelease = await guardedApp.inject({
+      method: 'POST', url: '/api/topics', headers: { ...sessionHeaders, 'content-type': 'application/json' }, payload: '{',
+    });
+    assert.equal(malformedDuringRelease.statusCode, 503, '发布写屏障必须先于正文解析');
+    assert.equal(malformedDuringRelease.json().code, 'RELEASE_IN_PROGRESS');
     assert.deepEqual((await guardedApp.inject({ method: 'GET', url: '/api/topics' })).json(), []);
 
     writesAllowed = true;
@@ -305,6 +312,295 @@ describe('围炉夜话 API', () => {
     });
     assert.equal(created.statusCode, 201);
     await guardedApp.close();
+  });
+
+  it('将五类请求解析错误映射为稳定安全响应并保持全部业务数据不变', async () => {
+    const writeKey = 'request-parser-contract-key';
+    let logs = '';
+    const parserApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date('2026-09-02T10:00:00.000Z'),
+      logger: true,
+      loggerStream: { write: (message) => { logs += message; } },
+    });
+    await parserApp.ready();
+    const issued = await issueSession(parserApp, writeKey);
+    const headers = { 'x-fireside-session': issued.sessionToken };
+    const created = await parserApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '解析错误不变式', summary: '任何解析拒绝都不能改变议题。', proposer: '协议测试', presenter: '协议测试', tags: ['契约'] },
+    });
+    assert.equal(created.statusCode, 201);
+    const scheduled = await parserApp.inject({
+      method: 'POST', url: `/api/topics/${created.json().id}/schedule`, headers: { ...headers, ...ifMatch(created.json().revision) },
+      payload: { scheduledAt: '2026-09-02T11:00:00.000Z', duration: 60, room: '围炉会议室', meetingUrl: '' },
+    });
+    assert.equal(scheduled.statusCode, 200);
+    assert.equal((await parserApp.inject({
+      method: 'POST', url: `/api/topics/${created.json().id}/participants`, headers, payload: { name: '报名伙伴' },
+    })).statusCode, 201);
+
+    const beforeTopics = await parserApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const beforeParticipants = await parserApp.inject({ method: 'GET', url: `/api/topics/${created.json().id}/participants`, headers });
+    const baselineTopic = beforeTopics.json()[0] as { id: number; revision: number; [key: string]: unknown };
+    const parserCases = [
+      {
+        name: '空 JSON',
+        options: { headers: { ...headers, 'content-type': 'application/json' }, payload: '' },
+        status: 400, code: 'INVALID_JSON_BODY', message: '提交内容不是有效的 JSON，请检查后重试',
+      },
+      {
+        name: '畸形 JSON',
+        options: { headers: { ...headers, 'content-type': 'application/json' }, payload: '{' },
+        status: 400, code: 'INVALID_JSON_BODY', message: '提交内容不是有效的 JSON，请检查后重试',
+      },
+      {
+        name: '错误媒体类型',
+        options: { headers: { ...headers, 'content-type': 'application/xml' }, payload: '<topic />' },
+        status: 415, code: 'UNSUPPORTED_MEDIA_TYPE', message: '提交格式不受支持，请使用 JSON',
+      },
+      {
+        name: '带长度正文超过 1 MiB',
+        options: { headers: { ...headers, 'content-type': 'application/json' }, payload: `"${'a'.repeat(1024 * 1024 - 1)}"` },
+        status: 413, code: 'REQUEST_BODY_TOO_LARGE', message: '提交内容过大，请精简后重试',
+      },
+      {
+        name: '预声明正文超过 1 MiB',
+        options: { headers: { ...headers, 'content-type': 'application/json', 'content-length': String(1024 * 1024 + 1) }, payload: '{}' },
+        status: 413, code: 'REQUEST_BODY_TOO_LARGE', message: '提交内容过大，请精简后重试',
+      },
+      {
+        name: '正文长度不一致',
+        options: { headers: { ...headers, 'content-type': 'application/json', 'content-length': '20' }, payload: '{}' },
+        status: 400, code: 'INVALID_REQUEST_BODY', message: '请求内容不完整，请重新提交',
+      },
+    ] as const;
+    for (const parserCase of parserCases) {
+      const response = await parserApp.inject({ method: 'POST', url: '/api/topics', ...parserCase.options });
+      assert.equal(response.statusCode, parserCase.status, parserCase.name);
+      assert.deepEqual(response.json(), { code: parserCase.code, message: parserCase.message }, parserCase.name);
+      assert.equal(response.headers['cache-control'], 'no-store', parserCase.name);
+    }
+
+    const exactLimit = await parserApp.inject({
+      method: 'POST', url: '/api/topics',
+      headers: { ...headers, 'content-type': 'application/json' },
+      payload: `"${'a'.repeat(1024 * 1024 - 2)}"`,
+    });
+    assert.equal(exactLimit.statusCode, 400, '恰好 1 MiB 应进入业务校验而不是 413');
+    assert.notEqual(exactLimit.json().code, 'REQUEST_BODY_TOO_LARGE');
+
+    for (const options of [
+      { headers: { 'content-type': 'application/json' }, payload: '{' },
+      { headers: { 'content-type': 'application/xml' }, payload: '<topic />' },
+      { headers: { 'content-type': 'application/json' }, payload: `"${'a'.repeat(1024 * 1024)}"` },
+    ]) {
+      const response = await parserApp.inject({ method: 'POST', url: '/api/topics', ...options });
+      assert.equal(response.statusCode, 401, '会话认证必须先于正文解析');
+      assert.equal(response.json().code, 'ACCESS_SESSION_REQUIRED');
+    }
+
+    for (const revisionHeaders of [{}, { 'if-match': 'not-an-etag' }]) {
+      const response = await parserApp.inject({
+        method: 'PATCH', url: `/api/topics/${created.json().id}`,
+        headers: { ...headers, ...revisionHeaders, 'content-type': 'application/json' }, payload: '{',
+      });
+      assert.equal(response.statusCode, 400, '正文解析必须先于 If-Match');
+      assert.equal(response.json().code, 'INVALID_JSON_BODY');
+    }
+
+    const afterParserTopics = await parserApp.inject({ method: 'GET', url: '/api/topics?sort=manual' });
+    const afterParserParticipants = await parserApp.inject({ method: 'GET', url: `/api/topics/${created.json().id}/participants`, headers });
+    assert.equal(afterParserTopics.body, beforeTopics.body);
+    assert.equal(afterParserTopics.headers['x-order-version'], beforeTopics.headers['x-order-version']);
+    assert.equal(afterParserParticipants.body, beforeParticipants.body);
+
+    const disposable = await parserApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '可安全删除的临时议题', summary: '验证 DELETE 不应错误携带 JSON 类型。', proposer: '协议测试', tags: [] },
+    });
+    const malformedDelete = await parserApp.inject({
+      method: 'DELETE', url: `/api/topics/${disposable.json().id}`,
+      headers: { ...headers, ...ifMatch(disposable.json().revision), 'content-type': 'application/json' }, payload: '',
+    });
+    assert.equal(malformedDelete.statusCode, 400);
+    assert.equal(malformedDelete.json().code, 'INVALID_JSON_BODY');
+    assert.equal((await readTopic(parserApp, disposable.json().id)).revision, disposable.json().revision);
+    assert.equal((await parserApp.inject({
+      method: 'DELETE', url: `/api/topics/${disposable.json().id}`,
+      headers: { ...headers, ...ifMatch(disposable.json().revision) },
+    })).statusCode, 204);
+
+    assert.deepEqual(await readTopic(parserApp, created.json().id), baselineTopic);
+    assert.equal((await parserApp.inject({ method: 'GET', url: `/api/topics/${created.json().id}/participants`, headers })).body, beforeParticipants.body);
+    assert.doesNotMatch(logs, /"level":50.*FST_ERR_CTP/, '预期客户端错误不得写 error 级日志');
+    await parserApp.close();
+  });
+
+  it('在正文解析前执行 verify 限流且坏正文不形成口令 oracle 或失败计数旁路', async () => {
+    let nowMs = Date.parse('2026-09-02T10:00:00.000Z');
+    const writeKey = 'verify-parser-priority-key';
+    const verifyApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      now: () => new Date(nowMs),
+      authRateLimit: { windowMs: 60_000, perSourceLimit: 2, globalLimit: 20 },
+    });
+    await verifyApp.ready();
+    const source = '203.0.113.90';
+    const malformedBodies = await Promise.all([
+      { 'x-fireside-write-key': writeKey },
+      { 'x-fireside-write-key': 'wrong-candidate' },
+      {},
+    ].map((candidateHeaders) => verifyApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { ...candidateHeaders, 'content-type': 'application/json' }, payload: '{',
+    })));
+    for (const response of malformedBodies) {
+      assert.equal(response.statusCode, 400);
+      assert.deepEqual(response.json(), { code: 'INVALID_JSON_BODY', message: '提交内容不是有效的 JSON，请检查后重试' });
+      assert.equal(response.headers['cache-control'], 'no-store');
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const failed = await verifyApp.inject({
+        method: 'POST', url: '/api/access/verify', remoteAddress: source,
+        headers: { 'x-fireside-write-key': `normal-wrong-${attempt}` },
+      });
+      assert.equal(failed.statusCode, 401, '坏正文不得提前消耗口令失败桶');
+    }
+    const blocked = await verifyApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { 'x-fireside-write-key': writeKey, 'content-type': 'application/json' },
+      payload: `"${'a'.repeat(1024 * 1024)}"`,
+    });
+    assert.equal(blocked.statusCode, 429, '已限流来源必须在超限正文解析前拒绝');
+    assert.equal(blocked.json().code, 'ACCESS_RATE_LIMITED');
+    assert.equal(blocked.headers['retry-after'], '60');
+    assert.equal(blocked.headers['cache-control'], 'no-store');
+
+    nowMs += 60_000;
+    assert.equal((await verifyApp.inject({
+      method: 'POST', url: '/api/access/verify', remoteAddress: source,
+      headers: { 'x-fireside-write-key': writeKey },
+    })).statusCode, 200, '窗口恢复后正确口令应正常签发会话');
+    await verifyApp.close();
+  });
+
+  it('真实 HTTP 监听稳定拒绝解析错误与提前断开的正文并保持健康', async () => {
+    const writeKey = 'real-http-parser-key';
+    const httpApp = buildApp({ databasePath: ':memory:', seed: false, serveStatic: false, writeKey });
+    await httpApp.listen({ host: '127.0.0.1', port: 0 });
+    const address = httpApp.server.address();
+    assert.ok(address && typeof address === 'object');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const issued = await issueSession(httpApp, writeKey);
+    const baseline = (await httpApp.inject({ method: 'GET', url: '/api/topics?sort=manual' })).body;
+    const cases = [
+      { body: '', type: 'application/json', status: 400, code: 'INVALID_JSON_BODY' },
+      { body: '{', type: 'application/json', status: 400, code: 'INVALID_JSON_BODY' },
+      { body: '<topic />', type: 'application/xml', status: 415, code: 'UNSUPPORTED_MEDIA_TYPE' },
+      { body: `"${'a'.repeat(1024 * 1024 - 1)}"`, type: 'application/json', status: 413, code: 'REQUEST_BODY_TOO_LARGE' },
+    ] as const;
+    for (const parserCase of cases) {
+      const response = await fetch(`${origin}/api/topics`, {
+        method: 'POST',
+        headers: { 'X-Fireside-Session': issued.sessionToken, 'Content-Type': parserCase.type },
+        body: parserCase.body,
+      });
+      assert.equal(response.status, parserCase.status);
+      assert.equal((await response.json() as { code: string }).code, parserCase.code);
+    }
+
+    const chunkedResponse = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const request = httpRequest(`${origin}/api/topics`, {
+        method: 'POST',
+        headers: { 'X-Fireside-Session': issued.sessionToken, 'Content-Type': 'application/json' },
+      }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body }));
+      });
+      request.on('error', reject);
+      for (let chunk = 0; chunk < 17; chunk += 1) request.write('a'.repeat(64 * 1024));
+      request.end();
+    });
+    assert.equal(chunkedResponse.status, 413, '无 Content-Length 的 chunked 正文越界也必须拒绝');
+    assert.equal((JSON.parse(chunkedResponse.body) as { code: string }).code, 'REQUEST_BODY_TOO_LARGE');
+
+    const rawResponse = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection({ host: '127.0.0.1', port: address.port });
+      let response = '';
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve(response);
+      };
+      const timer = setTimeout(() => {
+        socket.destroy();
+        finish();
+      }, 2_000);
+      socket.setEncoding('utf8');
+      socket.on('connect', () => {
+        socket.write([
+          'POST /api/topics HTTP/1.1',
+          `Host: 127.0.0.1:${address.port}`,
+          `X-Fireside-Session: ${issued.sessionToken}`,
+          'Content-Type: application/json',
+          'Content-Length: 100',
+          'Connection: close',
+          '',
+          '{',
+        ].join('\r\n'));
+        socket.end();
+      });
+      socket.on('data', (chunk) => { response += chunk; });
+      socket.on('end', () => { clearTimeout(timer); finish(); });
+      socket.on('close', () => { clearTimeout(timer); finish(); });
+      socket.on('error', (error) => {
+        clearTimeout(timer);
+        if ((error as NodeJS.ErrnoException).code === 'ECONNRESET') finish();
+        else reject(error);
+      });
+    });
+    assert.ok(rawResponse === '' || /^HTTP\/1\.1 400\b/.test(rawResponse), '提前 EOF 只能安全 400 或关闭连接');
+    assert.equal((await httpApp.inject({ method: 'GET', url: '/api/topics?sort=manual' })).body, baseline);
+    assert.equal((await fetch(`${origin}/api/health`)).status, 200);
+    await httpApp.close();
+  });
+
+  it('未知内部异常保持安全 500、记录错误且不改变议题', async () => {
+    const writeKey = 'internal-error-log-key';
+    const internalMessage = 'internal-update-sentinel';
+    let logs = '';
+    const internalApp = buildApp({
+      databasePath: ':memory:', seed: false, serveStatic: false, writeKey,
+      beforeTopicUpdate: async () => { throw new Error(internalMessage); },
+      logger: true,
+      loggerStream: { write: (message) => { logs += message; } },
+    });
+    await internalApp.ready();
+    const issued = await issueSession(internalApp, writeKey);
+    const headers = { 'x-fireside-session': issued.sessionToken };
+    const created = await internalApp.inject({
+      method: 'POST', url: '/api/topics', headers,
+      payload: { title: '内部异常基线', summary: '失败响应不能泄露内部信息。', proposer: '协议测试', tags: [] },
+    });
+    const before = await readTopic(internalApp, created.json().id);
+    const rejected = await internalApp.inject({
+      method: 'PATCH', url: `/api/topics/${created.json().id}`,
+      headers: { ...headers, ...ifMatch(created.json().revision) }, payload: { title: '不应写入的标题' },
+    });
+    assert.equal(rejected.statusCode, 500);
+    assert.deepEqual(rejected.json(), { message: '炉火晃了一下，请稍后再试' });
+    assert.doesNotMatch(rejected.body, new RegExp(`${internalMessage}|${writeKey}|不应写入的标题`));
+    assert.doesNotMatch(rejected.body, new RegExp(issued.sessionToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(logs, /internal-update-sentinel/);
+    assert.doesNotMatch(logs, new RegExp(writeKey));
+    assert.doesNotMatch(logs, new RegExp(issued.sessionToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.deepEqual(await readTopic(internalApp, created.json().id), before);
+    await internalApp.close();
   });
 
   it('按 TCP 来源和全局滑动窗口限制口令验证且忽略转发头', async () => {
