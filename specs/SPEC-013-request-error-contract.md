@@ -16,6 +16,7 @@
 | 截断/畸形 JSON | `FST_ERR_CTP_INVALID_JSON_BODY` | 500 | 400 |
 | `application/xml` | `FST_ERR_CTP_INVALID_MEDIA_TYPE` | 500 | 415 |
 | body 超过默认 1 MiB | `FST_ERR_CTP_BODY_TOO_LARGE` | 500 | 413 |
+| `Content-Length` 与实际正文不一致 | `FST_ERR_CTP_INVALID_CONTENT_LENGTH` | 500 | 400 |
 
 四条路径均未写入 Topic，但错误反馈违反 SPEC-011 已登记的 `400 / 413 / 415` 页面/API契约。
 
@@ -26,6 +27,7 @@
 - 空或畸形 JSON：`400 { code: "INVALID_JSON_BODY", message: "提交内容不是有效的 JSON，请检查后重试" }`。
 - 不支持的媒体类型：`415 { code: "UNSUPPORTED_MEDIA_TYPE", message: "提交格式不受支持，请使用 JSON" }`。
 - 请求体超过限制：`413 { code: "REQUEST_BODY_TOO_LARGE", message: "提交内容过大，请精简后重试" }`。
+- 请求长度与实际正文不一致：`400 { code: "INVALID_REQUEST_BODY", message: "请求内容不完整，请重新提交" }`。
 - 不回显原始 payload、口令、会话令牌或 Fastify 内部异常文本。
 - 未识别的程序异常继续返回通用 `500`，并记录服务端错误日志。
 
@@ -37,7 +39,7 @@
 
 ## 4. 验收
 
-1. 使用有效会话分别验证空 JSON、畸形 JSON、错误媒体类型和超大 body 的精确状态码、code 与安全文案。
+1. 使用有效会话分别验证空 JSON、畸形 JSON、错误媒体类型、超大 body 和错误 Content-Length 的精确状态码、code 与安全文案。
 2. 验证错误前后的完整公开 Topic 列表、revision/position、`X-Order-Version` 和参与名单一致。
 3. 无效会话叠加畸形 JSON 和超大 body 仍为 401。
 4. 无 body 的 DELETE 若错误携带 JSON Content-Type 返回 400，正确 DELETE 不携带该头仍按业务语义成功。

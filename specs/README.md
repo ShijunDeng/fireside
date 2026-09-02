@@ -40,5 +40,6 @@
 | [SPEC-012](./SPEC-012-runtime-gate-directory-validation.md) | Accepted | 运行态门禁目录校验 |
 | [SPEC-013](./SPEC-013-request-error-contract.md) | Ready | 客户端请求解析错误的稳定状态码、安全反馈与零副作用 |
 | [SPEC-014](./SPEC-014-reschedule-participant-notice.md) | Accepted | 有报名活动改期的影响确认与线下通知责任 |
+| [SPEC-015](./SPEC-015-navigation-destination-layout.md) | Accepted | 吸顶任务导航落点、焦点、当前态与合理排版 |
 
 历史与当前迭代记录见 [迭代日志](./iterations.md)。

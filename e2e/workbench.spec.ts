@@ -115,6 +115,41 @@ async function clickCollaborationState(page: Page, label: '退出协作' | '解�
   await page.getByRole('dialog', { name: '去哪里添柴？' }).getByRole('button', { name: label, exact: true }).click();
 }
 
+async function expectNavigationState(page: Page, label: string, targetSelector: '#topics h2' | '#how h2', useMenu: boolean) {
+  const target = page.locator(targetSelector);
+  await expect(target).toBeFocused();
+  await expect.poll(async () => page.evaluate((selector) => {
+    const heading = document.querySelector<HTMLElement>(selector);
+    const header = document.querySelector<HTMLElement>('.site-header');
+    return heading && header ? Math.round(heading.getBoundingClientRect().top - header.getBoundingClientRect().bottom) : -1;
+  }, targetSelector)).toBeGreaterThanOrEqual(8);
+
+  if (useMenu) {
+    await page.getByRole('button', { name: '菜单', exact: true }).click();
+    const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
+    const current = menu.locator('nav button[aria-current="page"]');
+    await expect(current).toHaveCount(1);
+    await expect(current).toHaveText(label);
+    await menu.getByRole('button', { name: '关闭菜单' }).click();
+  } else {
+    const current = page.locator('.desktop-nav button[aria-current="page"]');
+    await expect(current).toHaveCount(1);
+    await expect(current).toHaveText(label);
+  }
+}
+
+async function expectNavigationArrival(page: Page, label: string, targetSelector: '#topics h2' | '#how h2', useMenu: boolean) {
+  if (useMenu) {
+    await page.getByRole('button', { name: '菜单', exact: true }).click();
+    const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
+    await menu.getByRole('button', { name: label, exact: true }).click();
+    await expect(menu).toHaveCount(0);
+  } else {
+    await page.locator('.desktop-nav').getByRole('button', { name: label, exact: true }).click();
+  }
+  await expectNavigationState(page, label, targetSelector, useMenu);
+}
+
 test.describe('议题管理工作台', () => {
   test.beforeAll(async ({ request }) => {
     collaborationSession = await issueSession(request);
@@ -158,6 +193,56 @@ test.describe('议题管理工作台', () => {
     await expect(page.locator('.week-calendar')).toBeVisible();
   });
 
+  test('五个任务导航落点避开吸顶栏，焦点与当前项保持一致', async ({ page }, testInfo) => {
+    await page.goto('/');
+    const useMenu = testInfo.project.name === 'mobile';
+    const destinations = [
+      ['议题广场', '#topics h2'],
+      ['本周活动', '#topics h2'],
+      ['待归档', '#topics h2'],
+      ['往期回顾', '#topics h2'],
+      ['如何参与', '#how h2'],
+    ] as const;
+    for (const [label, target] of destinations) await expectNavigationArrival(page, label, target, useMenu);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  });
+
+  test('页脚业务导航复用同一落点、焦点和当前态', async ({ page }, testInfo) => {
+    await page.goto('/');
+    const useMenu = testInfo.project.name === 'mobile';
+    const destinations = [
+      ['议题', '议题广场', '#topics h2'],
+      ['活动', '本周活动', '#topics h2'],
+      ['往期', '往期回顾', '#topics h2'],
+      ['如何参与', '如何参与', '#how h2'],
+    ] as const;
+    for (const [footerLabel, currentLabel, target] of destinations) {
+      await page.locator('footer').getByRole('button', { name: footerLabel, exact: true }).click();
+      await expectNavigationState(page, currentLabel, target, useMenu);
+    }
+    await page.locator('.flow-grid > button').filter({ hasText: '认领议题' }).click();
+    await expect(page.locator('#topics h2')).toBeFocused();
+    if (useMenu) {
+      await page.getByRole('button', { name: '菜单', exact: true }).click();
+      const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
+      await expect(menu.locator('nav button[aria-current="page"]')).toHaveCount(0);
+      await menu.getByRole('button', { name: '关闭菜单' }).click();
+    } else {
+      await expect(page.locator('.desktop-nav button[aria-current="page"]')).toHaveCount(0);
+    }
+  });
+
+  test('减少动态效果时任务导航不执行平滑滚动', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'chromium', '媒体偏好只需在桌面项目验证一次');
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('/');
+    await page.locator('.desktop-nav').getByRole('button', { name: '如何参与', exact: true }).click();
+    await expect(page.locator('#how h2')).toBeFocused();
+    const settledPosition = await page.evaluate(() => window.scrollY);
+    await page.waitForTimeout(100);
+    expect(Math.abs(await page.evaluate(() => window.scrollY) - settledPosition)).toBeLessThanOrEqual(1);
+  });
+
   test('移动周历定位今天，核心控件可触达且页面不横向溢出', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'mobile', '本用例验证 Pixel 7 的日期定位和触控尺寸');
     await page.goto('/');
@@ -197,13 +282,14 @@ test.describe('议题管理工作台', () => {
     await page.setViewportSize({ width: 820, height: 1180 });
     await page.goto('/');
     await expect(page.getByRole('button', { name: '菜单', exact: true })).toBeVisible();
-    await page.getByRole('button', { name: '菜单', exact: true }).click();
-    const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
-    await expect(menu.getByRole('button', { name: '议题广场', exact: true })).toBeVisible();
-    await expect(menu.getByRole('button', { name: '待归档', exact: true })).toBeVisible();
-    await expect(menu.getByRole('button', { name: '往期回顾', exact: true })).toBeVisible();
-    await menu.getByRole('button', { name: '议题广场', exact: true }).click();
-    await expect(page.locator('#topics h2')).toBeFocused();
+    const destinations = [
+      ['议题广场', '#topics h2'],
+      ['本周活动', '#topics h2'],
+      ['待归档', '#topics h2'],
+      ['往期回顾', '#topics h2'],
+      ['如何参与', '#how h2'],
+    ] as const;
+    for (const [label, target] of destinations) await expectNavigationArrival(page, label, target, true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 

@@ -687,7 +687,7 @@ function MobileNavigation({ active, onClose, onNavigate, accessReady, accessEnab
     <div ref={dialogRef} className="mobile-nav-modal" role="dialog" aria-modal="true" aria-labelledby="mobile-nav-title" tabIndex={-1} inert={!isTop}>
       <div className="mobile-nav-head"><div><span>FIRESIDE MENU</span><h2 id="mobile-nav-title">去哪里添柴？</h2></div><button className="mobile-nav-close" onClick={onClose} aria-label="关闭菜单"><X size={20} /></button></div>
       <nav aria-label="移动业务导航">
-        {links.map((link, index) => <button key={link.key} data-initial-focus={index === 0 ? true : undefined} aria-current={active === link.key ? 'page' : undefined} onClick={() => { onClose(); window.setTimeout(() => onNavigate(link.key), 0); }}><span>{link.label}</span><ArrowRight size={17} /></button>)}
+        {links.map((link, index) => <button key={link.key} data-initial-focus={index === 0 ? true : undefined} aria-current={active === link.key ? 'page' : undefined} onClick={() => onNavigate(link.key)}><span>{link.label}</span><ArrowRight size={17} /></button>)}
       </nav>
       <button className={`mobile-access ${canCollaborate ? 'unlocked' : ''}`} disabled={!accessReady || (canCollaborate && !accessEnabled)} onClick={onAccess}>{canCollaborate ? <UnlockKeyhole size={16} /> : <LockKeyhole size={16} />}{accessLabel}</button>
     </div>
@@ -1427,6 +1427,8 @@ export default function App() {
   const [posterTopic, setPosterTopic] = useState<Topic | null>(null);
   const [meetingTopic, setMeetingTopic] = useState<Topic | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [activeAnchor, setActiveAnchor] = useState<'how' | null>(null);
+  const focusRequest = useRef(0);
   const [accessReady, setAccessReady] = useState(false);
   const [accessEnabled, setAccessEnabled] = useState(true);
   const [accessUnlocked, setAccessUnlocked] = useState(false);
@@ -1682,24 +1684,37 @@ export default function App() {
   }
   function focusDestination(selector: string) {
     const target = document.querySelector<HTMLElement>(selector);
-    target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const behavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+    target?.scrollIntoView({ behavior, block: 'start' });
     target?.focus({ preventScroll: true });
   }
-  function scrollToTopics() { focusDestination('#topics h2'); }
+  function scheduleDestinationFocus(selector: string) {
+    const request = ++focusRequest.current;
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      if (request === focusRequest.current) focusDestination(selector);
+    }));
+  }
+  function scrollToTopics() {
+    setActiveAnchor(null);
+    scheduleDestinationFocus('#topics h2');
+  }
   function showTopicView(nextTab: Tab, nextView: ViewMode = 'list', keyword = '', nextPhase: ActivityPhase | null = null) {
+    setActiveAnchor(null);
     setTab(nextTab);
     setView(nextView);
     setSearch(keyword);
     setPhaseFilter(nextPhase);
     if (nextView === 'week') setCalendarCursor(new Date());
-    window.requestAnimationFrame(scrollToTopics);
+    scheduleDestinationFocus('#topics h2');
   }
   function selectTab(nextTab: Tab) {
+    setActiveAnchor(null);
     setTab(nextTab);
     setPhaseFilter(null);
     if (nextTab === 'OPEN' || nextTab === 'CLAIMED') setView('list');
   }
   function selectView(nextView: ViewMode) {
+    setActiveAnchor(null);
     setView(nextView);
     setPhaseFilter(null);
     if (nextView !== 'list' && (tab === 'OPEN' || tab === 'CLAIMED')) setTab('SCHEDULED');
@@ -1710,17 +1725,22 @@ export default function App() {
     else if (destination === 'week') showTopicView('SCHEDULED', 'week');
     else if (destination === 'ended') showTopicView('SCHEDULED', 'list', '', 'ENDED');
     else if (destination === 'archived') showTopicView('ARCHIVED');
-    else window.requestAnimationFrame(() => focusDestination('#how h2'));
+    else {
+      setActiveAnchor('how');
+      scheduleDestinationFocus('#how h2');
+    }
   }
-  const activeDestination: NavDestination | null = phaseFilter === 'ENDED'
-    ? 'ended'
-    : tab === 'ARCHIVED' && view === 'list'
-      ? 'archived'
-      : tab === 'SCHEDULED' && view === 'week'
-        ? 'week'
-        : tab === 'ALL' && view === 'list' && !search
-          ? 'topics'
-          : null;
+  const activeDestination: NavDestination | null = activeAnchor === 'how'
+    ? 'how'
+    : phaseFilter === 'ENDED'
+      ? 'ended'
+      : tab === 'ARCHIVED' && view === 'list'
+        ? 'archived'
+        : tab === 'SCHEDULED' && view === 'week'
+          ? 'week'
+          : tab === 'ALL' && view === 'list' && !search
+            ? 'topics'
+            : null;
   function changeSort(nextSort: TopicSort) {
     activeSort.current = nextSort;
     topicRequestId.current += 1;
@@ -1797,7 +1817,7 @@ export default function App() {
           <button aria-current={activeDestination === 'week' ? 'page' : undefined} onClick={() => navigate('week')}>本周活动</button>
           <button aria-current={activeDestination === 'ended' ? 'page' : undefined} onClick={() => navigate('ended')}>待归档</button>
           <button aria-current={activeDestination === 'archived' ? 'page' : undefined} onClick={() => navigate('archived')}>往期回顾</button>
-          <button onClick={() => navigate('how')}>如何参与</button>
+          <button aria-current={activeDestination === 'how' ? 'page' : undefined} onClick={() => navigate('how')}>如何参与</button>
           <button className={`access-button ${canCollaborate ? 'unlocked' : ''}`} disabled={!accessReady || (canCollaborate && !accessEnabled)} onClick={openAccess}>{canCollaborate ? <UnlockKeyhole size={14} /> : <LockKeyhole size={14} />}{accessLabel}</button>
           <button className="nav-cta" onClick={() => openAction('create')}><Plus size={16} /> 发起议题</button>
         </nav>
@@ -1848,7 +1868,7 @@ export default function App() {
           <div className="tabs">
             {tabs.map((item) => <button key={item.key} className={tab === item.key && !phaseFilter ? 'active' : ''} aria-pressed={tab === item.key && !phaseFilter} onClick={() => selectTab(item.key)}>{item.label}</button>)}
           </div>
-          <label className="search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索议题、标签或分享人" /></label>
+          <label className="search"><Search size={16} /><input value={search} onChange={(event) => { setActiveAnchor(null); setSearch(event.target.value); }} placeholder="搜索议题、标签或分享人" /></label>
         </div>
 
         <div className="view-sort-bar">
@@ -1906,7 +1926,7 @@ export default function App() {
 
       <section className="how-wrap" id="how">
         <div className="shell">
-          <div className="section-heading compact"><div><p className="section-kicker">HOW IT WORKS · 如何围炉</p><h2>从一点好奇，到一束火光</h2></div><p>没有复杂流程，也没有专家门槛。</p></div>
+          <div className="section-heading compact"><div><p className="section-kicker">HOW IT WORKS · 如何围炉</p><h2 tabIndex={-1}>从一点好奇，到一束火光</h2></div><p>没有复杂流程，也没有专家门槛。</p></div>
           <div className="flow-grid">
             <button onClick={() => openAction('create')}><span>01</span><i><Lightbulb /></i><h3>创建议题</h3><p>留下一个真问题，告诉大家它为什么让你好奇。</p></button>
             <button onClick={() => showTopicView('OPEN')}><span>02</span><i><UserRoundPlus /></i><h3>认领议题</h3><p>愿意多走一步的人接过火炬，开始做些探索。</p></button>
