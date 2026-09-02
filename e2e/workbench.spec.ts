@@ -90,6 +90,31 @@ async function cleanupPhaseTopics(request: APIRequestContext, ids: number[]) {
   if (failure) throw failure.reason;
 }
 
+async function expectCollaborationState(page: Page, label: '确认协作…' | '退出协作' | '解锁协作', disabled = false) {
+  const desktopControl = page.locator('.desktop-nav').getByRole('button', { name: label, exact: true });
+  if (!await page.getByRole('button', { name: '菜单', exact: true }).isVisible()) {
+    await expect(desktopControl).toBeVisible();
+    if (disabled) await expect(desktopControl).toBeDisabled();
+    return;
+  }
+  await page.getByRole('button', { name: '菜单', exact: true }).click();
+  const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
+  const control = menu.getByRole('button', { name: label, exact: true });
+  await expect(control).toBeVisible();
+  if (disabled) await expect(control).toBeDisabled();
+  await menu.getByRole('button', { name: '关闭菜单' }).click();
+}
+
+async function clickCollaborationState(page: Page, label: '退出协作' | '解锁协作') {
+  const desktopControl = page.locator('.desktop-nav').getByRole('button', { name: label, exact: true });
+  if (!await page.getByRole('button', { name: '菜单', exact: true }).isVisible()) {
+    await desktopControl.click();
+    return;
+  }
+  await page.getByRole('button', { name: '菜单', exact: true }).click();
+  await page.getByRole('dialog', { name: '去哪里添柴？' }).getByRole('button', { name: label, exact: true }).click();
+}
+
 test.describe('议题管理工作台', () => {
   test.beforeAll(async ({ request }) => {
     collaborationSession = await issueSession(request);
@@ -101,29 +126,85 @@ test.describe('议题管理工作台', () => {
       if (localStorage.getItem('e2e-force-locked') !== '1') sessionStorage.setItem(sessionKey, session);
     }, { session: collaborationSession, legacyKey: legacyWriteKeyStorage, sessionKey: collaborationSessionStorage });
   });
-  test('在月历和周历中展示排期，并可从事件进入编辑', async ({ page }) => {
+  test('在月历和周历中展示排期，并先从事件进入公开活动详情', async ({ page }) => {
     await page.goto('/');
     await page.getByRole('button', { name: '月历' }).click();
     await expect(page.locator('.calendar-day')).toHaveCount(42);
     const monthEvent = page.locator('.calendar-event').filter({ hasText: '把一个模糊想法做成可用 Demo' });
     await expect(monthEvent).toBeVisible();
     await monthEvent.click();
+    await expect(page.getByRole('dialog').getByRole('heading', { name: '把一个模糊想法做成可用 Demo' })).toBeVisible();
+    await page.getByRole('button', { name: '编辑维护' }).click();
     await expect(page.getByRole('heading', { name: '编辑议题' })).toBeVisible();
     await expect(page.getByLabel('分享时间')).toHaveValue(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
-    await page.getByRole('button', { name: '关闭' }).click();
+    await page.getByRole('dialog', { name: '编辑议题' }).getByRole('button', { name: '关闭' }).click();
+    await page.getByRole('dialog', { name: '把一个模糊想法做成可用 Demo' }).getByRole('button', { name: '关闭' }).click();
 
     await page.getByRole('button', { name: '周历' }).click();
     await expect(page.locator('.week-day')).toHaveCount(7);
     await expect(page.locator('.week-event').filter({ hasText: '把一个模糊想法做成可用 Demo' })).toBeVisible();
   });
 
-  test('顶部“本周排期”进入当前周，而不是普通列表筛选', async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name === 'mobile', '移动端顶部次级导航按设计隐藏，周历通过视图开关进入');
+  test('顶部“本周活动”进入当前周，而不是普通列表筛选', async ({ page }, testInfo) => {
     await page.goto('/');
-    await page.getByRole('button', { name: '本周排期', exact: true }).click();
+    if (testInfo.project.name === 'mobile') {
+      await page.getByRole('button', { name: '菜单', exact: true }).click();
+      await page.getByRole('dialog').getByRole('button', { name: '本周活动', exact: true }).click();
+    } else {
+      await page.getByRole('button', { name: '本周活动', exact: true }).click();
+    }
     await expect(page.getByRole('button', { name: '周历' })).toHaveClass(/active/);
     await expect(page.getByRole('button', { name: '已排期', exact: true })).toHaveClass(/active/);
     await expect(page.locator('.week-calendar')).toBeVisible();
+  });
+
+  test('移动周历定位今天，核心控件可触达且页面不横向溢出', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', '本用例验证 Pixel 7 的日期定位和触控尺寸');
+    await page.goto('/');
+    await page.getByRole('button', { name: '周历' }).click();
+    const scroll = page.locator('.week-scroll');
+    const today = page.locator('.week-day.today');
+    await expect(today).toBeVisible();
+    await expect.poll(async () => scroll.evaluate((element) => ({ left: element.scrollLeft, width: element.clientWidth }))).not.toEqual({ left: 0, width: 0 });
+    const calendarBounds = await scroll.boundingBox();
+    const todayBounds = await today.boundingBox();
+    expect(calendarBounds).not.toBeNull();
+    expect(todayBounds).not.toBeNull();
+    expect(todayBounds!.x).toBeGreaterThanOrEqual(calendarBounds!.x - 4);
+    expect(todayBounds!.x).toBeLessThan(calendarBounds!.x + calendarBounds!.width);
+    expect(todayBounds!.x + todayBounds!.width).toBeLessThanOrEqual(calendarBounds!.x + calendarBounds!.width + 4);
+
+    const coreControls = [
+      page.getByRole('button', { name: '菜单', exact: true }),
+      page.getByRole('button', { name: '列表', exact: true }),
+      page.getByRole('button', { name: '月历', exact: true }),
+      page.getByRole('button', { name: '周历', exact: true }),
+      page.getByRole('button', { name: '今天', exact: true }),
+      page.getByRole('button', { name: '上一个周期' }),
+      page.getByRole('button', { name: '下一个周期' }),
+    ];
+    for (const control of coreControls) {
+      const bounds = await control.boundingBox();
+      expect(bounds, `控件 ${await control.getAttribute('aria-label') ?? await control.textContent()} 应可触达`).not.toBeNull();
+      expect(bounds!.height).toBeGreaterThanOrEqual(44);
+      expect(bounds!.width).toBeGreaterThanOrEqual(44);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  });
+
+  test('平板宽度使用完整移动菜单且工作区无页面横向溢出', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'chromium', '只需在桌面浏览器项目中切换一次 820px 视口');
+    await page.setViewportSize({ width: 820, height: 1180 });
+    await page.goto('/');
+    await expect(page.getByRole('button', { name: '菜单', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '菜单', exact: true }).click();
+    const menu = page.getByRole('dialog', { name: '去哪里添柴？' });
+    await expect(menu.getByRole('button', { name: '议题广场', exact: true })).toBeVisible();
+    await expect(menu.getByRole('button', { name: '待归档', exact: true })).toBeVisible();
+    await expect(menu.getByRole('button', { name: '往期回顾', exact: true })).toBeVisible();
+    await menu.getByRole('button', { name: '议题广场', exact: true }).click();
+    await expect(page.locator('#topics h2')).toBeFocused();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
 
   test('完成创建、编辑和删除', async ({ page }) => {
@@ -231,6 +312,28 @@ test.describe('议题管理工作台', () => {
 
     await page.getByRole('button', { name: '周历' }).click();
     const weekEvent = page.locator('.week-event').filter({ hasText: title });
+    await expect(weekEvent).toContainText('1 人报名');
+    await weekEvent.getByRole('button', { name: `查看活动 ${title}` }).click();
+    let activityDialog = page.getByRole('dialog', { name: title });
+    await expect(activityDialog).toContainText('1 人报名');
+    await activityDialog.getByRole('button', { name: '报名 / 查看参与' }).click();
+    const weekParticipantDialog = page.getByRole('dialog', { name: '报名参加围炉' });
+    await weekParticipantDialog.getByRole('button', { name: '取消 小林 的报名' }).click();
+    await expect(weekParticipantDialog.getByText('0 人')).toBeVisible();
+    await weekParticipantDialog.getByRole('button', { name: '关闭' }).click();
+    activityDialog = page.getByRole('dialog', { name: title });
+    await expect(activityDialog).toContainText('0 人报名');
+    await activityDialog.getByRole('button', { name: '关闭' }).click();
+    await expect(weekEvent).toContainText('0 人报名');
+
+    await page.getByRole('button', { name: '月历' }).click();
+    const monthEvent = page.locator('.calendar-event').filter({ hasText: title });
+    await expect(monthEvent).toContainText('0 人');
+    await monthEvent.click();
+    await expect(page.getByRole('dialog', { name: title })).toContainText('0 人报名');
+    await page.getByRole('dialog', { name: title }).getByRole('button', { name: '关闭' }).click();
+
+    await page.getByRole('button', { name: '周历' }).click();
     await weekEvent.getByRole('button', { name: '加入会议' }).click();
     meetingDialog = page.getByRole('dialog');
     meetingAccessLink = meetingDialog.getByRole('link', { name: '进入线上会议' });
@@ -435,6 +538,7 @@ test.describe('议题管理工作台', () => {
       await dialog.getByLabel('本期最值得留下的收获').fill(originalArchive.takeaway);
       if (originalArchive.materialUrl) await dialog.getByLabel('资料链接（选填）').fill(originalArchive.materialUrl);
       await dialog.getByRole('button', { name: '完成归档' }).click();
+      await page.getByRole('button', { name: '往期归档', exact: true }).click();
       await expect(seedCard.locator('.status-pill')).toHaveText('已经归档');
 
       const secondUnarchive = await request.post(`/api/topics/${archivedSeed.id}/unarchive`, {
@@ -531,7 +635,7 @@ test.describe('议题管理工作台', () => {
       sessionStorage.removeItem('fireside-collaboration-session-v1');
     });
     await page.reload();
-    await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+    await expectCollaborationState(page, '解锁协作');
     await expect.poll(() => page.evaluate(() => sessionStorage.getItem('fireside-write-key'))).toBeNull();
     await expect(page.locator('body')).not.toContainText('never-public');
     await expect(page.locator('body')).not.toContainText('不公开的报名人');
@@ -548,10 +652,10 @@ test.describe('议题管理工作台', () => {
     const meetingDialog = page.getByRole('dialog');
     await expect(meetingDialog.getByRole('link', { name: '进入线上会议' })).toHaveAttribute('href', secretMeeting);
     await meetingDialog.getByRole('button', { name: '关闭' }).click();
-    await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+    await expectCollaborationState(page, '退出协作');
 
-    await page.getByRole('button', { name: '协作已解锁' }).click();
-    await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+    await clickCollaborationState(page, '退出协作');
+    await expectCollaborationState(page, '解锁协作');
     await page.getByRole('button', { name: /发起议题/ }).first().click();
     accessDialog = page.getByRole('dialog');
     await accessDialog.getByLabel('围炉口令').fill(writeKey);
@@ -599,16 +703,13 @@ test.describe('议题管理工作台', () => {
     try {
       const sessionChecked = page.waitForResponse((response) => response.url().endsWith('/api/access/session') && response.status() === 200);
       await page.goto('/');
-      const confirmingButton = page.getByRole('button', { name: '确认协作…' });
-      await expect(confirmingButton).toBeVisible();
-      await expect(confirmingButton).toBeDisabled();
-      await expect(page.getByRole('button', { name: '协作已解锁' })).toHaveCount(0);
+      await expectCollaborationState(page, '确认协作…', true);
       releaseSessionValidation();
       const sessionResponse = await sessionChecked;
       const headers = sessionResponse.request().headers();
       expect(headers['x-fireside-session']).toBe(collaborationSession);
       expect(headers['x-fireside-write-key']).toBeUndefined();
-      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await expectCollaborationState(page, '退出协作');
       await page.unroute('**/api/access/session');
       expect(await page.evaluate(({ legacyKey, sessionKey }) => ({
         legacy: sessionStorage.getItem(legacyKey),
@@ -620,7 +721,7 @@ test.describe('议题管理工作台', () => {
 
       await page.route(/\/api\/access$/, async (route) => route.abort('failed'));
       await page.reload();
-      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      await expectCollaborationState(page, '解锁协作');
       expect(await page.evaluate((sessionKey) => sessionStorage.getItem(sessionKey), collaborationSessionStorage)).toBeNull();
       await page.unroute(/\/api\/access$/);
 
@@ -632,7 +733,7 @@ test.describe('议题管理工作台', () => {
       await page.reload();
       const refreshedSessionResponse = await refreshedSessionChecked;
       expect(refreshedSessionResponse.request().headers()['x-fireside-session']).toBe(collaborationSession);
-      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await expectCollaborationState(page, '退出协作');
 
       const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
       await card.getByRole('button', { name: '加入会议' }).click();
@@ -641,7 +742,7 @@ test.describe('议题管理工作台', () => {
 
       await page.locator('button.access-button').evaluate((button: HTMLButtonElement) => button.click());
       await expect(meetingDialog).toHaveCount(0);
-      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      await expectCollaborationState(page, '解锁协作');
       await expect(page.locator('body')).not.toContainText(secretMeeting);
       expect(await page.evaluate((sessionKey) => sessionStorage.getItem(sessionKey), collaborationSessionStorage)).toBeNull();
       expect(pageErrors).toEqual([]);
@@ -675,13 +776,13 @@ test.describe('议题管理工作台', () => {
 
     try {
       await page.goto('/');
-      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await expectCollaborationState(page, '退出协作');
       const card = page.locator('.topic-card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
       const delivered = page.waitForResponse((response) => response.url().endsWith(`/api/topics/${topic.id}/meeting-access`));
       await card.getByRole('button', { name: `编辑 ${title}`, exact: true }).click();
       await meetingCaptured;
-      await page.getByRole('button', { name: '协作已解锁' }).click();
-      await expect(page.getByRole('button', { name: '解锁协作' })).toBeVisible();
+      await page.locator('button.access-button').evaluate((button: HTMLButtonElement) => button.click());
+      await expectCollaborationState(page, '解锁协作');
       releaseMeeting();
       await delivered;
       await expect(page.getByRole('heading', { name: '编辑议题' })).toHaveCount(0);
@@ -723,7 +824,7 @@ test.describe('议题管理工作台', () => {
       expect(seededParticipant.status()).toBe(201);
 
       await page.goto('/');
-      await expect(page.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await expectCollaborationState(page, '退出协作');
       await page.getByRole('button', { name: /发起议题/ }).first().click();
       const businessDialog = page.locator('.modal[role="dialog"]:not(.access-modal)');
       const submitButton = businessDialog.locator('button[type="submit"]');
@@ -767,7 +868,7 @@ test.describe('议题管理工作台', () => {
         session: collaborationSession,
       });
       await existingSessionPage.goto('/');
-      await expect(existingSessionPage.getByRole('button', { name: '协作已解锁' })).toBeVisible();
+      await expectCollaborationState(existingSessionPage, '退出协作');
       await existingSessionPage.getByRole('button', { name: /发起议题/ }).first().click();
       const existingBusinessDialog = existingSessionPage.locator('.modal[role="dialog"]:not(.access-modal)');
       await existingBusinessDialog.locator('input[name="title"]').fill(existingSessionTitle);
@@ -1504,7 +1605,7 @@ test.describe('议题管理工作台', () => {
     await flow.getByRole('button', { name: '报名围炉' }).click();
     await expect(page.getByRole('button', { name: '周历' })).toHaveClass(/active/);
     await flow.getByRole('button', { name: '沉淀归档' }).click();
-    await expect(page.getByRole('button', { name: '往期归档', exact: true })).toHaveClass(/active/);
+    await expect(page.getByText(/待归档任务 · \d+ 个结果/)).toBeVisible();
   });
 
   test('月历可展开同日隐藏议题，标签超限不会静默丢弃', async ({ page, request }, testInfo) => {
