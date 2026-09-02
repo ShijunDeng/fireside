@@ -294,8 +294,9 @@ clear_transaction() {
 
 prepare_runtime_root() {
   install -d -o root -g root -m 0755 "${runtime_root}" 8>&- 9>&- || return 1
+  [[ -d ${runtime_root} && ! -L ${runtime_root} ]] || return 1
   if [[ ${test_mode} != 1 ]]; then
-    [[ $(stat -c '%U:%G:%a:%h' -- "${runtime_root}") == root:root:755:1 ]] || return 1
+    [[ $(stat -c '%U:%G:%a' -- "${runtime_root}") == root:root:755 ]] || return 1
   fi
 }
 
