@@ -167,12 +167,12 @@ a { color: inherit; text-decoration: none; }
 .float-chip { position: absolute; z-index: 2; padding: 7px 10px; border: 1px solid rgba(255,255,255,.1); border-radius: 9px; background: rgba(9,11,14,.72); backdrop-filter: blur(8px); color: #9c9a95; font-size: 10px; font-weight: 600; }
 .chip-a { left: 8%; top: 28%; }.chip-b { right: 7%; top: 37%; }.chip-c { right: 10%; bottom: 19%; }.chip-d { left: 7%; bottom: 24%; }
 .campfire { position: absolute; z-index: 3; left: 50%; bottom: 70px; transform: translateX(-50%); width: 220px; height: 220px; }
-.flame { position: absolute; left: 50%; bottom: 28px; transform: translateX(-50%) rotate(45deg); border-radius: 70% 12% 70% 70%; }
+.flame { position: absolute; left: 50%; bottom: 28px; transform: translateX(-50%) rotate(-45deg); border-radius: 70% 12% 70% 70%; }
 .flame-back { width: 130px; height: 130px; background: rgba(255, 83, 48, .25); filter: blur(5px); animation: flicker-back 1.6s ease-in-out infinite alternate; }
 .flame-main { width: 112px; height: 112px; background: linear-gradient(135deg, #ffd379 8%, #ff9850 45%, #f75f3f 82%); box-shadow: 0 0 70px rgba(255, 108, 48, .33), 0 0 120px rgba(255, 167, 76, .12); animation: flicker 1.7s ease-in-out infinite alternate; }
 .flame-core { position: absolute; left: 25px; top: 30px; width: 53px; height: 53px; border-radius: 70% 15% 70% 70%; background: linear-gradient(135deg, #fff7c8, #ffcc6b); }
-@keyframes flicker { from { transform: translateX(-50%) rotate(42deg) scale(.93, 1.03); } to { transform: translateX(-50%) rotate(48deg) scale(1.04, .96); } }
-@keyframes flicker-back { from { transform: translateX(-50%) rotate(40deg) scale(.98); } to { transform: translateX(-50%) rotate(50deg) scale(1.08); } }
+@keyframes flicker { from { transform: translateX(-50%) rotate(-48deg) scale(.93, 1.03); } to { transform: translateX(-50%) rotate(-42deg) scale(1.04, .96); } }
+@keyframes flicker-back { from { transform: translateX(-50%) rotate(-50deg) scale(.98); } to { transform: translateX(-50%) rotate(-40deg) scale(1.08); } }
 .log { position: absolute; bottom: 24px; left: 50%; width: 148px; height: 17px; border-radius: 10px; background: #664135; box-shadow: 0 7px 0 #332522; }
 .log::after { content:''; position:absolute; width:12px; height:12px; right:4px; top:2px; border-radius:50%; background:#8c5d45; }
 .log-a { transform: translateX(-50%) rotate(14deg); }.log-b { transform: translateX(-50%) rotate(-14deg); }
